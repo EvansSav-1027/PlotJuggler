@@ -379,6 +379,12 @@ jobs:
         # located rather than assumed.
         shell: pwsh
         run: |
+          # CMakeCache.txt stores absolute source/build paths. Never reuse a stale
+          # build directory that may have been created on Linux or another checkout.
+          if (Test-Path "build-savb") {
+            Remove-Item -LiteralPath "build-savb" -Recurse -Force
+          }
+
           cmake -S plugins/data_load_savb -B build-savb -G "Ninja Multi-Config" `
             -DCMAKE_TOOLCHAIN_FILE="build/conan_toolchain.cmake" `
             -DCMAKE_POLICY_DEFAULT_CMP0141=NEW `
