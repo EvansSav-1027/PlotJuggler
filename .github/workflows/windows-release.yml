@@ -371,6 +371,26 @@ jobs:
             sccache --show-stats
           fi
 
+      - name: Clean SAV plugin build directory
+        # A CMake cache contains absolute paths and cannot be reused across OSes
+        # or different checkout paths. Remove the whole plugin build tree before
+        # configuring it, and fail visibly if cleanup did not succeed.
+        shell: pwsh
+        run: |
+          Write-Host "Workspace: $env:GITHUB_WORKSPACE"
+          $path = Join-Path $env:GITHUB_WORKSPACE "build-savb"
+          Write-Host "Cleaning SAV plugin build directory: $path"
+
+          if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+          }
+
+          if (Test-Path -LiteralPath $path) {
+            throw "Could not remove stale SAV plugin build directory: $path"
+          }
+
+          Write-Host "Verified: build-savb does not exist"
+
       - name: Build the SAV log loader plugin
         # In-repo plugin (plugins/data_load_savb), built with the same Conan graph and
         # toolchain as the app so it finds the exact plotjuggler_sdk the app uses, then
@@ -379,10 +399,12 @@ jobs:
         # located rather than assumed.
         shell: pwsh
         run: |
-          # CMakeCache.txt stores absolute source/build paths. Never reuse a stale
-          # build directory that may have been created on Linux or another checkout.
-          if (Test-Path "build-savb") {
-            Remove-Item -LiteralPath "build-savb" -Recurse -Force
+          # Diagnose any step that unexpectedly recreates a cache before configuration.
+          if (Test-Path "build-savb/CMakeCache.txt") {
+            Write-Host "Unexpected CMake cache found before plugin configuration."
+            Get-Content "build-savb/CMakeCache.txt" |
+              Select-String "CMAKE_HOME_DIRECTORY|CMAKE_CACHEFILE_DIR"
+            throw "Stale CMakeCache exists after the clean step"
           }
 
           cmake -S plugins/data_load_savb -B build-savb -G "Ninja Multi-Config" `
