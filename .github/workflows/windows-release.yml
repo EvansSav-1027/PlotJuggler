@@ -1,45 +1,23 @@
 name: Release Windows Installer
 
-# Builds the PlotJuggler 4 Windows installer (.exe) on a clean windows-2022 runner
-# and, on a version tag, attaches it to the GitHub Release. The Windows sibling of
-# release.yml (which does the Linux AppImage).
-#
-# Official plugins are built and published independently. This workflow resolves
-# the curated Windows set from pj-plugin-registry, verifies every artifact, and
-# proves every DLL loads in the staged app before creating the installer.
-#
-# Cache/repository layers shared with windows-ci.yml:
-#   - Qt kit via actions/cache
-#   - compiler objects via sccache on GitHub's Actions cache
-#   - Conan packages via the Actions cache, then ConanCenter
-#
-# Triggers:
-#   - workflow_dispatch     -> build the installer from any branch (artifact only);
-#     with `update_url`, also build + publish an update repository there, to
-#     rehearse the maintenance-tool update path against a staging prefix
-#   - push of a version tag -> build + attach the installer to that tag's Release
-#     (e.g. `3.9.1` — no leading 'v')
-
 on:
   workflow_dispatch:
     inputs:
       update_url:
         description: >-
-          Staging update repository, e.g. https://updates.plotjuggler.io/windows-staging.
-          Empty = no update repository. The production URL is refused.
+          Staging update repository. Empty means no update repository.
+          The production URL is refused.
         type: string
         default: ""
       version:
         description: >-
-          Version to stamp (default: PJ_APP_VERSION). Publish a higher one in a
-          second run to see an installed maintenance tool offer the update.
+          Version to stamp (default: PJ_APP_VERSION).
         type: string
         default: ""
       update_check_from_run:
         description: >-
-          ID of an earlier run of this workflow (built with the same update_url
-          and a lower version). Its installer is installed headlessly, then
-          updated from the repository this run publishes.
+          ID of an earlier run of this workflow built with the same update_url
+          and a lower version. Its installer is installed, then updated.
         type: string
         default: ""
   push:
@@ -47,7 +25,7 @@ on:
       - '[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
-  contents: write     # softprops/action-gh-release needs write to create/update the Release
+  contents: write
 
 concurrency:
   group: windows-release-${{ github.ref }}
@@ -55,26 +33,14 @@ concurrency:
 
 jobs:
   windows-installer:
-    # GitHub-hosted runner, free for public repositories: same Windows Server 2022 /
-    # VS 2022 toolchain as the paid Depot runner this workflow was written for.
     runs-on: windows-2022
-    # Backstop against hangs — app build plus registry download/validation/packaging.
-    # A cold run (empty Conan/Qt/sccache caches) is slow on a GitHub-hosted runner; 350
-    # stays under GitHub's hard 360-minute job limit. Later runs restore the caches.
-    # Only the in-repo SAV log loader plugin is compiled here.
     timeout-minutes: 350
     outputs:
       version: ${{ steps.version.outputs.version }}
       update_url: ${{ env.PJ_WINDOWS_UPDATE_URL }}
-
     env:
-      # The one URL the installer is built against and the repository is
-      # published to: the production variable on a tag push, the staging input
-      # on a dispatch (even one started from a tag), empty otherwise. Both steps read it, so they cannot disagree.
       PJ_WINDOWS_UPDATE_URL: ${{ github.event_name == 'push' && vars.PJ4_WINDOWS_UPDATE_URL || (github.event_name == 'workflow_dispatch' && inputs.update_url || '') }}
 
-    # sccache uses GitHub's own Actions cache (the sccache step below) — a speedup only;
-    # it starts cold on a fresh repository.
     steps:
       - name: Use HTTPS for github.com submodules
         shell: bash
@@ -86,9 +52,6 @@ jobs:
           submodules: recursive
 
       - name: Read versions.env
-        # PJ_QT_VERSION / PJ_APP_VERSION are the single source of truth.
-        # `source` (not `cat`) so bash strips the comments in versions.env
-        # before we forward the values to $GITHUB_ENV, which only accepts KEY=VALUE.
         shell: bash
         run: |
           set -euo pipefail
@@ -97,13 +60,12 @@ jobs:
           echo "PJ_QT_VERSION=${PJ_QT_VERSION}" >> "${GITHUB_ENV}"
 
       - name: Resolve installer version
-        # Tag build -> the tag verbatim; manual build -> the `version` input,
-        # else PJ_APP_VERSION.
         id: version
         shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
+          set -euo pipefail
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
             v="${GITHUB_REF_NAME}"
           else
@@ -113,17 +75,17 @@ jobs:
           echo "version=${v}" >> "$GITHUB_OUTPUT"
 
       - name: Refuse to rehearse against the production update channel
-        # A dispatch build is not a release. Publishing it where installed
-        # maintenance tools look would offer every Windows user a dev build.
-        # Compared by bucket prefix, not URL: every update URL is served from
-        # the same bucket, so another host or a doubled slash with the same
-        # path would still overwrite the production repository.
         if: github.event_name != 'push' && env.PJ_WINDOWS_UPDATE_URL != ''
         shell: bash
         env:
           PROD_URL: ${{ vars.PJ4_WINDOWS_UPDATE_URL }}
         run: |
-          prefix_of() { local p="${1#*://}"; [[ "${p}" == */* ]] && p="${p#*/}" || p=""; printf '%s' "${p}" | tr -s '/' | sed 's#^/##; s#/$##'; }
+          set -euo pipefail
+          prefix_of() {
+            local p="${1#*://}"
+            [[ "${p}" == */* ]] && p="${p#*/}" || p=""
+            printf '%s' "${p}" | tr -s '/' | sed 's#^/##; s#/$##'
+          }
           if [[ -n "${PROD_URL}" && "$(prefix_of "${PJ_WINDOWS_UPDATE_URL}")" == "$(prefix_of "${PROD_URL}")" ]]; then
             echo "::error::update_url publishes to the production prefix of ${PROD_URL}; use a staging prefix." >&2
             exit 1
@@ -133,31 +95,20 @@ jobs:
       - name: Install Conan
         uses: conan-io/setup-conan@v1
         with:
-          # Packages are restored from the shared Actions-cache closure below.
-          # Do not also archive ~/.conan2 through setup-conan itself.
           cache_packages: false
 
       - name: Install cmake and ninja
         run: pip install cmake ninja
 
       - name: Set up MSVC environment
-        # Conan's package ID includes the detected compiler settings, so activate
-        # MSVC before detecting the profile or resolving Artifactory binaries.
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-
-      # ─────────────────────────── Conan binaries ───────────────────────────
-      # The Actions cache closure maintained by windows-ci.yml is the Conan
-      # binary store (same windows-2022 MSVC/RelWithDebInfo graph, same key).
-      # ConanCenter source builds cover any residual miss — all of it on the
-      # first run of a fresh repository.
 
       - name: Compute Conan cache key
         id: public_conan_cache
         shell: pwsh
         run: |
-          # Must match windows-ci.yml exactly — cache identity is shared.
           $cacheVersion = "v6"
           $combined = (Get-FileHash conanfile.txt -Algorithm SHA256).Hash + (Get-FileHash conan.lock -Algorithm SHA256).Hash
           $stream = [System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($combined))
@@ -176,12 +127,6 @@ jobs:
             ${{ steps.public_conan_cache.outputs.restore_prefix }}
 
       - name: Seed Conan source download cache
-        # Some third-party source tarballs live on hosts that reject
-        # GitHub-runner IPs (zlib.net → HTTP 415). Those are versioned in-repo
-        # under .github/conan/source-backup/, addressed by sha256, and copied
-        # into Conan's source download cache here so source() fetches are
-        # served locally. The source cache is separate from the binary packages
-        # resolved through Artifactory.
         shell: pwsh
         run: |
           $cacheDir = (Join-Path $env:RUNNER_TEMP "conan-source-cache").Replace('\', '/')
@@ -197,20 +142,13 @@ jobs:
             $lines = @(Get-Content $conf | Where-Object { $_ -notmatch '^core\.sources:(download_cache|download_urls)=' })
           }
           $lines += "core.sources:download_cache=$cacheDir"
-          # Retry through ConanCenter's sha256-addressed mirror when a recipe's own
-          # host refuses a datacenter IP. 'origin' stays FIRST: Conan aborts the
-          # download if a backup entry answers 401/403 (only 404 falls through).
           $lines += 'core.sources:download_urls=["origin", "https://c3i.jfrog.io/artifactory/conan-center-backup-sources/"]'
           $lines | Set-Content $conf
-
-      # ─────────────────────────── Qt caches: restore/install/save ───────────────────────────
 
       - name: Restore Qt SDK cache
         id: qt-sdk-cache
         uses: actions/cache/restore@v5
         with:
-          # Keep this path and key identical to windows-ci.yml so both workflows
-          # share one Qt SDK blob. IFW is release-only and cached separately.
           path: .qt/${{ env.PJ_QT_VERSION }}/msvc2022_64
           key: qt-sdk-${{ env.PJ_QT_VERSION }}-windows-msvc2022_64-v1
 
@@ -222,8 +160,6 @@ jobs:
           key: qt-ifw-4.7-windows-v1
 
       - name: Verify Qt SDK cache content
-        # Cache metadata can report a hit for an incomplete tree. Probe the
-        # executable consumed by CMake and reinstall if it is missing.
         id: qt-sdk-verify
         shell: bash
         run: |
@@ -247,20 +183,22 @@ jobs:
         if: steps.qt-sdk-verify.outputs.valid != 'true' || steps.qt-ifw-verify.outputs.valid != 'true'
         shell: bash
         run: |
-          # Released aqt can't fetch the current Windows Qt layout yet
-          # (miurahr/aqtinstall#959/#1007); pin to the merged fix commit — same as
-          # windows-ci.yml.
+          set -euo pipefail
           pip install "git+https://github.com/miurahr/aqtinstall.git@8c3695d4a4e1ceabf6a74dc6c79681656dc6b74b"
 
       - name: Install Qt SDK via aqt
         if: steps.qt-sdk-verify.outputs.valid != 'true'
         shell: bash
         run: |
+          set -euo pipefail
           rm -rf ".qt/${PJ_QT_VERSION}/msvc2022_64"
           attempt=0
           until aqt install-qt windows desktop "${PJ_QT_VERSION}" win64_msvc2022_64 --outputdir ./.qt; do
             attempt=$((attempt + 1))
-            if [ "$attempt" -ge 5 ]; then echo "aqt install-qt failed after ${attempt} attempts" >&2; exit 1; fi
+            if [ "$attempt" -ge 5 ]; then
+              echo "aqt install-qt failed after ${attempt} attempts" >&2
+              exit 1
+            fi
             echo "aqt attempt ${attempt} failed; retrying in $((attempt * 15))s..."
             sleep $((attempt * 15))
           done
@@ -269,6 +207,7 @@ jobs:
         if: steps.qt-ifw-verify.outputs.valid != 'true'
         shell: bash
         run: |
+          set -euo pipefail
           rm -rf .qt/Tools/QtInstallerFramework/4.7
           aqt install-tool --outputdir ./.qt windows desktop tools_ifw
 
@@ -286,32 +225,20 @@ jobs:
           path: .qt/Tools/QtInstallerFramework/4.7
           key: qt-ifw-4.7-windows-v1
 
-      # ─────────────────────────── Compiler cache ───────────────────────────
-
       - name: Install sccache
-        # sccache is a compile-cache speedup, NOT load-bearing: the build is
-        # correct without it, just slower. v0.16 supports GitHub's current cache
-        # service; the action exports its short-lived runtime credentials.
         id: setup_sccache
         continue-on-error: true
         uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: "v0.16.0"
 
-      # ─────────────────────────── Build ───────────────────────────
-
       - name: Conan install
-        # The restored closure supplies prebuilt binaries; ConanCenter covers
-        # (and builds from source) anything missing.
         id: conan_install
         shell: bash
         run: |
+          set -euo pipefail
           conan profile detect --force
           scripts/configure_conan_remote.sh
-          # cpython shared: its Conan recipe disables the static MSVC build (>=3.10),
-          # so the embedded interpreter must link shared (Release CRT, matching the
-          # RelWithDebInfo /MD graph). Ninja Multi-Config so sccache's compiler
-          # launcher is honoured (VS/MSBuild ignores it).
           conan_log="${RUNNER_TEMP}/pj4-conan-install.log"
           conan install . --output-folder=build --build=missing -r=plotjuggler-conan -r=conancenter \
             --lockfile=conan.lock --lockfile-partial \
@@ -322,6 +249,13 @@ jobs:
           if grep -q "Building from source" "$conan_log"; then
             echo "::notice::Conan built missing binaries; the cache save below persists them."
           fi
+          echo "Checking Conan-generated toolchain..."
+          if [[ ! -f build/conan_toolchain.cmake ]]; then
+            echo "::error::Conan completed but build/conan_toolchain.cmake is missing."
+            find build -maxdepth 4 -iname '*toolchain*.cmake' -print || true
+            exit 1
+          fi
+          echo "Conan toolchain exists: $(pwd)/build/conan_toolchain.cmake"
 
       - name: Trim Conan cache before saving
         if: steps.conan_install.outcome == 'success' && steps.conan-gha-cache.outputs.cache-hit != 'true'
@@ -329,8 +263,6 @@ jobs:
         run: conan cache clean "*" --build --source --temp || true
 
       - name: Save Conan cache
-        # Persist binaries this release built that the closure did not already
-        # hold, under the same key namespace windows-ci.yml restores from.
         if: steps.conan_install.outcome == 'success' && steps.conan-gha-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
@@ -342,10 +274,7 @@ jobs:
         env:
           SCCACHE_AVAILABLE: ${{ steps.setup_sccache.outcome == 'success' }}
         run: |
-          # CMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded forces /Z7 (embedded)
-          # over /Zi (shared PDB). /Zi writes via mspdbsrv.exe which sccache
-          # cannot cache and which races between parallel cl.exe workers
-          # (fatal C1041 on pj_base.pdb). Requires CMP0141=NEW.
+          set -euo pipefail
           launcher_args=()
           if [[ "$SCCACHE_AVAILABLE" == "true" ]]; then
             launcher_args=(-DCMAKE_C_COMPILER_LAUNCHER=sccache \
@@ -353,94 +282,105 @@ jobs:
           else
             echo "::warning::sccache unavailable; building without a compiler cache"
           fi
-
+          toolchain="$(pwd)/build/conan_toolchain.cmake"
+          if [[ ! -f "$toolchain" ]]; then
+            echo "::error::Missing Conan toolchain: $toolchain"
+            exit 1
+          fi
           cmake -S . -B build -G "Ninja Multi-Config" \
-            -DCMAKE_TOOLCHAIN_FILE="build/conan_toolchain.cmake" \
+            "-DCMAKE_TOOLCHAIN_FILE=$toolchain" \
             -DCMAKE_PREFIX_PATH="$(pwd)/.qt/${PJ_QT_VERSION}/msvc2022_64" \
             -DCMAKE_POLICY_DEFAULT_CMP0141=NEW \
             -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded \
             -DPJ_INSTALLATION=windows \
             "${launcher_args[@]}"
-
-          # This release only packages the application. Building the default ALL
-          # target also compiles the repository's test executables, which are not
-          # consumed by the installer and needlessly delays the registry smoke test.
           cmake --build build --config RelWithDebInfo --target pj_app --parallel
-
           if [[ "$SCCACHE_AVAILABLE" == "true" ]]; then
             sccache --show-stats
           fi
 
       - name: Clean SAV plugin build directory
-        # A CMake cache contains absolute paths and cannot be reused across OSes
-        # or different checkout paths. Remove the whole plugin build tree before
-        # configuring it, and fail visibly if cleanup did not succeed.
         shell: pwsh
         run: |
           Write-Host "Workspace: $env:GITHUB_WORKSPACE"
           $path = Join-Path $env:GITHUB_WORKSPACE "build-savb"
           Write-Host "Cleaning SAV plugin build directory: $path"
-
           if (Test-Path -LiteralPath $path) {
             Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
           }
-
           if (Test-Path -LiteralPath $path) {
             throw "Could not remove stale SAV plugin build directory: $path"
           }
-
           Write-Host "Verified: build-savb does not exist"
 
       - name: Build the SAV log loader plugin
-        # In-repo plugin (plugins/data_load_savb), built with the same Conan graph and
-        # toolchain as the app so it finds the exact plotjuggler_sdk the app uses, then
-        # laid out as <id>/{manifest.json,*_plugin.dll} for the installer's
-        # -LocalPluginDir. The multi-config output folder is not fixed, so the DLL is
-        # located rather than assumed.
         shell: pwsh
         run: |
-          # Diagnose any step that unexpectedly recreates a cache before configuration.
-          if (Test-Path "build-savb/CMakeCache.txt") {
+          $workspace = $env:GITHUB_WORKSPACE
+          $toolchain = Join-Path $workspace "build\conan_toolchain.cmake"
+          $pluginSource = Join-Path $workspace "plugins\data_load_savb"
+          $pluginBuild = Join-Path $workspace "build-savb"
+
+          Write-Host "Workspace: $workspace"
+          Write-Host "Plugin source: $pluginSource"
+          Write-Host "Plugin build directory: $pluginBuild"
+          Write-Host "Expected Conan toolchain: $toolchain"
+
+          if (Test-Path (Join-Path $pluginBuild "CMakeCache.txt")) {
             Write-Host "Unexpected CMake cache found before plugin configuration."
-            Get-Content "build-savb/CMakeCache.txt" |
+            Get-Content (Join-Path $pluginBuild "CMakeCache.txt") |
               Select-String "CMAKE_HOME_DIRECTORY|CMAKE_CACHEFILE_DIR"
             throw "Stale CMakeCache exists after the clean step"
           }
 
-          cmake -S plugins/data_load_savb -B build-savb -G "Ninja Multi-Config" `
-            -DCMAKE_TOOLCHAIN_FILE="build/conan_toolchain.cmake" `
+          if (-not (Test-Path -LiteralPath $toolchain -PathType Leaf)) {
+            Write-Host "::error::Conan toolchain is missing: $toolchain"
+            Write-Host "Searching workspace for conan_toolchain.cmake..."
+            Get-ChildItem -LiteralPath $workspace -Recurse -File `
+              -Filter "conan_toolchain.cmake" -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+            if (Test-Path "build") {
+              Write-Host "Build directory contents:"
+              Get-ChildItem "build" -Force | Select-Object Name, Mode, Length
+            } else {
+              Write-Host "The build directory does not exist."
+            }
+            throw "Conan toolchain was not found. Check the Conan install step and output folder."
+          }
+
+          $ninja = Get-Command ninja -ErrorAction SilentlyContinue
+          if (-not $ninja) {
+            Write-Host "::error::Ninja is not available on PATH."
+            Write-Host "PATH: $env:PATH"
+            throw "Ninja is missing. Check the Install cmake and ninja step."
+          }
+          Write-Host "Ninja executable: $($ninja.Source)"
+          & $ninja.Source --version
+          if ($LASTEXITCODE -ne 0) { throw "Ninja version check failed." }
+
+          cmake -S $pluginSource -B $pluginBuild -G "Ninja Multi-Config" `
+            "-DCMAKE_TOOLCHAIN_FILE=$toolchain" `
             -DCMAKE_POLICY_DEFAULT_CMP0141=NEW `
             -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded `
             -DSAVB_BUILD_TESTS=OFF
           if ($LASTEXITCODE -ne 0) { throw "SAV plugin configure failed" }
-          cmake --build build-savb --config RelWithDebInfo
+
+          cmake --build $pluginBuild --config RelWithDebInfo
           if ($LASTEXITCODE -ne 0) { throw "SAV plugin build failed" }
-          $dll = Get-ChildItem build-savb -Recurse -Filter "savb_source_plugin.dll" | Select-Object -First 1
+
+          $dll = Get-ChildItem $pluginBuild -Recurse -File `
+            -Filter "savb_source_plugin.dll" | Select-Object -First 1
           if (-not $dll) { throw "savb_source_plugin.dll was not produced" }
+
           $dest = "dist-plugins/sav-log-loader"
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          Copy-Item $dll.FullName $dest
-          Copy-Item plugins/data_load_savb/manifest.json $dest
+          Copy-Item -LiteralPath $dll.FullName -Destination $dest
+          Copy-Item "plugins/data_load_savb/manifest.json" -Destination $dest
           Get-ChildItem $dest
 
       - name: Build the installer
-        # The recipe stages the app, downloads the curated published plugins from
-        # the registry, verifies checksums + manifests, adds the in-repo plugins from
-        # dist-plugins/, loads every whitelisted DLL through the real host runtime,
-        # then runs binarycreator. Any plugin failure fails the release; there are no
-        # best-effort skips.
-        # -CleanReleaseName only on a tag build: -Version is already the unique,
-        # meaningful name there (matches the AppImage's plain naming); dispatch
-        # builds keep the date + main-commit stamp to stay distinguishable.
         shell: pwsh
         run: |
-          # Remote updates only when this run also publishes a repository at
-          # PJ_WINDOWS_UPDATE_URL (a tag, or a dispatch rehearsal): an installer
-          # pointing at a URL it was not published to would poll a repository
-          # advertising a different build than it installed.
-          # A hashtable splat, not an array: it binds by parameter NAME, so a
-          # future reordering of the script's parameters cannot silently bind
-          # these to the wrong ones.
           $updateArgs = @{}
           if ($env:PJ_WINDOWS_UPDATE_URL) {
             $updateArgs = @{ UpdateUrl = $env:PJ_WINDOWS_UPDATE_URL; RepoOutDir = "dist/repo" }
@@ -462,9 +402,6 @@ jobs:
           if-no-files-found: error
 
       - name: Upload the update repository (rehearsal)
-        # A later rehearsal's update-check installs this run's installer
-        # against THIS repository, so the install resolves this version rather
-        # than whatever the staging prefix has advertised since.
         if: github.event_name != 'push' && env.PJ_WINDOWS_UPDATE_URL != ''
         uses: actions/upload-artifact@v4
         with:
@@ -474,7 +411,6 @@ jobs:
           retention-days: 7
 
       - name: Attach installer to the GitHub Release
-        # Never a rehearsal build: it points at a staging repository.
         if: startsWith(github.ref, 'refs/tags/') && inputs.update_url == ''
         uses: softprops/action-gh-release@v3
         with:
@@ -483,14 +419,6 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: Publish the update repository
-        # After the Release attach, deliberately: the installer .exe is the
-        # canonical artifact, so a publishing failure must not cost it the
-        # upload. Same ordering rule as the Linux .deb and its apt repository.
-        #
-        # Skipped unless PJ_WINDOWS_UPDATE_URL is set — which is also what
-        # decided whether the installer above was built with remote updates at
-        # all, so the two can never disagree. The publisher takes the bucket
-        # prefix from the URL's path, so it lands where the installer looks.
         if: env.PJ_WINDOWS_UPDATE_URL != ''
         shell: pwsh
         env:
@@ -504,18 +432,12 @@ jobs:
             -Version $env:PJ_VERSION
 
   update-check:
-    # Rehearsal only: install the installer an earlier dispatch run built, then
-    # let its maintenance tool update from the repository the job above just
-    # published — the path a real user takes, driven through IFW's command
-    # line because nobody sits at the runner. The installed version recorded
-    # in components.xml is the assertion; check-updates output is only logged,
-    # since IFW's console output from a GUI-subsystem binary is best-effort.
     needs: windows-installer
     if: inputs.update_check_from_run != '' && needs.windows-installer.outputs.update_url != ''
     runs-on: windows-2022
     timeout-minutes: 30
     permissions:
-      actions: read     # gh run download of the earlier run's artifact
+      actions: read
     env:
       GH_TOKEN: ${{ github.token }}
       OLD_RUN: ${{ inputs.update_check_from_run }}
@@ -530,8 +452,6 @@ jobs:
         shell: pwsh
         run: |
           $root = Join-Path $env:RUNNER_TEMP "pj4"
-          # Start-Process -Wait, because PowerShell does not wait for a
-          # GUI-subsystem executable invoked directly.
           function Invoke-Ifw([string]$exe, [string[]]$ifwArgs, [switch]$AllowFailure) {
             $p = Start-Process $exe -ArgumentList $ifwArgs -Wait -PassThru -NoNewWindow `
                    -RedirectStandardOutput ifw.out -RedirectStandardError ifw.err
@@ -544,10 +464,8 @@ jobs:
           }
 
           $installer = (Get-ChildItem old -Recurse -Filter *.exe | Select-Object -First 1).FullName
+          if (-not $installer) { throw "No installer .exe was downloaded from run $env:OLD_RUN" }
 
-          # Offline: every installer carries <RemoteRepositories>, and it must
-          # still install its own embedded payload when the update host is
-          # unreachable (air-gapped labs, blocking proxies).
           $updateHost = ([uri]$env:UPDATE_URL).Host
           $hosts = "$env:SystemRoot\System32\drivers\etc\hosts"
           $saved = Get-Content -Raw $hosts
@@ -555,14 +473,23 @@ jobs:
           ipconfig /flushdns | Out-Null
           try {
             $reachable = $true
-            try { Invoke-WebRequest "$env:UPDATE_URL/Updates.xml" -UseBasicParsing -TimeoutSec 10 | Out-Null } catch { $reachable = $false }
+            try {
+              Invoke-WebRequest "$env:UPDATE_URL/Updates.xml" -UseBasicParsing -TimeoutSec 10 | Out-Null
+            } catch {
+              $reachable = $false
+            }
             if ($reachable) { throw "$updateHost is still reachable; the offline check would prove nothing" }
+
             $offRoot = Join-Path $env:RUNNER_TEMP "pj4-offline"
             Write-Host "offline: installing $installer into $offRoot with $updateHost blocked"
             Invoke-Ifw $installer @("install", "--root", $offRoot, "--accept-licenses", "--default-answer", "--confirm-command")
             $offline = Get-InstalledVersion $offRoot
-            if (-not $offline -or $offline -eq $env:EXPECT) { throw "offline install reports [$offline]; expected the installer's own version" }
-            if (-not (Test-Path (Join-Path $offRoot "bin\PlotJuggler4.exe"))) { throw "offline install has no bin\PlotJuggler4.exe" }
+            if (-not $offline -or $offline -eq $env:EXPECT) {
+              throw "offline install reports [$offline]; expected the installer's own version"
+            }
+            if (-not (Test-Path (Join-Path $offRoot "bin\PlotJuggler4.exe"))) {
+              throw "offline install has no bin\PlotJuggler4.exe"
+            }
             Write-Host "offline install OK: $offline"
           } finally {
             [IO.File]::WriteAllText($hosts, $saved)
@@ -571,15 +498,10 @@ jobs:
 
           $oldRepo = (Get-ChildItem old -Recurse -Filter Updates.xml | Select-Object -First 1).DirectoryName
           if (-not $oldRepo) { throw "run $env:OLD_RUN has no update-repo artifact; rebuild it with update_url set" }
-          # An installer carrying <RemoteRepositories> consults them at install
-          # time and installs the NEWEST version it finds there. Restricting the
-          # fetch to the old run's own repository (not saved into the
-          # maintenance tool) reproduces a machine that installed before the
-          # newer version was published.
           $oldRepoUri = ([uri]$oldRepo).AbsoluteUri
           Write-Host "installing $installer into $root, resolving only $oldRepoUri"
           Invoke-Ifw $installer @("install", "--root", $root, "--set-temp-repository", $oldRepoUri,
-                                   "--accept-licenses", "--default-answer", "--confirm-command")
+                                 "--accept-licenses", "--default-answer", "--confirm-command")
           $before = Get-InstalledVersion
           Write-Host "installed: $before"
           if ($before -eq $env:EXPECT) { throw "the older installer is already $env:EXPECT; nothing to update" }
@@ -592,5 +514,7 @@ jobs:
 
           $after = Get-InstalledVersion
           if ($after -ne $env:EXPECT) { throw "after the update components.xml says $after, expected $env:EXPECT" }
-          if (-not (Test-Path (Join-Path $root "bin\PlotJuggler4.exe"))) { throw "bin\PlotJuggler4.exe missing after the update" }
+          if (-not (Test-Path (Join-Path $root "bin\PlotJuggler4.exe"))) {
+            throw "bin\PlotJuggler4.exe missing after the update"
+          }
           Write-Host "updated $before -> $after"
