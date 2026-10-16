@@ -1,3 +1,0 @@
-/home/sav-sys-1027/PlotJuggler/build-savb/_deps/plotjuggler_sdk-subbuild/CMakeFiles/plotjuggler_sdk-populate.dir
-/home/sav-sys-1027/PlotJuggler/build-savb/_deps/plotjuggler_sdk-subbuild/CMakeFiles/edit_cache.dir
-/home/sav-sys-1027/PlotJuggler/build-savb/_deps/plotjuggler_sdk-subbuild/CMakeFiles/rebuild_cache.dir

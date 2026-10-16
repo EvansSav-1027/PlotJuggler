@@ -1,2 +1,0 @@
-/usr/bin/ar qc libpj_plugin_catalog.a CMakeFiles/pj_plugin_catalog.dir/src/plugin_catalog.cpp.o
-/usr/bin/ranlib libpj_plugin_catalog.a
