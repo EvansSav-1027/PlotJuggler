@@ -10,8 +10,8 @@ name: Release Windows Installer
 #
 # Cache/repository layers shared with windows-ci.yml:
 #   - Qt kit via actions/cache
-#   - compiler objects via sccache on Depot Cache
-#   - Conan packages via the shared Depot-backed Actions cache, then ConanCenter
+#   - compiler objects via sccache on GitHub's Actions cache
+#   - Conan packages via the Actions cache, then ConanCenter
 #
 # Triggers:
 #   - workflow_dispatch     -> build the installer from any branch (artifact only);
@@ -55,11 +55,14 @@ concurrency:
 
 jobs:
   windows-installer:
-    # Match windows-ci.yml and the toolchain used for the published plugin artifacts.
-    runs-on: depot-windows-2022-4
+    # GitHub-hosted runner, free for public repositories: same Windows Server 2022 /
+    # VS 2022 toolchain as the paid Depot runner this workflow was written for.
+    runs-on: windows-2022
     # Backstop against hangs — app build plus registry download/validation/packaging.
-    # Plugins are not compiled here.
-    timeout-minutes: 180
+    # A cold run (empty Conan/Qt/sccache caches) is slow on a GitHub-hosted runner; 350
+    # stays under GitHub's hard 360-minute job limit. Later runs restore the caches.
+    # Only the in-repo SAV log loader plugin is compiled here.
+    timeout-minutes: 350
     outputs:
       version: ${{ steps.version.outputs.version }}
       update_url: ${{ env.PJ_WINDOWS_UPDATE_URL }}
@@ -70,9 +73,8 @@ jobs:
       # on a dispatch (even one started from a tag), empty otherwise. Both steps read it, so they cannot disagree.
       PJ_WINDOWS_UPDATE_URL: ${{ github.event_name == 'push' && vars.PJ4_WINDOWS_UPDATE_URL || (github.event_name == 'workflow_dispatch' && inputs.update_url || '') }}
 
-    # sccache uses Depot Cache via the SCCACHE_WEBDAV_* env vars the Depot
-    # runner pre-sets — the same org-wide object store as Windows CI and the
-    # Pixi win-64 leg, so the release reuses identical MSVC compilation results.
+    # sccache uses GitHub's own Actions cache (the sccache step below) — a speedup only;
+    # it starts cold on a fresh repository.
     steps:
       - name: Use HTTPS for github.com submodules
         shell: bash
@@ -146,9 +148,10 @@ jobs:
           arch: x64
 
       # ─────────────────────────── Conan binaries ───────────────────────────
-      # The Depot-backed Actions cache closure maintained by windows-ci.yml is
-      # the Conan binary store (same windows-2022 MSVC/RelWithDebInfo graph,
-      # same key). ConanCenter source builds cover any residual miss.
+      # The Actions cache closure maintained by windows-ci.yml is the Conan
+      # binary store (same windows-2022 MSVC/RelWithDebInfo graph, same key).
+      # ConanCenter source builds cover any residual miss — all of it on the
+      # first run of a fresh repository.
 
       - name: Compute Conan cache key
         id: public_conan_cache
@@ -368,11 +371,36 @@ jobs:
             sccache --show-stats
           fi
 
+      - name: Build the SAV log loader plugin
+        # In-repo plugin (plugins/data_load_savb), built with the same Conan graph and
+        # toolchain as the app so it finds the exact plotjuggler_sdk the app uses, then
+        # laid out as <id>/{manifest.json,*_plugin.dll} for the installer's
+        # -LocalPluginDir. The multi-config output folder is not fixed, so the DLL is
+        # located rather than assumed.
+        shell: pwsh
+        run: |
+          cmake -S plugins/data_load_savb -B build-savb -G "Ninja Multi-Config" `
+            -DCMAKE_TOOLCHAIN_FILE="build/conan_toolchain.cmake" `
+            -DCMAKE_POLICY_DEFAULT_CMP0141=NEW `
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded `
+            -DSAVB_BUILD_TESTS=OFF
+          if ($LASTEXITCODE -ne 0) { throw "SAV plugin configure failed" }
+          cmake --build build-savb --config RelWithDebInfo
+          if ($LASTEXITCODE -ne 0) { throw "SAV plugin build failed" }
+          $dll = Get-ChildItem build-savb -Recurse -Filter "savb_source_plugin.dll" | Select-Object -First 1
+          if (-not $dll) { throw "savb_source_plugin.dll was not produced" }
+          $dest = "dist-plugins/sav-log-loader"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item $dll.FullName $dest
+          Copy-Item plugins/data_load_savb/manifest.json $dest
+          Get-ChildItem $dest
+
       - name: Build the installer
         # The recipe stages the app, downloads the curated published plugins from
-        # the registry, verifies checksums + manifests, loads every whitelisted DLL
-        # through the real host runtime, then runs binarycreator. Any plugin failure
-        # fails the release; there are no best-effort skips.
+        # the registry, verifies checksums + manifests, adds the in-repo plugins from
+        # dist-plugins/, loads every whitelisted DLL through the real host runtime,
+        # then runs binarycreator. Any plugin failure fails the release; there are no
+        # best-effort skips.
         # -CleanReleaseName only on a tag build: -Version is already the unique,
         # meaningful name there (matches the AppImage's plain naming); dispatch
         # builds keep the date + main-commit stamp to stay distinguishable.
@@ -392,6 +420,7 @@ jobs:
           .\packaging\installer\build_windows_installer.ps1 `
             -QtDir ".qt\$env:PJ_QT_VERSION\msvc2022_64" `
             -PluginRegistryUrl "https://raw.githubusercontent.com/PlotJuggler/pj-plugin-registry/refs/heads/development/registry.json" `
+            -LocalPluginDir dist-plugins `
             -Version $env:PJ_VERSION `
             -OutDir dist `
             -CleanReleaseName:($env:GITHUB_REF_TYPE -eq "tag") `

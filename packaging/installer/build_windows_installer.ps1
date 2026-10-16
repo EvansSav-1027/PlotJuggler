@@ -55,6 +55,13 @@
   for -PluginPlatform; a missing entry, failed download, bad checksum, or malformed
   archive fails the installer build.
 
+.PARAMETER LocalPluginDir
+  Directory of in-repo plugins to bundle next to the registry ones: one
+  sub-directory per plugin, named after the plugin id, holding exactly one
+  manifest.json (whose id and version are checked) and its *_plugin.dll. Each
+  gets the same manifest and host-load validation as a registry plugin. Ignored
+  with -SkipPlugins.
+
 .PARAMETER PluginPlatform
   Registry platform key. The x64 Windows installer uses windows-x86_64.
 
@@ -120,6 +127,7 @@ param(
     "toolbox-quaternion", "toolbox-transform-editor", "toolbox-mosaico",
     "arrow-parser"
   ),
+  [string]$LocalPluginDir = "",
   [string]$PluginPlatform = "windows-x86_64",
   [string]$ConanHome  = "$env:USERPROFILE\.conan2",
   [string]$Version    = "",
@@ -397,6 +405,52 @@ function Download-RegistryPlugins {
             Sort-Object FullName)
 }
 
+# --- stage in-repo plugins from -LocalPluginDir ------------------------------------
+# Same layout and checks as a registry plugin (plugins/<id>/{manifest.json,*_plugin.dll},
+# manifest id == directory name, no host newer than this installer), so the validation
+# below treats it like any other whitelisted plugin.
+$localPluginIds = @()
+function Stage-LocalPlugins([string]$sourceDir) {
+  if (-not (Test-Path -LiteralPath $sourceDir -PathType Container)) {
+    Die "-LocalPluginDir '$sourceDir' is not a directory"
+  }
+  foreach ($dir in @(Get-ChildItem -LiteralPath $sourceDir -Directory)) {
+    $id = $dir.Name
+    if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { Die "invalid local plugin id '$id'" }
+    if ($PluginIds -contains $id) { Die "local plugin '$id' duplicates a registry plugin id" }
+    $manifests = @(Get-ChildItem -LiteralPath $dir.FullName -Recurse -Filter "manifest.json")
+    if ($manifests.Count -ne 1) {
+      Die "local plugin '$id' must contain exactly one manifest.json (found $($manifests.Count))"
+    }
+    try {
+      $manifest = Get-Content -LiteralPath $manifests[0].FullName -Raw | ConvertFrom-Json
+    } catch {
+      Die "local plugin '$id' contains an invalid manifest.json: $_"
+    }
+    if ([string]$manifest.id -ne $id) {
+      Die "local plugin '$id' manifest declares id '$($manifest.id)'"
+    }
+    $version = [string]$manifest.version
+    if (-not $version) { Die "local plugin '$id' manifest has no version" }
+    $minimumHostVersion = [string]$manifest.min_plotjuggler_version
+    if ($minimumHostVersion) {
+      $minimumParsed = Convert-Semver $minimumHostVersion "plugin '$id' minimum PlotJuggler version"
+      $hostParsed = Convert-Semver $Version "installer version"
+      if ($minimumParsed -gt $hostParsed) {
+        Die "plugin '$id' requires PlotJuggler $minimumHostVersion, but this installer is $Version"
+      }
+    }
+    $destination = Join-Path $stagePlugins $id
+    New-Item -ItemType Directory -Force -Path $destination | Out-Null
+    Get-ChildItem -LiteralPath $dir.FullName -Force | Copy-Item -Destination $destination -Recurse -Force
+    $dlls = @(Get-ChildItem -LiteralPath $destination -Recurse -Filter "*_plugin.dll")
+    if ($dlls.Count -eq 0) { Die "local plugin '$id' contains no *_plugin.dll" }
+    $script:resolvedPluginVersions[$id] = $version
+    $script:localPluginIds += $id
+    Info "staged local plugin: $id $version ($($dlls.Count) DLL(s))"
+  }
+}
+
 $resolvedPluginVersions = @{}
 $pluginDlls = @()
 if ($SkipPlugins) {
@@ -404,6 +458,10 @@ if ($SkipPlugins) {
 } else {
   $pluginDlls = @(Download-RegistryPlugins)
   Info "staged $($pluginDlls.Count) plugin DLL(s) from $($PluginIds.Count) registry extension(s)"
+  if ($LocalPluginDir) {
+    Stage-LocalPlugins $LocalPluginDir
+    $pluginDlls = @(Get-ChildItem -LiteralPath $stagePlugins -Recurse -Filter "*_plugin.dll" | Sort-Object FullName)
+  }
 }
 
 # --- Qt deployment (Qt DLLs + Qt plugins + MSVC runtime) -------------------
@@ -504,12 +562,13 @@ Copy-CPythonStdlib
 # and the final staged DLL search path. Missing, extra, wrong-version, or unloadable
 # plugins make the release fail before binarycreator runs.
 if ($pluginDlls.Count -gt 0) {
+  $expectedPluginIds = @($PluginIds) + @($localPluginIds)
   $validationArgs = @("--validate-plugins", $stagePlugins)
-  foreach ($id in $PluginIds) {
+  foreach ($id in $expectedPluginIds) {
     $validationArgs += "--expect-plugin"
     $validationArgs += "$id=$($resolvedPluginVersions[$id])"
   }
-  Info "validating $($PluginIds.Count) whitelisted plugin(s) with the staged app ..."
+  Info "validating $($expectedPluginIds.Count) whitelisted plugin(s) with the staged app ..."
   & $stagedExe @validationArgs
   if ($LASTEXITCODE -ne 0) {
     Die "staged plugin validation failed (exit $LASTEXITCODE)"

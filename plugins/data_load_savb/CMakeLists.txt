@@ -65,7 +65,9 @@ if(NOT plotjuggler_sdk_FOUND)
 endif()
 
 if(MSVC)
-  set(SAVB_WARNING_FLAGS /W4 /WX /permissive-)
+  # No /WX: a new MSVC-only warning must not fail a release build; the GCC/Clang
+  # lane below keeps -Werror, which is where the code is checked.
+  set(SAVB_WARNING_FLAGS /W4 /permissive-)
 else()
   set(SAVB_WARNING_FLAGS -Wall -Wextra -Werror -Wshadow -Wconversion -Wold-style-cast -Wpedantic)
 endif()
@@ -75,7 +77,9 @@ add_library(savb_log STATIC savb_log.cpp)
 target_include_directories(savb_log PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(savb_log PRIVATE ${SAVB_WARNING_FLAGS})
 
+# A shared library is a LIBRARY artifact on Linux but a RUNTIME artifact (.dll) on Windows.
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bin)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bin)
 add_library(savb_source_plugin SHARED savb_source.cpp)
 target_compile_options(savb_source_plugin PRIVATE ${SAVB_WARNING_FLAGS})
 target_link_libraries(savb_source_plugin PRIVATE plotjuggler_sdk::plugin_sdk savb_log nlohmann_json::nlohmann_json)

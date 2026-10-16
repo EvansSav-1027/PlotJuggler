@@ -144,7 +144,10 @@ The script:
 
 Options: `-SkipPlugins` (fast core-only installer), `-PluginIds a,b,c` (override
 the curated registry ids), `-PluginRegistryUrl <url-or-json-path>` (registry
-source), `-PluginPlatform <key>` (defaults to `windows-x86_64`), and
+source), `-LocalPluginDir <dir>` (also bundle in-repo plugins built by the workflow:
+one `<id>/` sub-directory each, holding its `manifest.json` and `*_plugin.dll`, checked
+and host-validated like a registry plugin), `-PluginPlatform <key>` (defaults to
+`windows-x86_64`), and
 `-CleanReleaseName` (name the output `PlotJuggler-<Version>-Windows-x64.exe`
 instead of the commit-stamped default — used by release CI on tag builds).
 
