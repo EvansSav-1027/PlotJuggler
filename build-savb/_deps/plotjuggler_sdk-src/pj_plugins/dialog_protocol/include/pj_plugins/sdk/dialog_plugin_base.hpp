@@ -1,0 +1,436 @@
+#pragma once
+// Copyright 2026 Davide Faconti
+// SPDX-License-Identifier: Apache-2.0
+
+#include <pj_plugins/dialog_protocol.h>
+
+#include <cstring>
+#include <exception>
+#include <optional>
+#include <pj_base/plugin_abi_export.hpp>
+#include <string>
+#include <string_view>
+#include <utility>
+
+namespace PJ {
+
+/// Host capabilities available to a dialog instance.
+///
+/// @since 0.21.0
+enum class DialogHostCapability : uint64_t {
+  kCanOpenFile = PJ_DIALOG_HOST_CAN_OPEN_FILE,
+  kCanOpenFiles = PJ_DIALOG_HOST_CAN_OPEN_FILES,
+  kCanSaveFilePath = PJ_DIALOG_HOST_CAN_SAVE_FILE_PATH,
+  kCanSelectFolder = PJ_DIALOG_HOST_CAN_SELECT_FOLDER,
+  kStagesBrowserFile = PJ_DIALOG_HOST_STAGES_BROWSER_FILE,
+};
+
+/// Owned copy of the runtime information supplied by the embedding host.
+///
+/// @since 0.21.0
+struct DialogHostInfo {
+  std::string sdk_version;
+  std::string plotjuggler_version;
+  uint64_t capabilities = 0;
+
+  [[nodiscard]] bool has(DialogHostCapability capability) const noexcept {
+    return (capabilities & static_cast<uint64_t>(capability)) != 0;
+  }
+};
+
+/// C++ base class for Dialog plugins (protocol v4).
+///
+/// Plugin authors subclass this and override the virtual methods. String
+/// lifetime is managed by internal buffers. Trampolines catch exceptions
+/// to prevent UB at the C ABI; caught exceptions populate the `PJ_error_t*`
+/// out-parameter on fallible calls. All trampolines are `noexcept` at the
+/// ABI boundary (v4 requirement) — the try/catch sits inside, so a throw
+/// from user code is translated to an error return, never propagated.
+class DialogPluginBase {
+ public:
+  virtual ~DialogPluginBase() = default;
+
+  virtual std::string manifest() const = 0;
+  virtual std::string ui_content() const = 0;
+  virtual std::string widget_data() = 0;
+
+  virtual bool onWidgetEvent(std::string_view widget_name, std::string_view event_json) = 0;
+
+  virtual bool onTick() {
+    return false;
+  }
+
+  virtual void onAccepted(std::string_view final_state_json) {
+    (void)final_state_json;
+  }
+
+  virtual void onRejected() {}
+
+  virtual std::string saveConfig() const {
+    return "{}";
+  }
+
+  virtual bool loadConfig(std::string_view config_json) {
+    (void)config_json;
+    return false;
+  }
+
+ protected:
+  /// Information supplied by a conforming 0.21+ host before first dialog use.
+  ///
+  /// An empty optional means the plugin is running under a pre-0.21 host or a
+  /// non-conforming embedding host. Repeated successful deliveries use
+  /// last-writer-wins semantics; a rejected delivery preserves the last
+  /// successfully captured snapshot.
+  ///
+  /// @since 0.21.0
+  [[nodiscard]] const std::optional<DialogHostInfo>& hostInfo() const noexcept {
+    return host_info_;
+  }
+
+ public:
+  template <typename CreateFn>
+  static const PJ_dialog_vtable_t* vtableWithCreate(CreateFn create_fn, const char* manifest_json = nullptr) {
+    static const PJ_dialog_vtable_t vt = {
+        PJ_DIALOG_PROTOCOL_VERSION,
+        sizeof(PJ_dialog_vtable_t),
+        create_fn,
+        trampoline_destroy,
+        trampoline_get_manifest,
+        trampoline_get_ui_content,
+        trampoline_get_widget_data,
+        trampoline_on_widget_event,
+        trampoline_on_tick,
+        trampoline_on_accepted,
+        trampoline_on_rejected,
+        trampoline_save_config,
+        trampoline_load_config,
+        manifest_json,
+        trampoline_set_host_info,
+    };
+    return &vt;
+  }
+
+ private:
+  std::string manifest_buf_;
+  std::string ui_content_buf_;
+  std::string widget_data_buf_;
+  std::string config_buf_;
+
+  bool manifest_cached_ = false;
+  bool ui_content_cached_ = false;
+
+  // Layout discipline: append new data members after every existing member.
+  std::optional<DialogHostInfo> host_info_;
+
+  static void storeError(PJ_error_t* out_error, int32_t code, std::string_view domain, std::string_view message) {
+    if (out_error == nullptr) {
+      return;
+    }
+    out_error->code = code;
+    auto write_field = [](char* dest, std::size_t dest_size, std::string_view src) {
+      if (dest == nullptr || dest_size == 0) {
+        return;
+      }
+      std::size_t n = src.size() < dest_size - 1 ? src.size() : dest_size - 1;
+      std::memcpy(dest, src.data(), n);
+      dest[n] = '\0';
+    };
+    write_field(out_error->domain, sizeof(out_error->domain), domain);
+    write_field(out_error->message, sizeof(out_error->message), message);
+    // Clear the v3.1 growth-path slots so a reused error struct does not
+    // carry a stale pointer from a previous call. Matches sdk::fillError.
+    out_error->extended = nullptr;
+    out_error->extended_kind[0] = '\0';
+  }
+
+  static void trampoline_destroy(void* ctx) noexcept {
+    try {
+      delete static_cast<DialogPluginBase*>(ctx);
+    } catch (...) {}
+  }
+
+  static const char* trampoline_get_manifest(void* ctx) noexcept {
+    auto* self = static_cast<DialogPluginBase*>(ctx);
+    try {
+      if (!self->manifest_cached_) {
+        self->manifest_buf_ = self->manifest();
+        self->manifest_cached_ = true;
+      }
+      return self->manifest_buf_.c_str();
+    } catch (...) {
+      return "{}";
+    }
+  }
+
+  static const char* trampoline_get_ui_content(void* ctx) noexcept {
+    auto* self = static_cast<DialogPluginBase*>(ctx);
+    try {
+      if (!self->ui_content_cached_) {
+        self->ui_content_buf_ = self->ui_content();
+        self->ui_content_cached_ = true;
+      }
+      return self->ui_content_buf_.c_str();
+    } catch (...) {
+      return "";
+    }
+  }
+
+  static const char* trampoline_get_widget_data(void* ctx) noexcept {
+    auto* self = static_cast<DialogPluginBase*>(ctx);
+    try {
+      self->widget_data_buf_ = self->widget_data();
+      return self->widget_data_buf_.c_str();
+    } catch (...) {
+      return "{}";
+    }
+  }
+
+  static bool trampoline_on_widget_event(
+      void* ctx, const char* widget_name, const char* event_json, PJ_error_t* out_error) noexcept {
+    auto* self = static_cast<DialogPluginBase*>(ctx);
+    try {
+      return self->onWidgetEvent(
+          widget_name == nullptr ? std::string_view{} : std::string_view(widget_name),
+          event_json == nullptr ? std::string_view{} : std::string_view(event_json));
+    } catch (const std::exception& e) {
+      self->storeError(out_error, 1, "dialog", std::string("on_widget_event threw: ") + e.what());
+      return false;
+    } catch (...) {
+      self->storeError(out_error, 1, "dialog", "unknown exception in on_widget_event");
+      return false;
+    }
+  }
+
+  static bool trampoline_on_tick(void* ctx, PJ_error_t* out_error) noexcept {
+    auto* self = static_cast<DialogPluginBase*>(ctx);
+    try {
+      return self->onTick();
+    } catch (const std::exception& e) {
+      self->storeError(out_error, 1, "dialog", std::string("on_tick threw: ") + e.what());
+      return false;
+    } catch (...) {
+      self->storeError(out_error, 1, "dialog", "unknown exception in on_tick");
+      return false;
+    }
+  }
+
+  static void trampoline_on_accepted(void* ctx, const char* final_state_json) noexcept {
+    auto* self = static_cast<DialogPluginBase*>(ctx);
+    try {
+      self->onAccepted(final_state_json == nullptr ? std::string_view{} : std::string_view(final_state_json));
+    } catch (...) {}
+  }
+
+  static void trampoline_on_rejected(void* ctx) noexcept {
+    auto* self = static_cast<DialogPluginBase*>(ctx);
+    try {
+      self->onRejected();
+    } catch (...) {}
+  }
+
+  static bool trampoline_save_config(void* ctx, PJ_string_view_t* out_json, PJ_error_t* out_error) noexcept {
+    auto* self = static_cast<DialogPluginBase*>(ctx);
+    if (out_json == nullptr) {
+      self->storeError(out_error, 2, "dialog", "save_config called with null out_json");
+      return false;
+    }
+    try {
+      self->config_buf_ = self->saveConfig();
+      out_json->data = self->config_buf_.data();
+      out_json->size = self->config_buf_.size();
+      return true;
+    } catch (const std::exception& e) {
+      self->storeError(out_error, 1, "dialog", std::string("save_config threw: ") + e.what());
+      return false;
+    } catch (...) {
+      self->storeError(out_error, 1, "dialog", "unknown exception in save_config");
+      return false;
+    }
+  }
+
+  static bool trampoline_load_config(void* ctx, PJ_string_view_t config_json, PJ_error_t* out_error) noexcept {
+    auto* self = static_cast<DialogPluginBase*>(ctx);
+    try {
+      std::string_view sv =
+          config_json.data == nullptr ? std::string_view{} : std::string_view(config_json.data, config_json.size);
+      return self->loadConfig(sv);
+    } catch (const std::exception& e) {
+      self->storeError(out_error, 1, "dialog", std::string("load_config threw: ") + e.what());
+      return false;
+    } catch (...) {
+      self->storeError(out_error, 1, "dialog", "unknown exception in load_config");
+      return false;
+    }
+  }
+
+  static bool trampoline_set_host_info(void* ctx, const PJ_dialog_host_info_t* info, PJ_error_t* out_error) noexcept {
+    auto* self = static_cast<DialogPluginBase*>(ctx);
+    if (info == nullptr) {
+      self->storeError(out_error, 2, "dialog", "set_host_info called with null info");
+      return false;
+    }
+    constexpr std::size_t kHeaderSize =
+        offsetof(PJ_dialog_host_info_t, struct_size) + sizeof(PJ_dialog_host_info_t::struct_size);
+    if (info->struct_size < kHeaderSize) {
+      self->storeError(out_error, 2, "dialog", "set_host_info called with undersized info");
+      return false;
+    }
+    const auto field_is_covered = [info](std::size_t offset, std::size_t size) noexcept {
+      return static_cast<std::size_t>(info->struct_size) >= offset + size;
+    };
+    try {
+      auto copy_string = [](PJ_string_view_t value) {
+        return value.data == nullptr || value.size == 0 ? std::string() : std::string(value.data, value.size);
+      };
+      DialogHostInfo copied;
+      if (field_is_covered(offsetof(PJ_dialog_host_info_t, sdk_version), sizeof(PJ_string_view_t))) {
+        copied.sdk_version = copy_string(info->sdk_version);
+      }
+      if (field_is_covered(offsetof(PJ_dialog_host_info_t, plotjuggler_version), sizeof(PJ_string_view_t))) {
+        copied.plotjuggler_version = copy_string(info->plotjuggler_version);
+      }
+      if (field_is_covered(offsetof(PJ_dialog_host_info_t, capabilities), sizeof(uint64_t))) {
+        copied.capabilities = info->capabilities;
+      }
+      self->host_info_ = std::move(copied);
+      return true;
+    } catch (const std::exception&) {
+      // Keep this noexcept catch path allocation-free, including for bad_alloc.
+      self->storeError(out_error, 1, "dialog", "set_host_info failed");
+      return false;
+    } catch (...) {
+      self->storeError(out_error, 1, "dialog", "unknown exception in set_host_info");
+      return false;
+    }
+  }
+};
+
+/// Per-dialog-type vtable accessor. Specialised by `PJ_DIALOG_PLUGIN`.
+/// Plugin authors don't call this directly; they call `borrowDialog(member)`
+/// from their host's `getDialog()` override, and the compiler picks the
+/// right specialisation from the dialog member's static type.
+template <class DialogT>
+const PJ_dialog_vtable_t* dialogVtableFor() noexcept;
+
+/// Build a `PJ_borrowed_dialog_t` fat pointer from an embedded dialog
+/// member. This is what hosts with embedded dialogs should return from
+/// their `getDialog()` override — no `extern "C"` forward declaration
+/// required in the plugin source.
+///
+///   class MySource : public PJ::FileSourceBase {
+///     PJ_borrowed_dialog_t getDialog() override {
+///       return PJ::borrowDialog(dialog_);
+///     }
+///    private:
+///     MyDialog dialog_;
+///   };
+template <class DialogT>
+PJ_borrowed_dialog_t borrowDialog(DialogT& dialog) noexcept {
+  // static_cast to DialogPluginBase* before erasing to void* so the
+  // C-ABI ctx points to the DialogPluginBase subobject regardless of
+  // multiple inheritance order. Without this, plugins whose dialog
+  // class derives from another base first (e.g. QObject for Q_OBJECT
+  // support) would hand the wrong base-pointer to the trampolines,
+  // and `static_cast<DialogPluginBase*>(ctx)` inside them would read
+  // garbage members and dispatch through a corrupted vtable, producing
+  // a SIGSEGV deep inside the first `get_ui_content` / `widget_data`
+  // call.
+  return PJ_borrowed_dialog_t{static_cast<DialogPluginBase*>(&dialog), dialogVtableFor<DialogT>()};
+}
+
+}  // namespace PJ
+
+/// Macro to export a Dialog plugin from a DSO.
+///
+/// Works whether the dialog is the only plugin in the DSO or co-resident with
+/// another family (DataSource, MessageParser, Toolbox). The shared
+/// `pj_plugin_abi_version` export uses weak linkage, so duplicate definitions
+/// across family macros in the same DSO collapse into one COMDAT entry.
+/// Prefer `PJ_DIALOG_PLUGIN(ClassName, manifest_json_literal)` for new
+/// plugins so catalog scans can read metadata without instantiating the
+/// dialog. The one-argument form is kept for source compatibility and leaves
+/// the optional static manifest tail slot null.
+///
+/// Emits three things:
+///   1. The boot-level `pj_plugin_abi_version` symbol the host loader checks
+///      first (via `PJ_EXPORT_PLUGIN_ABI_VERSION`).
+///   2. The `PJ_get_dialog_vtable()` C symbol the host resolves via `dlsym`.
+///   3. A specialisation of `PJ::dialogVtableFor<ClassName>()` that lets
+///      other plugin code (notably a host's `getDialog()` override) obtain
+///      the vtable pointer type-safely via `PJ::borrowDialog(member)` —
+///      no `extern "C"` forward declaration required in the plugin source.
+#define PJ_DIALOG_PLUGIN_SELECT(_1, _2, NAME, ...) NAME
+// The extra PJ_DIALOG_PLUGIN_EXPAND pass makes the overload-by-arg-count
+// dispatch correct under BOTH MSVC preprocessors. The traditional MSVC
+// preprocessor (the default without /Zc:preprocessor) forwards __VA_ARGS__
+// into a nested macro call as a single argument, so without this rescan a
+// two-argument PJ_DIALOG_PLUGIN(Class, kManifest) selects the one-arg LEGACY
+// branch with the glued pair as ClassName (C2064/C2912 at the call site).
+#define PJ_DIALOG_PLUGIN_EXPAND(x) x
+#define PJ_DIALOG_PLUGIN(...) \
+  PJ_DIALOG_PLUGIN_EXPAND(    \
+      PJ_DIALOG_PLUGIN_SELECT(__VA_ARGS__, PJ_DIALOG_PLUGIN_WITH_MANIFEST, PJ_DIALOG_PLUGIN_LEGACY)(__VA_ARGS__))
+#define PJ_DIALOG_PLUGIN_LEGACY(ClassName) PJ_DIALOG_PLUGIN_WITH_MANIFEST(ClassName, nullptr)
+#define PJ_DIALOG_PLUGIN_WITH_MANIFEST(ClassName, ManifestJson)                             \
+  PJ_EXPORT_PLUGIN_ABI_VERSION(PJ_DIALOG_EXPORT)                                            \
+  extern "C" PJ_DIALOG_EXPORT const PJ_dialog_vtable_t* PJ_get_dialog_vtable() noexcept {   \
+    static const PJ_dialog_vtable_t* vt = PJ::DialogPluginBase::vtableWithCreate(           \
+        []() noexcept -> void* {                                                            \
+          try {                                                                             \
+            /* static_cast to DialogPluginBase* before erasing to void* so      */          \
+            /* trampolines that re-cast back find the right subobject in        */          \
+            /* multiple-inheritance plugins (e.g. ClassName : QObject, Dialog). */          \
+            return static_cast<PJ::DialogPluginBase*>(new ClassName());                     \
+          } catch (...) {                                                                   \
+            return nullptr;                                                                 \
+          }                                                                                 \
+        },                                                                                  \
+        ManifestJson);                                                                      \
+    return vt;                                                                              \
+  }                                                                                         \
+  namespace PJ {                                                                            \
+  template <>                                                                               \
+  [[maybe_unused]] inline const PJ_dialog_vtable_t* dialogVtableFor<ClassName>() noexcept { \
+    return PJ_get_dialog_vtable();                                                          \
+  }                                                                                         \
+  }
+
+// Variant for namespaced plugin classes. SymbolName must be an unqualified
+// identifier and is used only to form the unique static getter name.
+#define PJ_DIALOG_PLUGIN_NAMED(ClassName, SymbolName, ManifestJson) \
+  PJ_DIALOG_PLUGIN_WITH_MANIFEST(ClassName, ManifestJson)
+
+// --- Static-link variant (WASM / no dlopen) ---  see data_source_plugin_base.hpp.
+// Many statically-linked plugins each carry a PJ_DIALOG_PLUGIN, so the fixed
+// `extern "C" PJ_get_dialog_vtable` symbol (and the ABI-version export) would
+// collide at link. The static registry never resolves a dialog via dlsym (the
+// host short-circuits the dialog path on WASM), so emit only a uniquely
+// class-keyed getter. The host's static composition point passes this getter's
+// result alongside the owning source/parser/toolbox vtable, and
+// dialogVtableFor<ClassName>() also uses it inside the plugin.
+#ifdef PJ_STATIC_PLUGINS
+#undef PJ_DIALOG_PLUGIN_WITH_MANIFEST
+#undef PJ_DIALOG_PLUGIN_NAMED
+#define PJ_DIALOG_PLUGIN_NAMED(ClassName, SymbolName, ManifestJson)                         \
+  const PJ_dialog_vtable_t* pj_static_get_dialog_vtable_##SymbolName() noexcept {           \
+    static const PJ_dialog_vtable_t* vt = PJ::DialogPluginBase::vtableWithCreate(           \
+        []() noexcept -> void* {                                                            \
+          try {                                                                             \
+            return static_cast<PJ::DialogPluginBase*>(new ClassName());                     \
+          } catch (...) {                                                                   \
+            return nullptr;                                                                 \
+          }                                                                                 \
+        },                                                                                  \
+        ManifestJson);                                                                      \
+    return vt;                                                                              \
+  }                                                                                         \
+  namespace PJ {                                                                            \
+  template <>                                                                               \
+  [[maybe_unused]] inline const PJ_dialog_vtable_t* dialogVtableFor<ClassName>() noexcept { \
+    return pj_static_get_dialog_vtable_##SymbolName();                                      \
+  }                                                                                         \
+  }
+#define PJ_DIALOG_PLUGIN_WITH_MANIFEST(ClassName, ManifestJson) \
+  PJ_DIALOG_PLUGIN_NAMED(ClassName, ClassName, ManifestJson)
+#endif  // PJ_STATIC_PLUGINS

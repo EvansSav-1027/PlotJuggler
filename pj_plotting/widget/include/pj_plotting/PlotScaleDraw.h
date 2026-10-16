@@ -17,4 +17,12 @@ class PlotScaleDraw : public QwtScaleDraw {
   [[nodiscard]] QwtText label(double value) const override;
 };
 
+/// X-axis scale draw for absolute time ("Use time offset" off): reads each
+/// tick as Unix epoch seconds and labels it as UTC time of day, "hh:mm:ss.z"
+/// (no date).
+class TimeScaleDraw : public QwtScaleDraw {
+ public:
+  [[nodiscard]] QwtText label(double value) const override;
+};
+
 }  // namespace PJ

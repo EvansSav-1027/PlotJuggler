@@ -1,0 +1,506 @@
+/**
+ * @file data_source_host_views.hpp
+ * @brief C++ wrappers over the DataSource runtime host vtable (v4).
+ *
+ * The runtime host is delivered to DataSource plugins via the service
+ * registry under the canonical name `"pj.runtime.v1"`. This header wraps
+ * the raw `PJ_data_source_runtime_host_t` fat pointer in an ergonomic
+ * view that null-checks every call and maps ABI error out-params into
+ * `PJ::Expected<T>` / `PJ::Status`.
+ *
+ * Plugin authors access the view through
+ * `DataSourcePluginBase::runtimeHost()`; it is not constructed directly
+ * in plugin code.
+ */
+// Copyright 2026 Davide Faconti
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <type_traits>
+
+#include "pj_base/buffer_anchor.hpp"
+#include "pj_base/data_source_protocol.h"
+#include "pj_base/expected.hpp"
+#include "pj_base/sdk/ingest_completion.hpp"
+#include "pj_base/sdk/plugin_data_api.hpp"
+
+namespace PJ {
+
+/// C++ mirror of PJ_data_source_state_t.
+enum class DataSourceState : uint32_t {
+  kIdle = PJ_DATA_SOURCE_STATE_IDLE,
+  kConfiguring = PJ_DATA_SOURCE_STATE_CONFIGURING,
+  kStarting = PJ_DATA_SOURCE_STATE_STARTING,
+  kRunning = PJ_DATA_SOURCE_STATE_RUNNING,
+  kPaused = PJ_DATA_SOURCE_STATE_PAUSED,
+  kStopping = PJ_DATA_SOURCE_STATE_STOPPING,
+  kStopped = PJ_DATA_SOURCE_STATE_STOPPED,
+  kFailed = PJ_DATA_SOURCE_STATE_FAILED,
+};
+
+/// Severity level for plugin-to-host diagnostic messages.
+enum class DataSourceMessageLevel : uint32_t {
+  kInfo = PJ_DATA_SOURCE_MESSAGE_INFO,
+  kWarning = PJ_DATA_SOURCE_MESSAGE_WARNING,
+  kError = PJ_DATA_SOURCE_MESSAGE_ERROR,
+};
+
+/// Type of message box to display (determines icon).
+enum class MessageBoxType : uint32_t {
+  kInfo = PJ_MESSAGE_BOX_INFO,
+  kWarning = PJ_MESSAGE_BOX_WARNING,
+  kError = PJ_MESSAGE_BOX_ERROR,
+  kQuestion = PJ_MESSAGE_BOX_QUESTION,
+};
+
+/// Standard buttons for message boxes (combinable with |).
+enum class MessageBoxButton : int {
+  kOk = PJ_MSG_BTN_OK,
+  kCancel = PJ_MSG_BTN_CANCEL,
+  kYes = PJ_MSG_BTN_YES,
+  kNo = PJ_MSG_BTN_NO,
+  kContinue = PJ_MSG_BTN_CONTINUE,
+  kAbort = PJ_MSG_BTN_ABORT,
+  kRetry = PJ_MSG_BTN_RETRY,
+  kIgnore = PJ_MSG_BTN_IGNORE,
+};
+
+inline int operator|(MessageBoxButton a, MessageBoxButton b) {
+  return static_cast<int>(a) | static_cast<int>(b);
+}
+inline int operator|(int a, MessageBoxButton b) {
+  return a | static_cast<int>(b);
+}
+
+/// Capability flag constants mirrored from the C ABI.
+constexpr uint64_t kCapabilityFiniteImport = PJ_DATA_SOURCE_CAPABILITY_FINITE_IMPORT;
+constexpr uint64_t kCapabilityContinuousStream = PJ_DATA_SOURCE_CAPABILITY_CONTINUOUS_STREAM;
+constexpr uint64_t kCapabilityDirectIngest = PJ_DATA_SOURCE_CAPABILITY_DIRECT_INGEST;
+constexpr uint64_t kCapabilityDelegatedIngest = PJ_DATA_SOURCE_CAPABILITY_DELEGATED_INGEST;
+constexpr uint64_t kCapabilitySupportsPause = PJ_DATA_SOURCE_CAPABILITY_SUPPORTS_PAUSE;
+constexpr uint64_t kCapabilityHasDialog = PJ_DATA_SOURCE_CAPABILITY_HAS_DIALOG;
+constexpr uint64_t kCapabilityPerTopicPause = PJ_DATA_SOURCE_CAPABILITY_PER_TOPIC_PAUSE;
+
+using ParserBindingHandle = PJ_parser_binding_handle_t;
+
+/// C++ mirror of PJ_parser_binding_request_t for delegated-ingest parser lookup.
+struct ParserBindingRequest {
+  std::string_view topic_name;
+  std::string_view parser_encoding;
+  std::string_view type_name;
+  Span<const uint8_t> schema;
+  std::string_view parser_config_json;
+};
+
+/// A topic the source can stream but has not (necessarily) subscribed. Handed
+/// to the host via DataSourceRuntimeHostView::notifyAvailableTopics so the host
+/// lists and a-priori classifies it (via classify_schema) with no data flowing.
+/// Mirrors ParserBindingRequest's parser inputs so the host can classify and,
+/// later, bind identically. `schema` may be empty when the encoding needs none.
+struct AvailableTopic {
+  std::string_view topic_name;
+  std::string_view parser_encoding;
+  std::string_view type_name;
+  Span<const uint8_t> schema;
+};
+
+/// Convert a PJ_error_t populated by the ABI into a descriptive std::string.
+/// Safe to call on a zero-initialized error (returns "unspecified error").
+[[nodiscard]] std::string errorToString(const PJ_error_t& err);
+
+class ParserIngestHostView;
+class DatasetIngestHostView;
+
+/**
+ * Type-safe view over the runtime host vtable.
+ *
+ * Each method null-checks the underlying function pointer and maps the
+ * ABI `bool + PJ_error_t*` convention into `PJ::Expected<T>` /
+ * `PJ::Status` for idiomatic C++ usage. Calls on an unbound host return
+ * errors rather than crashing.
+ */
+class DataSourceRuntimeHostView {
+ public:
+  DataSourceRuntimeHostView() = default;
+  explicit DataSourceRuntimeHostView(PJ_data_source_runtime_host_t host) : host_(host) {}
+
+  [[nodiscard]] bool valid() const noexcept {
+    return host_.ctx != nullptr && host_.vtable != nullptr;
+  }
+
+  [[nodiscard]] ParserIngestHostView parserIngest() const noexcept;
+
+  /// Canonical dataset-scoped ingest lifecycle facade — the wider sibling of
+  /// parserIngest() that also exposes progress/stop. See DatasetIngestHostView.
+  [[nodiscard]] DatasetIngestHostView datasetIngest() const noexcept;
+
+  /// Send a diagnostic message to the host UI log. Never fails.
+  void reportMessage(DataSourceMessageLevel level, std::string_view message) const {
+    if (valid() && host_.vtable->report_message != nullptr) {
+      host_.vtable->report_message(
+          host_.ctx, static_cast<PJ_data_source_message_level_t>(level), sdk::toAbiString(message));
+    }
+  }
+
+  /// Begin a progress bar. Returns an error if the host refused to start it.
+  [[nodiscard]] Status progressStart(std::string_view label, uint64_t total_steps, bool cancellable) const;
+
+  /// Advance progress. Returns true to continue, false if the user cancelled.
+  [[nodiscard]] bool progressUpdate(uint64_t current_step) const {
+    if (!valid() || host_.vtable->progress_update == nullptr) {
+      return false;
+    }
+    return host_.vtable->progress_update(host_.ctx, current_step);
+  }
+
+  /// End the current progress sequence.
+  void progressFinish() const {
+    if (valid() && host_.vtable->progress_finish != nullptr) {
+      host_.vtable->progress_finish(host_.ctx);
+    }
+  }
+
+  /// Returns true if the host has requested the plugin to stop.
+  [[nodiscard]] bool isStopRequested() const {
+    if (!valid() || host_.vtable->is_stop_requested == nullptr) {
+      return false;
+    }
+    return host_.vtable->is_stop_requested(host_.ctx);
+  }
+
+  /// Inform the host that the plugin has transitioned to @p state.
+  void notifyState(DataSourceState state) const {
+    if (valid() && host_.vtable->notify_state != nullptr) {
+      host_.vtable->notify_state(host_.ctx, static_cast<PJ_data_source_state_t>(state));
+    }
+  }
+
+  /// Plugin-initiated stop. @p terminal_state should be kStopped or kFailed.
+  void requestStop(DataSourceState terminal_state, std::string_view reason) const {
+    if (valid() && host_.vtable->request_stop != nullptr) {
+      host_.vtable->request_stop(
+          host_.ctx, static_cast<PJ_data_source_state_t>(terminal_state), sdk::toAbiString(reason));
+    }
+  }
+
+  /// Bind (or look up) a parser for delegated ingest.
+  [[nodiscard]] Expected<ParserBindingHandle> ensureParserBinding(const ParserBindingRequest& request) const;
+
+  /// Advertise the full set of topics this source can stream but has not
+  /// (necessarily) subscribed, so the host can list and a-priori classify them
+  /// with no data flowing. Each call replaces the previously-advertised set for
+  /// this source. Returns an error if the host does not expose the tail slot
+  /// (old host) — callers may treat that as "advertisement unsupported" and
+  /// fall back to legacy behavior. Call on the poll/stream thread.
+  [[nodiscard]] Status notifyAvailableTopics(Span<const AvailableTopic> topics) const;
+
+  /// Declare, on the stream thread at download start, the canonical descriptor of
+  /// the reproducible request this source answers, so the host can cache the
+  /// download (attach_source_record tail slot). The host copies and stores the
+  /// bytes verbatim and derives its cache key from them, scoped by the bound
+  /// provider id. The last attachment before this context's first pushMessage
+  /// wins; byte-identical repeats before ingest are idempotent. Attaching after
+  /// ingest begins or using a host that predates the slot returns an error
+  /// without affecting ingest. See PJ_data_source_runtime_host_vtable_t's
+  /// attach_source_record documentation for validation and commit semantics.
+  [[nodiscard]] Status attachSourceRecord(std::string_view descriptor_json) const;
+
+  /// Report, on the stream thread AFTER every producer and pushMessage on this
+  /// context has quiesced, the terminal outcome of this finite ingest
+  /// (complete_ingest tail slot). `requested_topics` is the FULL requested set
+  /// from the request snapshot — never assembled from successful pulls; kCompleted
+  /// attests the entire declared request finished. The call seals the context
+  /// for capture: later pushes/attachments/conflicting terminals veto caching
+  /// (an identical repeat is idempotent). Success means "terminal accepted",
+  /// never "published". Not a cancellation mechanism — stop goes through the
+  /// host's thread-safe stop path first. Old hosts (no slot) return an error;
+  /// the plugin proceeds uncached.
+  [[nodiscard]] Status completeIngest(
+      sdk::IngestOutcome outcome, Span<const std::string_view> requested_topics,
+      PJ_ingest_completion_flags_t flags = PJ_INGEST_COMPLETION_FLAG_NONE) const;
+
+  /// Attach a descriptive metadata document (one UTF-8 JSON object) to the
+  /// dataset this ingest produces, for the host to display generically
+  /// (set_dataset_metadata tail slot). Observations ABOUT the loaded artifact
+  /// — never request identity: caching and restore stay attachSourceRecord's
+  /// business, and a refused document has no effect on ingestion. Each
+  /// successful call replaces the whole document; "{}" clears it. Old hosts
+  /// (no slot) return an error; the plugin proceeds without metadata.
+  [[nodiscard]] Status setDatasetMetadata(std::string_view metadata_json) const;
+
+  /// Push a message via a deferred FetchMessageData callable. The DataSource
+  /// hands the host a callable that produces the payload bytes when invoked.
+  /// The host applies the active ObjectIngestPolicy (resolved via the
+  /// ObjectIngestPolicyResolver below for source_id, topic, kind) to decide
+  /// whether to invoke the callable at ingest, only on consumer pull, or
+  /// never. The DataSource is policy-agnostic — it neither queries the
+  /// policy nor tracks which mode is active.
+  ///
+  /// The callable MUST be idempotent — the host may invoke it zero, one, or
+  /// many times depending on policy and consumer pulls. It MUST be
+  /// thread-safe: invocations may come from the ingest thread (kEager) or
+  /// from consumer threads (lazy pulls). Capture by shared_ptr (file
+  /// readers, mcap chunks) so the source buffer outlives every pending
+  /// pull.
+  ///
+  /// FetchMessageData return type:
+  ///   - sdk::PayloadView { bytes, anchor }  — preferred, zero-copy. The
+  ///     anchor is propagated through the C ABI as a heap-held shared_ptr
+  ///     copy that the host releases when no longer needed.
+  ///   - std::vector<uint8_t>                — legacy form. The vector is
+  ///     heap-relocated and used as its own anchor; bytes survive across
+  ///     the C ABI boundary at the cost of one alloc-and-move.
+  ///
+  /// The host MUST advertise the push_message tail slot. We wrap the
+  /// closure into a PJ_message_data_fetcher_t and hand it over verbatim; the
+  /// host applies ObjectIngestPolicy and decides when (and whether) to
+  /// invoke it. There is no legacy fallback: a host that doesn't expose
+  /// the slot returns an explicit error here.
+  template <typename FetchMessageData>
+  [[nodiscard]] Status pushMessage(
+      ParserBindingHandle handle, Timestamp host_timestamp_ns, FetchMessageData&& fetch_message_data) const {
+    using FetchMessageDataT = std::decay_t<FetchMessageData>;
+    using FetchMessageDataResult = std::decay_t<std::invoke_result_t<FetchMessageDataT&>>;
+    static_assert(
+        std::is_same_v<FetchMessageDataResult, sdk::PayloadView> ||
+            std::is_same_v<FetchMessageDataResult, std::vector<uint8_t>>,
+        "FetchMessageData must return sdk::PayloadView (zero-copy) or std::vector<uint8_t>");
+
+    if (!valid()) {
+      return unexpected(std::string("runtime host is not bound"));
+    }
+    if (!PJ_HAS_TAIL_SLOT(PJ_data_source_runtime_host_vtable_t, host_.vtable, push_message)) {
+      return unexpected(std::string("runtime host does not expose push_message"));
+    }
+
+    auto* ctx = new FetchMessageDataT(std::forward<FetchMessageData>(fetch_message_data));
+
+    PJ_message_data_fetcher_t abi_fetch_message_data{
+        .ctx = ctx,
+        .fetchMessageData = +[](void* c, PJ_payload_t* out, PJ_error_t* err) noexcept -> bool {
+          try {
+            auto& fn = *static_cast<FetchMessageDataT*>(c);
+            using Result = std::decay_t<decltype(fn())>;
+            if constexpr (std::is_same_v<Result, sdk::PayloadView>) {
+              // Zero-copy path: hold a heap copy of the BufferAnchor so it
+              // survives across the C ABI; release_fn deletes the holder
+              // (and decrements the underlying shared_ptr ref count).
+              auto pv = fn();
+              auto* held = new sdk::BufferAnchor(std::move(pv.anchor));
+              out->data = pv.bytes.data();
+              out->size = pv.bytes.size();
+              out->anchor.ctx = held;
+              out->anchor.release = +[](void* h) noexcept { delete static_cast<sdk::BufferAnchor*>(h); };
+            } else {
+              // Closure returns std::vector<uint8_t>: heap-hold the vector;
+              // it owns its bytes.
+              auto* held = new std::vector<uint8_t>(fn());
+              out->data = held->data();
+              out->size = held->size();
+              out->anchor.ctx = held;
+              out->anchor.release = +[](void* h) noexcept { delete static_cast<std::vector<uint8_t>*>(h); };
+            }
+            return true;
+          } catch (const std::exception& e) {
+            sdk::fillError(err, 1, "plugin", e.what());
+            return false;
+          } catch (...) {
+            sdk::fillError(err, 1, "plugin", "unknown exception in FetchMessageData callable");
+            return false;
+          }
+        },
+        .release = +[](void* c) noexcept { delete static_cast<FetchMessageDataT*>(c); },
+    };
+
+    PJ_error_t err{};
+    if (!host_.vtable->push_message(host_.ctx, handle, host_timestamp_ns, abi_fetch_message_data, &err)) {
+      return unexpected(errorToString(err));
+    }
+    return okStatus();
+  }
+
+  /**
+   * Display a modal message box and wait for user response.
+   * @return The button clicked, or kOk if the host does not support dialogs.
+   */
+  [[nodiscard]] MessageBoxButton showMessageBox(
+      MessageBoxType type, std::string_view title, std::string_view message, int buttons = 0) const;
+
+  void showInfo(std::string_view title, std::string_view message) const {
+    (void)showMessageBox(MessageBoxType::kInfo, title, message, static_cast<int>(MessageBoxButton::kOk));
+  }
+  void showWarning(std::string_view title, std::string_view message) const {
+    (void)showMessageBox(MessageBoxType::kWarning, title, message, static_cast<int>(MessageBoxButton::kOk));
+  }
+  void showError(std::string_view title, std::string_view message) const {
+    (void)showMessageBox(MessageBoxType::kError, title, message, static_cast<int>(MessageBoxButton::kOk));
+  }
+  [[nodiscard]] bool askContinue(std::string_view title, std::string_view message) const {
+    auto result = showMessageBox(
+        MessageBoxType::kQuestion, title, message, MessageBoxButton::kContinue | MessageBoxButton::kAbort);
+    return result == MessageBoxButton::kContinue;
+  }
+  [[nodiscard]] bool askYesNo(std::string_view title, std::string_view message) const {
+    auto result =
+        showMessageBox(MessageBoxType::kQuestion, title, message, MessageBoxButton::kYes | MessageBoxButton::kNo);
+    return result == MessageBoxButton::kYes;
+  }
+
+  /**
+   * List all available parser encodings.
+   * @return JSON array string of encoding names, or empty if no parsers loaded.
+   */
+  [[nodiscard]] std::string_view listAvailableEncodings() const {
+    if (!valid() || host_.vtable->list_available_encodings == nullptr) {
+      return {};
+    }
+    const char* result = host_.vtable->list_available_encodings(host_.ctx);
+    return result == nullptr ? std::string_view{} : std::string_view(result);
+  }
+
+  /// Access the underlying C ABI struct (SDK internals).
+  [[nodiscard]] const PJ_data_source_runtime_host_t& raw() const noexcept {
+    return host_;
+  }
+
+ private:
+  PJ_data_source_runtime_host_t host_{};
+};
+
+/// Narrow delegated-ingest facade shared by DataSource and Toolbox code.
+class ParserIngestHostView {
+ public:
+  ParserIngestHostView() = default;
+  explicit ParserIngestHostView(PJ_data_source_runtime_host_t host) : host_(host) {}
+
+  [[nodiscard]] bool valid() const noexcept {
+    return host_.valid();
+  }
+
+  [[nodiscard]] Expected<ParserBindingHandle> ensureParserBinding(const ParserBindingRequest& request) const {
+    return host_.ensureParserBinding(request);
+  }
+
+  template <typename FetchMessageData>
+  [[nodiscard]] Status pushMessage(
+      ParserBindingHandle handle, Timestamp host_timestamp_ns, FetchMessageData&& fetch_message_data) const {
+    return host_.pushMessage(handle, host_timestamp_ns, std::forward<FetchMessageData>(fetch_message_data));
+  }
+
+ private:
+  DataSourceRuntimeHostView host_{};
+};
+
+inline ParserIngestHostView DataSourceRuntimeHostView::parserIngest() const noexcept {
+  return ParserIngestHostView{host_};
+}
+
+/// Canonical dataset-scoped ingest lifecycle facade — the ONE surface for
+/// both delegated parsing and direct toolbox writes. Wraps the same runtime
+/// host that ParserIngestHostView wraps, but also exposes the lifecycle verbs
+/// the parser-only facade hides: progress start/update/finish and cooperative
+/// stop. A toolbox that writes directly (e.g. Arrow batches through
+/// ToolboxHostView) acquires this view for its dataset purely for lifecycle,
+/// and never binds a parser. Obtain via
+/// ToolboxRuntimeHostView::createDatasetIngest() (toolboxes) or
+/// DataSourceRuntimeHostView::datasetIngest() (data sources).
+///
+/// Deliberately excludes notifyDataChanged(): a direct-writing toolbox still
+/// signals the host through its already-held ToolboxRuntimeHostView (the
+/// dataset ingest context and the toolbox instance's runtime host are
+/// distinct handles). progressFinish() ends the progress sequence only — it
+/// does not imply a host UI refresh.
+class DatasetIngestHostView {
+ public:
+  DatasetIngestHostView() = default;
+  explicit DatasetIngestHostView(PJ_data_source_runtime_host_t host) : host_(host) {}
+
+  [[nodiscard]] bool valid() const noexcept {
+    return host_.valid();
+  }
+
+  /// Send a diagnostic message to the host UI log. Never fails.
+  void reportMessage(DataSourceMessageLevel level, std::string_view message) const {
+    host_.reportMessage(level, message);
+  }
+
+  /// Begin a progress bar. Returns an error if the host refused to start it.
+  [[nodiscard]] Status progressStart(std::string_view label, uint64_t total_steps, bool cancellable) const {
+    return host_.progressStart(label, total_steps, cancellable);
+  }
+
+  /// Advance progress. Returns true to continue, false if the user cancelled.
+  [[nodiscard]] bool progressUpdate(uint64_t current_step) const {
+    return host_.progressUpdate(current_step);
+  }
+
+  /// End the current progress sequence.
+  void progressFinish() const {
+    host_.progressFinish();
+  }
+
+  /// Returns true if the host has requested the plugin to stop.
+  [[nodiscard]] bool isStopRequested() const {
+    return host_.isStopRequested();
+  }
+
+  /// Bind (or look up) a parser for delegated ingest.
+  [[nodiscard]] Expected<ParserBindingHandle> ensureParserBinding(const ParserBindingRequest& request) const {
+    return host_.ensureParserBinding(request);
+  }
+
+  /// Push a message via a deferred FetchMessageData callable. See
+  /// DataSourceRuntimeHostView::pushMessage for the full contract.
+  template <typename FetchMessageData>
+  [[nodiscard]] Status pushMessage(
+      ParserBindingHandle handle, Timestamp host_timestamp_ns, FetchMessageData&& fetch_message_data) const {
+    return host_.pushMessage(handle, host_timestamp_ns, std::forward<FetchMessageData>(fetch_message_data));
+  }
+
+  /// Declare this dataset's source record (the canonical descriptor of the
+  /// download) so the host can cache it. See
+  /// DataSourceRuntimeHostView::attachSourceRecord for the full contract.
+  [[nodiscard]] Status attachSourceRecord(std::string_view descriptor_json) const {
+    return host_.attachSourceRecord(descriptor_json);
+  }
+
+  /// See DataSourceRuntimeHostView::completeIngest for the full contract.
+  [[nodiscard]] Status completeIngest(
+      sdk::IngestOutcome outcome, Span<const std::string_view> requested_topics,
+      PJ_ingest_completion_flags_t flags = PJ_INGEST_COMPLETION_FLAG_NONE) const {
+    return host_.completeIngest(outcome, requested_topics, flags);
+  }
+
+  /// Attach a descriptive metadata document to this ingest's dataset. See
+  /// DataSourceRuntimeHostView::setDatasetMetadata for the full contract.
+  [[nodiscard]] Status setDatasetMetadata(std::string_view metadata_json) const {
+    return host_.setDatasetMetadata(metadata_json);
+  }
+
+  /// Rider forward of the runtime host's thread-safe stop request: a provider
+  /// cancelling a finite download must call this BEFORE joining producers —
+  /// it is what wakes a producer blocked on lossless capture backpressure.
+  /// Safe from any thread; see DataSourceRuntimeHostView::requestStop.
+  void requestStop(DataSourceState terminal_state, std::string_view reason) const {
+    return host_.requestStop(terminal_state, reason);
+  }
+
+  /// Narrow parser-only facade over the same underlying context.
+  [[nodiscard]] ParserIngestHostView parserIngest() const noexcept {
+    return host_.parserIngest();
+  }
+
+ private:
+  DataSourceRuntimeHostView host_{};
+};
+
+inline DatasetIngestHostView DataSourceRuntimeHostView::datasetIngest() const noexcept {
+  return DatasetIngestHostView{host_};
+}
+
+}  // namespace PJ

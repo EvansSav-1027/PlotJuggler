@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+STAGING_DIR="$(mktemp -d)"
+BUILD_DIR="${SCRIPT_DIR}/build/_sdk_install_test"
+CONSUMER_BUILD_DIR="${STAGING_DIR}/consumer_build"
+
+cleanup() {
+  rm -rf "$STAGING_DIR" "$BUILD_DIR" "$CONSUMER_BUILD_DIR"
+}
+trap cleanup EXIT
+
+echo "=== plotjuggler_sdk install test ==="
+echo "Staging dir: ${STAGING_DIR}"
+echo ""
+
+# ---------------------------------------------------------------------------
+# 1. Build the project with PJ_INSTALL_SDK=ON
+# ---------------------------------------------------------------------------
+
+echo "--- Step 1: Configure + build with PJ_INSTALL_SDK=ON ---"
+
+conan install "$SCRIPT_DIR" --output-folder="$BUILD_DIR" --build=missing \
+  -s build_type=Release -s compiler.cppstd=20
+
+cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" \
+  -DCMAKE_TOOLCHAIN_FILE="$BUILD_DIR/conan_toolchain.cmake" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DPJ_INSTALL_SDK=ON \
+  -DPJ_BUILD_TESTS=OFF \
+  -DPJ_BUILD_PORTED_PLUGINS=OFF \
+  -DPJ_BUILD_PARQUET_IMPORT_EXAMPLE=OFF \
+  -DCMAKE_INSTALL_PREFIX="$STAGING_DIR"
+
+cmake --build "$BUILD_DIR" -j "$(nproc)"
+
+# ---------------------------------------------------------------------------
+# 2. Install to staging directory
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "--- Step 2: Install to staging ---"
+
+cmake --install "$BUILD_DIR"
+
+# Package-only consumers need the same discovery/contract docs as source users.
+for doc in sdk-utilities.md provider-guide.md; do
+  cmp "$SCRIPT_DIR/docs/$doc" "$STAGING_DIR/share/plotjuggler_sdk/docs/$doc"
+done
+
+echo ""
+echo "Installed CMake package files:"
+find "$STAGING_DIR" -path '*/cmake/plotjuggler_sdk*' | sort
+
+echo ""
+echo "Installed libraries:"
+find "$STAGING_DIR" -name 'libpj_*' | sort
+
+# ---------------------------------------------------------------------------
+# 3. Build the out-of-tree consumer against the installed package
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "--- Step 3: Configure + build sdk_consumer example ---"
+
+cmake -S "$SCRIPT_DIR/examples/sdk_consumer" -B "$CONSUMER_BUILD_DIR" \
+  -DCMAKE_PREFIX_PATH="$STAGING_DIR;$BUILD_DIR" \
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build "$CONSUMER_BUILD_DIR" -j "$(nproc)"
+
+# ---------------------------------------------------------------------------
+# 4. Verify each public component is independently findable
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "--- Step 4: Smoke-test find_package COMPONENTS ---"
+for comp in base parser_module plugin_sdk plugin_host source descriptor_import_support; do
+  COMP_DIR="$(mktemp -d)"
+  cat > "$COMP_DIR/CMakeLists.txt" <<EOF
+cmake_minimum_required(VERSION 3.22)
+project(comp_smoke LANGUAGES CXX)
+find_package(plotjuggler_sdk REQUIRED COMPONENTS ${comp})
+if(NOT TARGET plotjuggler_sdk::${comp})
+  message(FATAL_ERROR "plotjuggler_sdk::${comp} target missing")
+endif()
+EOF
+  if cmake -S "$COMP_DIR" -B "$COMP_DIR/build" \
+       -DCMAKE_PREFIX_PATH="$STAGING_DIR;$BUILD_DIR" \
+       -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1; then
+    echo "  OK  plotjuggler_sdk::${comp}"
+  else
+    echo "  FAIL plotjuggler_sdk::${comp}"
+    cmake -S "$COMP_DIR" -B "$COMP_DIR/build" \
+       -DCMAKE_PREFIX_PATH="$STAGING_DIR;$BUILD_DIR" \
+       -DCMAKE_BUILD_TYPE=Release
+    rm -rf "$COMP_DIR"
+    exit 1
+  fi
+  rm -rf "$COMP_DIR"
+done
+
+# ---------------------------------------------------------------------------
+# 5. Verify no host-internal headers leaked
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "--- Step 5: Verify installed-header sanity ---"
+
+# Nothing source-tree-private should appear under include/. tests/ and
+# examples/ directories from the module source trees must NOT be exported.
+# (The pj_plugins/testing/ headers ARE intentionally public test helpers.)
+LEAKED=0
+for forbidden_dir in /tests/ /examples/ /src/; do
+  if find "$STAGING_DIR/include" -path "*${forbidden_dir}*" -type f 2>/dev/null | grep -q .; then
+    echo "ERROR: Found forbidden directory '${forbidden_dir}' in installed include/"
+    find "$STAGING_DIR/include" -path "*${forbidden_dir}*" -type f
+    LEAKED=1
+  fi
+done
+if [[ $LEAKED -ne 0 ]]; then
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Verify pj_base ships no fmt implementation symbols
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "--- Step 6: Verify libpj_base.a defines no fmt symbols ---"
+
+# fmt is a private, header-only implementation detail. If its implementation
+# symbols land in the installed archive (weak on ELF, so Linux links fine),
+# the MSVC build of the same code collides (LNK2005) with any consumer that
+# links its own fmt — this check makes the Windows failure visible on Linux.
+if nm -C "$STAGING_DIR/lib/libpj_base.a" | grep -E " [TWuVvW] " | grep -q "fmt::"; then
+  echo "ERROR: installed libpj_base.a defines fmt symbols (collides with a consumer's fmt on MSVC):"
+  nm -C "$STAGING_DIR/lib/libpj_base.a" | grep -E " [TWuVvW] " | grep "fmt::" | head -10
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Verify the feature-floors table + checker are installed and work
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "--- Step 7: Verify feature_floors.json and feature_floor_check.py install ---"
+
+FLOORS="$STAGING_DIR/share/plotjuggler_sdk/feature_floors.json"
+FLOOR_CHECK="$STAGING_DIR/share/plotjuggler_sdk/feature_floor_check.py"
+for f in "$FLOORS" "$FLOOR_CHECK"; do
+  if [[ ! -f "$f" ]]; then
+    echo "ERROR: $f not installed"
+    exit 1
+  fi
+done
+# The installed checker is the one parser of the installed table: loading the
+# table through it validates both, in the exact combination users receive.
+python3 -c "
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location('feature_floor_check', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules['feature_floor_check'] = module
+spec.loader.exec_module(module)
+table = module.load_surface_table(pathlib.Path(sys.argv[2]))
+assert table.surfaces, 'empty feature_floors.json'
+" "$FLOOR_CHECK" "$FLOORS"
+
+echo ""
+echo "=== plotjuggler_sdk install test PASSED ==="

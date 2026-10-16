@@ -597,6 +597,8 @@ class MainWindow : public QMainWindow {
   // Pushes the current toolbar toggle state (show_points / legend_status /
   // activate_grid / dots) into one plot, so newly added plots match.
   void applyGlobalToggles(PlotWidget* plot);
+  // Pushes the "Use time offset" frame to the timeline readout (off = time of day).
+  void syncTimelineDateTime();
   void applyShowPointsToDock(DockWidget* dock);
   void applyShowPointsTo2DWidgets();
   void applyLegendStatus(PlotWidget* plot);
@@ -1698,6 +1700,7 @@ class MainWindow : public QMainWindow {
   // Re-bases the time axis to start near zero (each dataset relative to its own
   // earliest sample) instead of absolute Unix-epoch time. The frame state lives
   // in SessionManager; this button mirrors it.
+  // Off, the axis and the current-time readout show wall-clock time of day.
   QToolButton* button_t0_ = nullptr;
   // Global-column "Legend" button — single icon that combines a corner
   // picker (left-click) with a show/hide toggle (right-click). Checked

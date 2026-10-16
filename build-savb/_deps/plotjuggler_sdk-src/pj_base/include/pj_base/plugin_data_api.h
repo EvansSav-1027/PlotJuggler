@@ -1,0 +1,1305 @@
+#ifndef PJ_PLUGIN_DATA_API_H
+#define PJ_PLUGIN_DATA_API_H
+// Copyright 2026 Davide Faconti
+// SPDX-License-Identifier: Apache-2.0
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define PJ_PLUGIN_DATA_API_VERSION 1
+
+/*
+ * PJ_NOEXCEPT: applied to every function-pointer type in a vtable. In C++ this
+ * is part of the function type (since C++17) and is enforced at compile time;
+ * in C it is a no-op. Plugin-side trampolines that implement these slots MUST
+ * be declared noexcept — a throw across the ABI boundary calls std::terminate.
+ */
+#ifdef __cplusplus
+#define PJ_NOEXCEPT noexcept
+#else
+#define PJ_NOEXCEPT
+#endif
+
+/**
+ * Boot-level ABI version, exported by every plugin .so as a separate C symbol
+ * independent of any vtable. Loaders dlsym this BEFORE fetching the family
+ * vtable, because struct_size — the next level of compatibility check — lives
+ * INSIDE the struct being validated, creating a bootstrap problem. An
+ * incompatible or missing `pj_plugin_abi_version` is a fail-fast rejection
+ * with a specific error.
+ *
+ * The integer value is PJ_ABI_VERSION below. The symbol name the loader looks
+ * up is `pj_plugin_abi_version` (a regular C identifier, not a preprocessor
+ * token).
+ *
+ * Contract for plugin authors: the symbol is emitted automatically at file
+ * scope by `pj_base/plugin_abi_export.hpp`, which is transitively included by
+ * every family SDK header (data_source_plugin_base.hpp, dialog_plugin_base.hpp,
+ * etc.). Weak linkage lets multiple TUs in the same DSO each emit a definition
+ * and have the linker fold them into one COMDAT entry — so co-resident DSOs
+ * (e.g. DataSource + Dialog in one .so) work without any extra ceremony.
+ * Do not redefine it manually.
+ *
+ * v5 plugins advertise version 5. Relative to v4, this bump rejects
+ * pre-v5 parser DSOs because the C++ MessageParserPluginBase
+ * pure-functional contract changed parseScalars()/parseObject() return
+ * types to ScalarRecord/ObjectRecord. SDK 0.21 subsequently placed those
+ * results behind the additive `pj.parser_functional.v1` C extension; direct
+ * host calls on the C++ base remain only as a temporary old-plugin bridge.
+ *
+ * The C data-plane layout remains the v4 layout:
+ *   - Arrow C Data Interface replaces Arrow IPC bytes at the boundary
+ *     (append_arrow_stream + read_series_arrow).
+ *   - append_arrow_ipc removed from all write hosts.
+ *   - read_series (PJ_materialized_series_t) removed from toolbox host.
+ *   - Every vtable slot is PJ_NOEXCEPT.
+ *   - Every slot carries a thread-class tag (// [main-thread], etc.).
+ */
+#define PJ_ABI_VERSION 5
+
+/**
+ * Convention for plugin-loaders:
+ *
+ *   1. `dlsym("pj_plugin_abi_version")` — reject if missing or not equal to PJ_ABI_VERSION.
+ *   2. `dlsym("PJ_get_<family>_vtable")` — reject if missing.
+ *   3. Check `vtable->protocol_version == PJ_<FAMILY>_PROTOCOL_VERSION`.
+ *   4. Check `vtable->struct_size >= PJ_<FAMILY>_MIN_VTABLE_SIZE`
+ *      (NOT `sizeof(...)` — that grows per host release and would reject
+ *       plugins compiled against older headers).
+ *   5. Every tail slot read must be guarded by
+ *      `PJ_HAS_TAIL_SLOT(vtable_type, vtable_ptr, field)` below, which
+ *      checks both struct_size and field non-null.
+ */
+#define PJ_HAS_TAIL_SLOT(vtable_type, vtable_ptr, field)                                        \
+  ((vtable_ptr)->struct_size >= (offsetof(vtable_type, field) + sizeof((vtable_ptr)->field)) && \
+   (vtable_ptr)->field != NULL)
+
+typedef enum {
+  PJ_PRIMITIVE_TYPE_FLOAT32 = 0,
+  PJ_PRIMITIVE_TYPE_FLOAT64 = 1,
+  PJ_PRIMITIVE_TYPE_INT8 = 2,
+  PJ_PRIMITIVE_TYPE_INT16 = 3,
+  PJ_PRIMITIVE_TYPE_INT32 = 4,
+  PJ_PRIMITIVE_TYPE_INT64 = 5,
+  PJ_PRIMITIVE_TYPE_UINT8 = 6,
+  PJ_PRIMITIVE_TYPE_UINT16 = 7,
+  PJ_PRIMITIVE_TYPE_UINT32 = 8,
+  PJ_PRIMITIVE_TYPE_UINT64 = 9,
+  PJ_PRIMITIVE_TYPE_BOOL = 10,
+  PJ_PRIMITIVE_TYPE_STRING = 11,
+  /** Sentinel: null value with no type information. Used when is_null=true
+   *  and the plugin provides no type hint (untyped kNull). */
+  PJ_PRIMITIVE_TYPE_UNSPECIFIED = 0xFF,
+  /* Forces a stable 4-byte width across compilers, so a plugin built with
+   * -fshort-enums cannot shrink this enum and misalign the by-value uses in
+   * PJ_scalar_value_t / PJ_field_info_t / ensure_field. Not a real type. */
+  PJ_PRIMITIVE_TYPE_FORCE_INT32 = 0x7FFFFFFF,
+} PJ_primitive_type_t;
+
+/* ABI-FROZEN: layout permanent; changes = ABI break. */
+typedef struct {
+  const char* data;
+  uint64_t size;
+} PJ_string_view_t;
+
+/* ABI-FROZEN: layout permanent; changes = ABI break. */
+typedef struct {
+  const uint8_t* data;
+  uint64_t size;
+} PJ_bytes_view_t;
+
+/**
+ * Ownership token kept alive while a non-owning byte buffer is in use.
+ * `ctx` is opaque to the consumer; `release(ctx)` is invoked exactly once by
+ * the API that accepts ownership. A null ctx + null release represents a
+ * borrowed call-duration-only buffer.
+ *
+ * ABI-FROZEN: this shared data-plane type was originally declared by
+ * data_source_protocol.h. It lives here so multiple plugin families can use
+ * anchored payloads without importing one another's protocol headers.
+ */
+typedef struct PJ_payload_anchor_t {
+  void* ctx;
+  void (*release)(void* ctx);
+} PJ_payload_anchor_t;
+
+/** Non-owning payload bytes plus one optional ownership-anchor reference. */
+typedef struct PJ_payload_t {
+  const uint8_t* data;
+  uint64_t size;
+  PJ_payload_anchor_t anchor;
+} PJ_payload_t;
+
+/* ==========================================================================
+ * Apache Arrow C Data Interface.
+ *
+ * These are the exact POD struct layouts from the Arrow specification at
+ * https://arrow.apache.org/docs/format/CDataInterface.html, inlined verbatim
+ * so the plugin ABI surface has zero Arrow-library dependency. Plugins that
+ * want helpers link nanoarrow themselves.
+ *
+ * Frozen by upstream Arrow ("once this specification is supported in an
+ * official Arrow release, the C ABI is frozen"). The ARROW_C_DATA_INTERFACE
+ * guard is the official spec guard — if nanoarrow or arrow-cpp is already
+ * included, these declarations are elided and the existing definitions win.
+ *
+ * Ownership: every struct carries its own `release` callback plus private
+ * data. The producer of the struct is responsible for setting `release`; the
+ * consumer that takes ownership is responsible for calling it when done.
+ * ========================================================================== */
+
+#ifndef ARROW_C_DATA_INTERFACE
+#define ARROW_C_DATA_INTERFACE
+
+#define ARROW_FLAG_DICTIONARY_ORDERED 1
+#define ARROW_FLAG_NULLABLE 2
+#define ARROW_FLAG_MAP_KEYS_SORTED 4
+
+struct ArrowSchema {
+  const char* format;
+  const char* name;
+  const char* metadata;
+  int64_t flags;
+  int64_t n_children;
+  struct ArrowSchema** children;
+  struct ArrowSchema* dictionary;
+  void (*release)(struct ArrowSchema*);
+  void* private_data;
+};
+
+struct ArrowArray {
+  int64_t length;
+  int64_t null_count;
+  int64_t offset;
+  int64_t n_buffers;
+  int64_t n_children;
+  const void** buffers;
+  struct ArrowArray** children;
+  struct ArrowArray* dictionary;
+  void (*release)(struct ArrowArray*);
+  void* private_data;
+};
+
+struct ArrowArrayStream {
+  int (*get_schema)(struct ArrowArrayStream*, struct ArrowSchema* out);
+  int (*get_next)(struct ArrowArrayStream*, struct ArrowArray* out);
+  const char* (*get_last_error)(struct ArrowArrayStream*);
+  void (*release)(struct ArrowArrayStream*);
+  void* private_data;
+};
+
+#endif /* ARROW_C_DATA_INTERFACE */
+
+/* ABI-FROZEN: layout permanent; changes = ABI break. */
+typedef struct {
+  uint32_t id;
+} PJ_data_source_handle_t;
+
+/* ABI-FROZEN: layout permanent; changes = ABI break. */
+typedef struct {
+  uint32_t id;
+} PJ_topic_handle_t;
+
+/* ABI-FROZEN: layout permanent; changes = ABI break. */
+typedef struct {
+  PJ_topic_handle_t topic;
+  uint32_t id;
+} PJ_field_handle_t;
+
+/* ABI-FROZEN: layout permanent; changes = v5 break.
+ *
+ * Declared up here (rather than next to the object-store host vtables below)
+ * because PJ_toolbox_host_vtable_t now references it: toolbox plugins can
+ * register/push canonical media topics directly through the toolbox host. */
+typedef struct {
+  uint32_t id; /* 0 == invalid handle */
+} PJ_object_topic_handle_t;
+
+/* ==========================================================================
+ * Protocol v4 core types
+ *
+ * PJ_error_t carries its message/domain INLINE (fixed-size null-terminated
+ * buffers) so callers can copy it freely and its lifetime is trivial.
+ * There is no dangling view into plugin-owned storage.
+ * ========================================================================== */
+
+#define PJ_ERROR_DOMAIN_MAX 32
+#define PJ_ERROR_MESSAGE_MAX 224
+#define PJ_ERROR_KIND_MAX 32
+
+/*
+ * ABI-FROZEN (with growth escape hatch).
+ *
+ * The inline layout is permanent for v4.x — existing fields never move or
+ * change type. The `extended` + `extended_kind` slots are the designated
+ * growth path for richer payloads (cause chains, stack traces, structured
+ * field lists); never add further top-level fields.
+ *
+ * Lifetime of `extended`: valid until the next ABI call through the same
+ * plugin instance's vtable. Callers that want to retain the payload past
+ * that window must deep-copy. `extended_kind` is a reverse-DNS ID of the
+ * payload type (e.g. "pj.error.cause.v1"); when `extended_kind[0]=='\0'`
+ * the `extended` pointer is ignored regardless of its value.
+ *
+ * Every populator (see sdk::fillError) MUST clear both new slots when
+ * writing to avoid stale pointers in reused error structs.
+ */
+/* Shared host-service error-code convention. Codes are domain-specific in
+ * general, but every PJ host service distinguishes at least these two classes,
+ * and aggregators (e.g. a kind router probing multiple backends) rely on the
+ * distinction: REJECTED means "this request is not mine / not valid" (safe to
+ * try another backend), INTERNAL means a real failure on a request the backend
+ * owns (must be surfaced, never masked by a fallback). */
+#define PJ_ERROR_CODE_REJECTED 1
+#define PJ_ERROR_CODE_INTERNAL 2
+
+typedef struct {
+  int32_t code;                          /* 0 = success; otherwise domain-specific */
+  char domain[PJ_ERROR_DOMAIN_MAX];      /* null-terminated; truncated if too long */
+  char message[PJ_ERROR_MESSAGE_MAX];    /* null-terminated; truncated if too long */
+  const void* extended;                  /* nullable typed payload */
+  char extended_kind[PJ_ERROR_KIND_MAX]; /* reverse-DNS ID; "" if no payload */
+} PJ_error_t;
+
+/* ABI-FROZEN: fat pointer layout permanent. The `vtable` is const void* by
+ * design — consumers cast to the appropriate typed service vtable based on
+ * the service name they requested. */
+typedef struct {
+  void* ctx;
+  const void* vtable;
+} PJ_service_t;
+
+/* ABI-APPENDABLE: new slots may be added at the tail; struct_size gates read. */
+typedef struct PJ_service_registry_vtable_t {
+  uint32_t protocol_version;
+  uint32_t struct_size;
+
+  /* [thread-safe] Look up a host-provided service by reverse-DNS name. */
+  bool (*get_service)(
+      void* ctx, PJ_string_view_t name, uint32_t min_version, PJ_service_t* out_service,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+} PJ_service_registry_vtable_t;
+
+/* ABI-FROZEN: fat pointer layout permanent. */
+typedef struct {
+  void* ctx;
+  const PJ_service_registry_vtable_t* vtable;
+} PJ_service_registry_t;
+
+struct PJ_dialog_vtable_t;
+
+/* ABI-FROZEN: fat pointer layout permanent. */
+typedef struct {
+  void* ctx;
+  const struct PJ_dialog_vtable_t* vtable;
+} PJ_borrowed_dialog_t;
+
+typedef union {
+  float as_float32;
+  double as_float64;
+  int8_t as_int8;
+  int16_t as_int16;
+  int32_t as_int32;
+  int64_t as_int64;
+  uint8_t as_uint8;
+  uint16_t as_uint16;
+  uint32_t as_uint32;
+  uint64_t as_uint64;
+  uint8_t as_bool;
+  PJ_string_view_t as_string;
+} PJ_scalar_value_data_t;
+
+typedef struct {
+  PJ_primitive_type_t type;
+  PJ_scalar_value_data_t data;
+} PJ_scalar_value_t;
+
+typedef struct {
+  PJ_string_view_t name;
+  bool is_null;
+  PJ_scalar_value_t value;
+} PJ_named_field_value_t;
+
+typedef struct {
+  PJ_field_handle_t field;
+  bool is_null;
+  PJ_scalar_value_t value;
+} PJ_bound_field_value_t;
+
+typedef struct {
+  PJ_data_source_handle_t handle;
+  PJ_string_view_t name;
+  uint32_t first_topic;
+  uint32_t topic_count;
+} PJ_data_source_info_t;
+
+typedef struct {
+  PJ_topic_handle_t handle;
+  PJ_data_source_handle_t source;
+  PJ_string_view_t name;
+  uint32_t first_field;
+  uint32_t field_count;
+} PJ_topic_info_t;
+
+typedef struct {
+  PJ_field_handle_t handle;
+  PJ_string_view_t name;
+  PJ_primitive_type_t type;
+} PJ_field_info_t;
+
+typedef struct {
+  const PJ_data_source_info_t* data_sources;
+  uint64_t data_source_count;
+  const PJ_topic_info_t* topics;
+  uint64_t topic_count;
+  const PJ_field_info_t* fields;
+  uint64_t field_count;
+  void* release_ctx;
+  void (*release)(void* release_ctx);
+} PJ_catalog_snapshot_t;
+
+/* ==========================================================================
+ * Three distinct write-host vtables (protocol v4).
+ *
+ * Each plugin family binds to its own type so the compiler enforces scope:
+ * a DataSource plugin cannot accidentally call Toolbox-only ops, a Parser
+ * plugin cannot name topics, etc. The host-side implementation can (and
+ * does) share one backend across all three — but at the ABI layer the
+ * types are distinct.
+ *
+ * All fallible slots take a PJ_error_t* out-parameter. Callers may pass
+ * NULL to discard detail. Every slot is PJ_NOEXCEPT and carries a
+ * thread-class tag in its leading comment.
+ *
+ * Arrow C Data Interface is the canonical bulk-ingest path
+ * (append_arrow_stream). Per-record slots remain for streaming producers
+ * and simple plugins where batching does not fit naturally. Thread tags:
+ *   [main-thread]    GUI thread ONLY. Dialog callbacks, initial config.
+ *   [stream-thread]  Any ONE thread at a time — typically the plugin's own
+ *                    ingest/worker thread, not the GUI thread. The host
+ *                    serialises its own state (engine lock / ObjectStore), so
+ *                    calling off the GUI thread is sanctioned; but each host
+ *                    object carries a SHARED error buffer whose pointer is
+ *                    handed back through PJ_error_t*, so two threads must not
+ *                    be inside slots of the SAME host object concurrently.
+ *                    Serialise with your own mutex if you fan out.
+ *   [thread-safe]    Any thread, concurrently.
+ * ========================================================================== */
+
+/* ABI-APPENDABLE: new slots may be added at the tail; struct_size gates read.
+ *
+ * Source write host: multi-topic writes bound to one data source.
+ *
+ * append_arrow_stream ownership:
+ *   Producer (plugin) sets `stream->release`. On a successful call the host
+ *   takes ownership of the stream, pulls all batches via get_next, and calls
+ *   stream->release before returning. On failure (function returns false),
+ *   ownership is NOT transferred — the plugin retains responsibility and
+ *   must release the stream itself. */
+typedef struct PJ_source_write_host_vtable_t {
+  uint32_t abi_version;
+  uint32_t struct_size;
+
+  /* [stream-thread] Ensure a topic exists under this data source. */
+  bool (*ensure_topic)(void* ctx, PJ_string_view_t topic_name, PJ_topic_handle_t* out_topic, PJ_error_t* out_error)
+      PJ_NOEXCEPT;
+
+  /* [stream-thread] Ensure a field exists under a topic with the given type. */
+  bool (*ensure_field)(
+      void* ctx, PJ_topic_handle_t topic, PJ_string_view_t field_name, PJ_primitive_type_t type,
+      PJ_field_handle_t* out_field, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Append a record by field name. Convenience path for
+   * simple plugins; resolves field handles on every call. */
+  bool (*append_record)(
+      void* ctx, PJ_topic_handle_t topic, int64_t timestamp, const PJ_named_field_value_t* fields, uint64_t field_count,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Append a record with pre-resolved field handles. Fast
+   * path for streaming producers — skip the name lookup. */
+  bool (*append_bound_record)(
+      void* ctx, PJ_topic_handle_t topic, int64_t timestamp, const PJ_bound_field_value_t* fields, uint64_t field_count,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] PRIMARY BATCH PATH. Plugin hands ownership of an Arrow
+   * C Data Interface stream; host pulls all batches and releases the stream
+   * before returning (success path). `timestamp_column` names the column
+   * in the stream's schema whose int64 values are interpreted as nanoseconds
+   * since Unix epoch; if empty, a synthetic monotonic timestamp is used. */
+  bool (*append_arrow_stream)(
+      void* ctx, PJ_topic_handle_t topic, struct ArrowArrayStream* stream, PJ_string_view_t timestamp_column,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+} PJ_source_write_host_vtable_t;
+
+typedef struct {
+  void* ctx;
+  const PJ_source_write_host_vtable_t* vtable;
+} PJ_source_write_host_t;
+
+/* ABI-APPENDABLE: new slots may be added at the tail; struct_size gates read.
+ *
+ * Parser write host: single-topic writes. The bound topic is set at
+ * service-creation time; the parser plugin never names it.
+ *
+ * append_arrow_stream is an optional tail slot for parser-shaped formats
+ * that naturally decode a batch in one parse() call. Ownership matches
+ * PJ_source_write_host_vtable_t::append_arrow_stream. Plugins must gate
+ * this slot with PJ_HAS_TAIL_SLOT when calling through the C ABI directly. */
+typedef struct PJ_parser_write_host_vtable_t {
+  uint32_t abi_version;
+  uint32_t struct_size;
+
+  /* [stream-thread] Ensure a field exists in the bound topic. */
+  bool (*ensure_field)(
+      void* ctx, PJ_string_view_t field_name, PJ_primitive_type_t type, PJ_field_handle_t* out_field,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Append a record by field name. */
+  bool (*append_record)(
+      void* ctx, int64_t timestamp, const PJ_named_field_value_t* fields, uint64_t field_count,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Append a record with pre-resolved field handles. */
+  bool (*append_bound_record)(
+      void* ctx, int64_t timestamp, const PJ_bound_field_value_t* fields, uint64_t field_count,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Optional batch path. Plugin hands ownership of an Arrow
+   * C Data Interface stream for the bound topic. The timestamp column rule
+   * and success/failure ownership contract are identical to
+   * PJ_source_write_host_vtable_t::append_arrow_stream. */
+  bool (*append_arrow_stream)(
+      void* ctx, struct ArrowArrayStream* stream, PJ_string_view_t timestamp_column, PJ_error_t* out_error) PJ_NOEXCEPT;
+} PJ_parser_write_host_vtable_t;
+
+/*
+ * Parser write-host v4.0 floor, before append_arrow_stream was added as an
+ * optional tail slot. Hosts/plugins that care about the batch path must use
+ * PJ_HAS_TAIL_SLOT(PJ_parser_write_host_vtable_t, vtable, append_arrow_stream).
+ */
+#define PJ_PARSER_WRITE_HOST_MIN_VTABLE_SIZE (offsetof(PJ_parser_write_host_vtable_t, append_arrow_stream))
+
+typedef struct {
+  void* ctx;
+  const PJ_parser_write_host_vtable_t* vtable;
+} PJ_parser_write_host_t;
+
+/**
+ * Optional parser runtime diagnostics service ("pj.parser_runtime.v1",
+ * protocol_version 1).
+ *
+ * Parsers use this service for recoverable or aggregated conditions that do
+ * not make the current parse fail. Fatal failure of the current message still
+ * travels through the parser's Status/PJ_error_t path.
+ *
+ * The host aggregates reports by parser manifest ID, bound schema/type,
+ * level, and stable_code. stable_code is a plugin-defined, machine-stable
+ * deduplication key (for example "integer_overflow"), never localized or
+ * value-filled prose. All string views are borrowed for the duration of the
+ * call.
+ *
+ * ABI-APPENDABLE: new slots may be added at the tail; struct_size gates read.
+ *
+ * @since 0.21.0
+ */
+#define PJ_PARSER_RUNTIME_HOST_SERVICE_V1 "pj.parser_runtime.v1"
+
+/** Diagnostic severity reported by a message parser. @since 0.21.0 */
+typedef enum {
+  PJ_PARSER_DIAGNOSTIC_INFO = 0,
+  PJ_PARSER_DIAGNOSTIC_WARNING = 1,
+  PJ_PARSER_DIAGNOSTIC_ERROR = 2,
+  /* Forces a stable 4-byte width across compilers. Not a real level. */
+  PJ_PARSER_DIAGNOSTIC_FORCE_INT32 = 0x7FFFFFFF,
+} PJ_parser_diagnostic_level_t;
+
+/** ABI-APPENDABLE: new slots may be added at the tail; struct_size gates read.
+ * @since 0.21.0 */
+typedef struct PJ_parser_runtime_host_vtable_t {
+  uint32_t protocol_version;
+  uint32_t struct_size;
+
+  /* [thread-safe, non-blocking] Report a recoverable parser diagnostic.
+   * The implementation must not throw or block the parse callback thread.
+   * occurrences is the number of equivalent events represented by this
+   * report; the host accumulates it under stable_code. classify_schema is
+   * side-effect free and must never call this slot. */
+  void (*report_diagnostic)(
+      void* ctx, PJ_parser_diagnostic_level_t level, PJ_string_view_t stable_code, PJ_string_view_t message,
+      uint64_t occurrences) PJ_NOEXCEPT;
+} PJ_parser_runtime_host_vtable_t;
+
+/** ABI-FROZEN: fat pointer layout permanent. @since 0.21.0 */
+typedef struct {
+  void* ctx;
+  const PJ_parser_runtime_host_vtable_t* vtable;
+} PJ_parser_runtime_host_t;
+
+/* ABI-APPENDABLE: new slots may be added at the tail; struct_size gates read.
+ *
+ * Toolbox host: multi-source read+write.
+ *
+ * Threading: every IMPLEMENTED slot below is [stream-thread], NOT [main-thread].
+ * Driving this vtable from a toolbox plugin's own fetch/ingest worker is the
+ * sanctioned shape — the host serialises its own state internally (the write
+ * and catalog slots take the engine lock for the whole call; the object slots
+ * go through ObjectStore's shared_mutex). What is NOT supported is two threads
+ * inside slots of the SAME PJ_toolbox_host_t concurrently: the host state
+ * carries one shared error buffer whose pointer is handed back through
+ * PJ_error_t*, so concurrent failures would race on it. Fan out with your own
+ * mutex if you need to (toolbox_mosaico's fetch worker holds a host_write_mu_
+ * for exactly this).
+ *
+ * The two ABI-appended tail slots (register_object_topic_on_dataset,
+ * set_object_topic_retention) deliberately keep a conservative [main-thread]
+ * tag: no host implements them yet — every known vtable leaves them NULL — so
+ * there is no implementation to audit. Re-tag when the first one lands.
+ *
+ * read_series_arrow: caller zero-initialises both out structs. Host fills
+ * them (allocates buffers, sets release callbacks). On success the caller
+ * MUST invoke out_schema->release and out_array->release when done. The
+ * array has two columns: ["timestamp" (int64), <field_name> (typed)].
+ * Validity bitmap populated per Arrow spec. */
+typedef struct PJ_toolbox_host_vtable_t {
+  uint32_t abi_version;
+  uint32_t struct_size;
+
+  /* [stream-thread] Create a new named data source, returning its handle. */
+  bool (*create_data_source)(
+      void* ctx, PJ_string_view_t name, PJ_data_source_handle_t* out_source, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Ensure a topic exists under a specified data source. */
+  bool (*ensure_topic)(
+      void* ctx, PJ_data_source_handle_t source, PJ_string_view_t topic_name, PJ_topic_handle_t* out_topic,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Ensure a field exists under a topic. */
+  bool (*ensure_field)(
+      void* ctx, PJ_topic_handle_t topic, PJ_string_view_t field_name, PJ_primitive_type_t type,
+      PJ_field_handle_t* out_field, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Append a record by field name. */
+  bool (*append_record)(
+      void* ctx, PJ_topic_handle_t topic, int64_t timestamp, const PJ_named_field_value_t* fields, uint64_t field_count,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Append a record with pre-resolved field handles. */
+  bool (*append_bound_record)(
+      void* ctx, PJ_topic_handle_t topic, int64_t timestamp, const PJ_bound_field_value_t* fields, uint64_t field_count,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Bulk-write via Arrow C Data Interface (same ownership rule
+   * as PJ_source_write_host_vtable_t::append_arrow_stream). */
+  bool (*append_arrow_stream)(
+      void* ctx, PJ_topic_handle_t topic, struct ArrowArrayStream* stream, PJ_string_view_t timestamp_column,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Snapshot the current catalog of data sources, topics, and
+   * fields. Caller releases via snapshot.release(snapshot.release_ctx). */
+  bool (*acquire_catalog_snapshot)(void* ctx, PJ_catalog_snapshot_t* out_snapshot, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Materialise one field's time series into a host-owned
+   * ArrowArray (two columns: timestamp + field). Caller must call
+   * out_schema->release and out_array->release when done. */
+  bool (*read_series_arrow)(
+      void* ctx, PJ_field_handle_t field, struct ArrowSchema* out_schema, struct ArrowArray* out_array,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Register an object topic for media payloads (images, point
+   * clouds, annotations). The topic is namespaced under the data source
+   * previously created via create_data_source. `metadata_json` is opaque to
+   * the host. Built-in renderer discovery uses the canonical key
+   * `builtin_object_type`; its value is the exact C++ PJ::sdk::name() string
+   * for the type (for example, {"builtin_object_type":"kImage"}). Returns
+   * false (with out_error populated) if the source handle is unknown or a
+   * topic with this name already exists for the data source. */
+  bool (*register_object_topic)(
+      void* ctx, PJ_data_source_handle_t source, PJ_string_view_t topic_name, PJ_string_view_t metadata_json,
+      PJ_object_topic_handle_t* out_handle, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Eager push of an object payload — host copies the bytes
+   * into ObjectStore. Appropriate for both small messages and the
+   * one-shot media writes that toolbox plugins typically perform; lazy
+   * push is not offered on the toolbox surface (plugin holds the bytes
+   * already by the time it calls). */
+  bool (*push_owned_object)(
+      void* ctx, PJ_object_topic_handle_t topic, int64_t timestamp_ns, const uint8_t* data, uint64_t size,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Register an object topic on an EXISTING dataset, addressed by
+   * its DatasetId, rather than under a data source the toolbox created. This is
+   * the ANNOTATION path: a toolbox attaches objects (e.g. plot markers) to data
+   * loaded by another source. Idempotent — if a topic with this name already
+   * exists on the dataset, its existing handle is returned (so a producer that
+   * republishes its whole set just re-resolves the handle each time).
+   * `metadata_json` is opaque (as in register_object_topic); built-in renderer
+   * discovery uses its canonical `builtin_object_type` key and C++
+   * PJ::sdk::name() values. Returns false (with out_error populated) if the
+   * dataset does not exist.
+   * ABI-APPENDED slot: gate via struct_size before calling. */
+  bool (*register_object_topic_on_dataset)(
+      void* ctx, uint32_t dataset_id, PJ_string_view_t topic_name, PJ_string_view_t metadata_json,
+      PJ_object_topic_handle_t* out_handle, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Bound an object topic's retention to keep at most `max_entries`
+   * of the most recent snapshots (0 = unlimited). Generic capability: a producer
+   * that republishes a whole set under one topic at a sentinel timestamp (e.g.
+   * plot markers) sets max_entries=1 so superseded snapshots are evicted instead
+   * of accumulating. Returns false (out_error populated) on a bad handle.
+   * ABI-APPENDED slot: gate via struct_size before calling. */
+  bool (*set_object_topic_retention)(
+      void* ctx, PJ_object_topic_handle_t topic, uint64_t max_entries, PJ_error_t* out_error) PJ_NOEXCEPT;
+} PJ_toolbox_host_vtable_t;
+
+typedef struct {
+  void* ctx;
+  const PJ_toolbox_host_vtable_t* vtable;
+} PJ_toolbox_host_t;
+
+/* ==========================================================================
+ * Object-store write host (protocol v4)
+ *
+ * Plugin-visible surface over `pj_datastore::ObjectStore` — a message-
+ * oriented peer to DataEngine holding timestamped opaque payloads
+ * (markers/annotations written eagerly via push_owned; images/point
+ * clouds written lazily via push_lazy with a plugin-owned fetch closure).
+ *
+ * Separate from the scalar write surface by design: a plugin family
+ * may want one, the other, or both. DataSource plugins that handle
+ * media resolve `pj.source_object_write.v1` from the service registry.
+ * Parser plugins receiving delegated ingest for a media topic resolve
+ * `pj.parser_object_write.v1` in addition to `pj.parser_write.v1`.
+ * ========================================================================== */
+
+/* PJ_object_topic_handle_t is declared earlier (next to PJ_field_handle_t)
+ * because the toolbox host vtable references it as well. */
+
+/* Lazy-fetch callback type. Invoked by the host on-demand when a consumer
+ * reads an entry stored via push_lazy. On success the plugin populates
+ * *out_data + *out_size with a pointer into memory owned by the plugin's
+ * fetch context — valid at least until the NEXT call to the same fn or
+ * until fetch_ctx_destroy runs. The host immediately copies the bytes; the
+ * plugin may reuse or free the buffer on the following call. */
+typedef bool (*PJ_lazy_fetch_fn_t)(void* fetch_ctx, const uint8_t** out_data, uint64_t* out_size) PJ_NOEXCEPT;
+
+/* ABI-APPENDABLE: new slots may be added at the tail; struct_size gates read.
+ *
+ * push_lazy / fetch_ctx lifetime contract:
+ *   The store retains fetch_ctx for the lifetime of the pushed entry (i.e.
+ *   as long as the entry remains in the ObjectStore's deque — indefinite
+ *   if no retention budget, bounded by the budget otherwise). When the
+ *   entry is finally evicted (retention, explicit evictBefore, removeTopic,
+ *   or clear), the store invokes fetch_ctx_destroy(fetch_ctx) exactly once.
+ *   Typical use: pack a shared_ptr<FileReader> into fetch_ctx; the destroy
+ *   callback `delete`s the owning box and drops the shared reference. */
+typedef struct PJ_object_write_host_vtable_t {
+  uint32_t abi_version;
+  uint32_t struct_size;
+
+  /* [stream-thread] Register an object topic under this data source with
+   * the given metadata JSON. `metadata_json` is opaque to the store and
+   * retained verbatim. Built-in renderer discovery uses the canonical key
+   * `builtin_object_type`; its value is the exact C++ PJ::sdk::name() string
+   * for the type (for example, {"builtin_object_type":"kImage"}). Returns
+   * false (with out_error populated) if a topic with this name already exists
+   * for the data source. */
+  bool (*register_topic)(
+      void* ctx, PJ_string_view_t topic_name, PJ_string_view_t metadata_json, PJ_object_topic_handle_t* out_handle,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Push an eagerly-owned entry. The store copies the bytes
+   * into its own storage; the plugin's buffer is free to be reused or freed
+   * the moment this call returns. Appropriate for small structured messages
+   * (markers, annotations, scene primitives) whose aggregate volume stays
+   * comfortably in memory. */
+  bool (*push_owned)(
+      void* ctx, PJ_object_topic_handle_t topic, int64_t timestamp_ns, const uint8_t* data, uint64_t size,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Push a lazy entry — host stores the fetch closure, not
+   * the bytes. Appropriate for large blobs (still images, point clouds)
+   * where eager storage would inflate memory. See the lifetime contract
+   * above for fetch_ctx / fetch_ctx_destroy. */
+  bool (*push_lazy)(
+      void* ctx, PJ_object_topic_handle_t topic, int64_t timestamp_ns, PJ_lazy_fetch_fn_t fetch_fn, void* fetch_ctx,
+      void (*fetch_ctx_destroy)(void*), PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [stream-thread] Configure the per-topic retention budget. Either axis
+   * may be zero to disable that axis; both zero disables automatic
+   * eviction entirely. Infallible — bad handles are silently ignored.
+   *
+   * Typical plugin author usage: do NOT call this. The application owns
+   * the retention policy; DataSource plugins should leave budgets alone. */
+  void (*set_retention_budget)(
+      void* ctx, PJ_object_topic_handle_t topic, int64_t time_window_ns, uint64_t max_memory_bytes) PJ_NOEXCEPT;
+} PJ_object_write_host_vtable_t;
+
+/* ABI-FROZEN: fat pointer layout permanent. */
+typedef struct {
+  void* ctx;
+  const PJ_object_write_host_vtable_t* vtable;
+} PJ_object_write_host_t;
+
+/* ==========================================================================
+ * Parser-scoped object write host (protocol v4)
+ *
+ * The MessageParser analogue of PJ_parser_write_host_vtable_t for the object
+ * path. Topic is bound once by the host at service-creation time (just like
+ * the scalar parser write host); the parser never names topics. Delivered
+ * only when the host has an object-capable target for the parser's binding —
+ * typically delegated ingest from a DataSource that registered an object
+ * topic alongside the scalar topic.
+ *
+ * A media-capable parser resolves both "pj.parser_write.v1" and
+ * "pj.parser_object_write.v1" at bind time and writes scalar portions to the
+ * former + media payload to the latter from a single parse() call. No
+ * protocol-version bump needed.
+ * ========================================================================== */
+
+/* ABI-APPENDABLE: new slots may be added at the tail; struct_size gates read.
+ *
+ * Same lifetime contract for fetch_ctx / fetch_ctx_destroy as
+ * PJ_object_write_host_vtable_t::push_lazy: the store retains the ctx until
+ * the entry is evicted, then runs fetch_ctx_destroy exactly once. */
+typedef struct PJ_parser_object_write_host_vtable_t {
+  uint32_t abi_version;
+  uint32_t struct_size;
+
+  /* [stream-thread] Eager push of serialized payload bytes into the bound
+   * object topic. Store copies the bytes. */
+  bool (*push_owned)(void* ctx, int64_t timestamp_ns, const uint8_t* data, uint64_t size, PJ_error_t* out_error)
+      PJ_NOEXCEPT;
+
+  /* [stream-thread] Lazy push. Rarely used from parsers (a delegated parser
+   * is given already-available bytes by the host), but exposed for
+   * transform-style parsers that produce fetch closures. */
+  bool (*push_lazy)(
+      void* ctx, int64_t timestamp_ns, PJ_lazy_fetch_fn_t fetch_fn, void* fetch_ctx, void (*fetch_ctx_destroy)(void*),
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+} PJ_parser_object_write_host_vtable_t;
+
+/* ABI-FROZEN: fat pointer layout permanent. */
+typedef struct {
+  void* ctx;
+  const PJ_parser_object_write_host_vtable_t* vtable;
+} PJ_parser_object_write_host_t;
+
+/* ==========================================================================
+ * Object-store read host (protocol v4)
+ *
+ * Exposed to Toolbox plugins that want to read back ObjectStore entries —
+ * typically transformer-style plugins that consume bytes and emit results.
+ * Read access uses an opaque OWNING handle model: each successful
+ * read_latest_at allocates a refcounted box that keeps the bytes alive
+ * independent of the store's internal state (matches
+ * `shared_ptr<const vector<uint8_t>>` in the C++ API).
+ *
+ * Lifetime contract: a handle remains valid until the consumer calls
+ * release_bytes(handle). Eviction, concurrent writes, even topic removal
+ * cannot invalidate a handle that is already held.
+ * ========================================================================== */
+
+/* Opaque handle. The host allocates one per successful read; the plugin
+ * releases via vtable->release_bytes. The pointer value is never
+ * dereferenced by the plugin. */
+struct PJ_object_bytes_handle_s;
+typedef struct PJ_object_bytes_handle_s* PJ_object_bytes_handle_t;
+
+/* ABI-APPENDABLE: new slots may be added at the tail; struct_size gates read.
+ *
+ * get_bytes / release_bytes take the handle directly (no ctx) because the
+ * handle itself is a heap-allocated box the host owns; its internal state
+ * is all the free/read operation needs. */
+typedef struct PJ_object_read_host_vtable_t {
+  uint32_t abi_version;
+  uint32_t struct_size;
+
+  /* [main-thread] Look up a topic by name. Returns {id=0} on miss. */
+  PJ_object_topic_handle_t (*lookup_topic)(void* ctx, PJ_string_view_t topic_name) PJ_NOEXCEPT;
+
+  /* [main-thread] Enumerate all object topics the toolbox can see. The
+   * caller passes a buffer of capacity `buffer_capacity`; the host writes
+   * up to that many handles and always sets *out_count to the TOTAL number
+   * of topics (so the caller can detect truncation and resize). */
+  bool (*list_topics)(
+      void* ctx, PJ_object_topic_handle_t* out_buffer, uint64_t buffer_capacity, uint64_t* out_count,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Return the topic's metadata JSON — a pointer stable for
+   * the topic's lifetime. Returns NULL on bad handle. */
+  const char* (*topic_metadata)(void* ctx, PJ_object_topic_handle_t topic)PJ_NOEXCEPT;
+
+  /* [main-thread] Fetch the entry at-or-before `timestamp_ns`. On success
+   * allocates an owning handle; caller releases via release_bytes.
+   * out_timestamp (optional) receives the entry's actual timestamp. On
+   * miss returns false with *out_handle=NULL and out_error populated. */
+  bool (*read_latest_at)(
+      void* ctx, PJ_object_topic_handle_t topic, int64_t timestamp_ns, PJ_object_bytes_handle_t* out_handle,
+      int64_t* out_timestamp, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [thread-safe] Expose the bytes behind an owning handle. View is valid
+   * until release_bytes(handle). Safe to call from decoder worker threads. */
+  void (*get_bytes)(PJ_object_bytes_handle_t handle, const uint8_t** out_data, uint64_t* out_size) PJ_NOEXCEPT;
+
+  /* [thread-safe] Release an owning handle. Idempotent on NULL. */
+  void (*release_bytes)(PJ_object_bytes_handle_t handle) PJ_NOEXCEPT;
+
+  /* [main-thread] Entry count for a topic. 0 on bad handle. */
+  uint64_t (*entry_count)(void* ctx, PJ_object_topic_handle_t topic) PJ_NOEXCEPT;
+
+  /* [main-thread] Time range [min, max] for a topic. Returns false if the
+   * topic is unknown or empty. */
+  bool (*time_range)(void* ctx, PJ_object_topic_handle_t topic, int64_t* out_min_ts, int64_t* out_max_ts) PJ_NOEXCEPT;
+
+  /* [main-thread] Look up an object topic on a SPECIFIC dataset by name.
+   * Object-topic identity is (dataset_id, name): the same name can exist on
+   * several loaded datasets, so the name-only `lookup_topic` above is ambiguous
+   * across datasets. This dataset-scoped form returns the topic owned by
+   * `dataset_id`, or {id=0} on miss. ABI-APPENDED slot: gate via struct_size. */
+  PJ_object_topic_handle_t (*lookup_topic_on_dataset)(void* ctx, uint32_t dataset_id, PJ_string_view_t topic_name)
+      PJ_NOEXCEPT;
+} PJ_object_read_host_vtable_t;
+
+/* ABI-FROZEN: fat pointer layout permanent. */
+typedef struct {
+  void* ctx;
+  const PJ_object_read_host_vtable_t* vtable;
+} PJ_object_read_host_t;
+
+/**
+ * Colormap registry service ("pj.colormap.v1", protocol_version 1).
+ *
+ * Independent host-provided service for toolbox plugins that want to
+ * publish named colormap callbacks.
+ */
+typedef struct PJ_colormap_registry_vtable_t {
+  uint32_t protocol_version;
+  uint32_t struct_size;
+
+  /* [main-thread] Register a named colormap. eval_fn is invoked later from
+   * the main GUI thread when rendering. */
+  bool (*register_map)(
+      void* ctx, PJ_string_view_t name, const char* (*eval_fn)(double value, void* user_ctx), void* user_ctx,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Unregister a previously registered colormap. */
+  bool (*unregister_map)(void* ctx, PJ_string_view_t name, PJ_error_t* out_error) PJ_NOEXCEPT;
+} PJ_colormap_registry_vtable_t;
+
+typedef struct {
+  void* ctx;
+  const PJ_colormap_registry_vtable_t* vtable;
+} PJ_colormap_registry_t;
+
+/**
+ * Data-processor host service ("pj.data_processors.v1", protocol_version 1).
+ *
+ * One host-driven service for plugins that submit WHOLE-SERIES data processors by
+ * DATA — nothing executable crosses the boundary; the HOST compiles, runs, and owns
+ * the lifecycle (a node survives plugin unload and re-runs on data change). A single
+ * polymorphic surface covers every output shape via a `kind` discriminator:
+ *   - kind="transform": per-sample numeric series materialized into the DataEngine
+ *     via the DerivedEngine (catalog-resident timeseries; N inputs -> M outputs).
+ *   - kind="markers":   a discrete PlotMarkers set (events / regions / value bands).
+ *     Exactly one output topic; the host publishes the serialized PlotMarkers to the
+ *     ObjectStore under markerObjectTopicName(key).
+ * Future kinds (e.g. a host-owned engine backend) are added the same way — a new
+ * `kind` string plus host routing, no ABI change.
+ *
+ * Nothing executable crosses the boundary — only strings:
+ *   - id          : plugin-namespaced stable key. create() UPSERTS by id (idempotent
+ *                   Save). ids survive a session reload, so a plugin can re-edit its
+ *                   nodes after the host replays them from persisted recipes (see
+ *                   data_processor_config). The host scopes list/remove/config to the
+ *                   calling plugin (per-plugin isolation): one plugin can neither
+ *                   enumerate nor remove another's.
+ *   - kind        : output discriminator, see above ("transform", "markers").
+ *   - language    : script backend, "luau" today; the host rejects anything else.
+ *   - inputs      : topic OR topic-field names ("pose/orientation" or
+ *                   "pose/orientation/x") the script reads; the host resolves them
+ *                   and exact-joins co-timestamped inputs. A name MAY carry the
+ *                   dataset qualifier, see DATASET-QUALIFIED NAMES below.
+ *   - outputs     : target topic key(s). MAY be empty for an ephemeral preview
+ *                   (flags & PJ_DATA_PROCESSOR_FLAG_EPHEMERAL), in which case the host
+ *                   names the sink(s) and returns the resolved names in out_topics.
+ *                   transform: the created catalog topic(s). markers: a single
+ *                   marker-topic key (kGlobalMarkerTopic or a per-series key, see
+ *                   markerSeriesKey).
+ *   - script      : the processor source. BINARY-SAFE PJ_string_view_t {data,size},
+ *                   NOT a C string, so it MAY carry a non-text blob — e.g. a future
+ *                   WASM module detected by the leading "\0asm" magic. Nothing on the
+ *                   path may treat it as NUL-terminated (no strlen).
+ *   - params_json : forwarded VERBATIM to the backend's create(params) (translucent
+ *                   pass-through; binary-safe PJ_string_view_t {data,size}).
+ *                   {"scope":"all"} makes a global node publish across EVERY dataset;
+ *                   absent = active dataset.
+ *   - flags       : bitset; PJ_DATA_PROCESSOR_FLAG_EPHEMERAL marks a preview (never
+ *                   persisted, dropped on remove). PJ_DATA_PROCESSOR_FLAG_HISTORY_EXEMPT
+ *                   marks a node the host's undo/redo history has no authority over
+ *                   (still persisted like any other node; history never restores,
+ *                   recreates or removes it). Reserved bits must be 0.
+ *
+ * DATASET-QUALIFIED NAMES — a series' full identity is (dataset, topic, field); a
+ * bare "topic/field" name is an abbreviation that stops being unique the moment
+ * two loaded datasets share topic names. An input MAY therefore carry the
+ * qualifier "dataset_source:topic/field" — the same form hosts print as a series
+ * identity (shared parser/composer: sdk/dataset_qualified_name.hpp). The qualifier
+ * is matched against the LOADED source names (longest match wins), never split
+ * blindly at ':'. This is a catalog-dependent lookup syntax: an unmatched prefix
+ * leaves the ENTIRE string as a bare name; the host must never guess by stripping
+ * it. Colons are legal in both source and bare names, so composition round-trips
+ * only when the intended source remains the longest loaded matching prefix.
+ * The host MUST enforce:
+ *   - an unknown whole name is an error;
+ *   - a bare name that exists in SEVERAL loaded datasets is refused, reporting the
+ *     qualified candidates — NEVER resolved by load order;
+ *   - all qualified inputs of one processor agree on a single dataset.
+ * Marker output keys (per-series, see markerSeriesKey) accept the qualifier the
+ * same way; transform outputs name NEW topics and are never qualified. Addressing
+ * two datasets that share one source name is outside this contract (ambiguous ->
+ * error); that needs a typed dataset id, which would be a tail-appended addition.
+ *
+ * FORWARD-COMPAT — the native door is WASM, not a C++ kernel. Because the script
+ * slot is a binary-safe blob the host owns and runs (today Luau; tomorrow a
+ * host-owned WASM/Python backend), a native processor needs NO new ABI: it ships
+ * as bytes through this same data-only surface, survives plugin unload (the host
+ * owns the payload + runtime), and is sandboxed. Adding a backend is purely
+ * additive. This is deliberately the OPPOSITE of crossing a C++ vtable across the
+ * DSO boundary (which dangles on unload).
+ *
+ * ABI-APPENDABLE: new slots may be added at the tail; struct_size gates read.
+ */
+
+/* create_data_processor flags. */
+#define PJ_DATA_PROCESSOR_FLAG_EPHEMERAL (1u << 0) /* preview: never persisted, dropped on remove_data_processor */
+/* Persisted in the layout file like any other processor, but the host's undo/redo
+ * history never restores, recreates or removes it -- history has no authority over
+ * it. Orthogonal to EPHEMERAL: an EPHEMERAL processor is never persisted at all, so
+ * this bit is irrelevant on it. A conforming host rejects unknown flag bits.
+ * To confirm protection even on a host that silently ignores unknown bits,
+ * read data_processor_config after creation: only history_exempt=true confirms
+ * the property. A missing/false property or failed read does not confirm it. */
+#define PJ_DATA_PROCESSOR_FLAG_HISTORY_EXEMPT (1u << 1)
+
+typedef struct PJ_data_processors_host_vtable_t {
+  uint32_t protocol_version;  // = 1
+  uint32_t struct_size;       // = sizeof(PJ_data_processors_host_vtable_t)
+
+  /* [main-thread] Create or replace (upsert by id) a data processor of `kind`. The
+   * host compiles `script` with `language`, runs it over `inputs`, and routes the
+   * output by kind (transform -> DerivedEngine; markers -> ObjectStore). `outputs`
+   * may be empty for an ephemeral preview (flags & PJ_DATA_PROCESSOR_FLAG_EPHEMERAL),
+   * in which case the host auto-names the sink(s). The resolved physical topic
+   * name(s) are written to out_topics using the count-then-fill convention: pass
+   * out_topics=NULL/capacity=0 to read *out_topics_count, or a buffer to receive
+   * min(capacity,*out_topics_count) entries (borrowed, valid only until the next call
+   * on this vtable); pass out_topics_count=NULL to ignore them. Transactional: on
+   * failure no partial state is left AND any previously published output for this id
+   * is preserved. All string arguments are borrowed for the duration of the call. */
+  bool (*create_data_processor)(
+      void* ctx, PJ_string_view_t id, PJ_string_view_t kind, PJ_string_view_t language, const PJ_string_view_t* inputs,
+      uint64_t input_count, const PJ_string_view_t* outputs, uint64_t output_count, PJ_string_view_t script,
+      PJ_string_view_t params_json, uint32_t flags, PJ_string_view_t* out_topics, uint64_t out_topics_capacity,
+      uint64_t* out_topics_count, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Remove a node by id (persistent or ephemeral). Unknown id is an error. */
+  bool (*remove_data_processor)(void* ctx, PJ_string_view_t id, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Enumerate the ids of THIS plugin's live nodes.
+   * Count-then-fill: pass capacity 0 to read *out_count, then call again with a
+   * buffer of that size. On success the first min(capacity, *out_count) entries
+   * of out_ids are filled and point into host storage valid only until the next
+   * call on this vtable. Ephemeral previews are excluded. */
+  bool (*list_data_processor_ids)(
+      void* ctx, PJ_string_view_t* out_ids, uint64_t capacity, uint64_t* out_count, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Read a node's full recipe as JSON
+   * {"kind":"...","language":"...","inputs":[...],"outputs":[...],"params":{...}} for
+   * re-edit (e.g. after a session reload). *out_recipe_json is borrowed, valid only
+   * until the next call on this vtable. An unknown id is an error.
+   * Hosts supporting PJ_DATA_PROCESSOR_FLAG_HISTORY_EXEMPT include the boolean
+   * "history_exempt" for transforms and markers, reflecting the node's actual
+   * property. Callers must not infer support from a successful create alone. */
+  bool (*data_processor_config)(
+      void* ctx, PJ_string_view_t id, PJ_string_view_t* out_recipe_json, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Validate a script WITHOUT installing anything: the host compiles
+   * it with `language` for the given `kind` to catch syntax and module-load errors.
+   * Returns true if it compiles; on false, *out_error carries the reason (suitable
+   * for a UI semaphore / error box). Compilation-only: it does NOT run the script
+   * over data, so a runtime error or empty output is not detected here (use an
+   * ephemeral create for that). No node, topic or catalog entry is created. An
+   * unknown language or kind is an error. */
+  bool (*validate_data_processor_script)(
+      void* ctx, PJ_string_view_t kind, PJ_string_view_t language, PJ_string_view_t script,
+      PJ_string_view_t params_json, PJ_error_t* out_error) PJ_NOEXCEPT;
+} PJ_data_processors_host_vtable_t;
+
+typedef struct {
+  void* ctx;
+  const PJ_data_processors_host_vtable_t* vtable;
+} PJ_data_processors_host_t;
+
+/**
+ * Settings store service ("pj.settings.v1", protocol_version 1).
+ *
+ * Optional host-provided key/value persistence, modeled on Qt's QSettings but
+ * Qt-free. Plugins read/write small scalars (stored as strings) and string
+ * lists keyed by a string; the host owns the backing store (e.g. QSettings in
+ * the GUI app, a JSON file in a headless host) and namespaces keys per plugin.
+ * All calls are [main-thread]. A string / list returned through an out-param
+ * remains valid only until the next call on the same store.
+ */
+typedef struct PJ_settings_store_vtable_t {
+  uint32_t protocol_version;
+  uint32_t struct_size;
+
+  /* [main-thread] Read a string. *out_found reports whether the key exists; on
+   * found, *out_value is valid until the next call on this store. */
+  bool (*get_string)(
+      void* ctx, PJ_string_view_t key, PJ_string_view_t* out_value, bool* out_found, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Write a string (create or overwrite). */
+  bool (*set_string)(void* ctx, PJ_string_view_t key, PJ_string_view_t value, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Read a string list. On found, *out_items points to an array
+   * of *out_count entries, valid until the next call on this store. */
+  bool (*get_string_list)(
+      void* ctx, PJ_string_view_t key, const PJ_string_view_t** out_items, uint64_t* out_count, bool* out_found,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Write a string list (create or overwrite). */
+  bool (*set_string_list)(
+      void* ctx, PJ_string_view_t key, const PJ_string_view_t* items, uint64_t count,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Report whether a key exists, in *out_present. */
+  bool (*contains)(void* ctx, PJ_string_view_t key, bool* out_present, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Remove a key (no-op if absent). */
+  bool (*remove_key)(void* ctx, PJ_string_view_t key, PJ_error_t* out_error) PJ_NOEXCEPT;
+} PJ_settings_store_vtable_t;
+
+typedef struct {
+  void* ctx;
+  const PJ_settings_store_vtable_t* vtable;
+} PJ_settings_store_t;
+
+/**
+ * Playback host service ("pj.playback.v1", protocol_version 1).
+ *
+ * Optional programmatic control of the host's playback cursor (the vertical
+ * time tracker the playback slider drives). All slots are [main-thread].
+ *
+ * TIME UNIT: every time in this service is DISPLAY-AXIS SECONDS — the numbers
+ * the plot X axes and the playback slider show — NOT absolute nanoseconds.
+ * Display time is derived from absolute time via per-dataset, user-editable
+ * offsets, so any converted value is valid for the CURRENT frame only:
+ * re-query after the user edits a source offset or the time reference.
+ *
+ * ABI-APPENDABLE: new slots may be added at the tail; struct_size gates read.
+ */
+
+/* ABI-FROZEN: layout permanent; changes = ABI break (add a get_state_v2 slot instead). */
+typedef struct {
+  bool is_playing;
+  double current_time_s; /* display-axis seconds */
+  double range_min_s;    /* playback range in display-axis seconds */
+  double range_max_s;
+  double playback_rate; /* speed multiplier; 1.0 = real time */
+} PJ_playback_state_t;
+
+typedef struct PJ_playback_host_vtable_t {
+  uint32_t protocol_version; /* = 1 */
+  uint32_t struct_size;      /* = sizeof(PJ_playback_host_vtable_t) */
+
+  /* [main-thread] Start advancing the playback cursor. Idempotent. */
+  bool (*play)(void* ctx, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Stop advancing the playback cursor. Idempotent. */
+  bool (*pause)(void* ctx, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Move the cursor to `time_s` (display-axis seconds); the host
+   * clamps into [range_min_s, range_max_s]. Play/pause state is unchanged.
+   * Non-finite time is an error. */
+  bool (*seek)(void* ctx, double time_s, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Set the playback-speed multiplier (> 0; the host may clamp).
+   * Non-finite or non-positive rate is an error. */
+  bool (*set_playback_rate)(void* ctx, double rate, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Snapshot the current playback state. During live streaming
+   * the range (and a cursor glued to its tip) advances on every ingest tick. */
+  bool (*get_state)(void* ctx, PJ_playback_state_t* out_state, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Convert an ABSOLUTE nanosecond timestamp (the unit the data
+   * read/write surfaces speak) into display-axis seconds, using the display
+   * offset of the dataset that owns `topic`. An empty topic uses the host's
+   * representative dataset. Current-frame semantics (see the service
+   * doc-comment). A nonempty topic must identify exactly one loaded dataset;
+   * unknown or ambiguous topics are errors. Use to_display_time_for_source to
+   * select a dataset explicitly when topic names repeat. */
+  bool (*to_display_time)(
+      void* ctx, PJ_string_view_t topic, int64_t absolute_ns, double* out_display_s, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Convert absolute nanoseconds using the display offset of
+   * `source`, a data-source handle obtained from this host's catalog. Invalid
+   * (id == 0) or unloaded handles are errors; no representative-dataset fallback.
+   * The result has the same current-frame semantics as to_display_time.
+   * Optional tail slot: test struct_size and the function pointer before use. */
+  bool (*to_display_time_for_source)(
+      void* ctx, PJ_data_source_handle_t source, int64_t absolute_ns, double* out_display_s,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+} PJ_playback_host_vtable_t;
+
+typedef struct {
+  void* ctx;
+  const PJ_playback_host_vtable_t* vtable;
+} PJ_playback_host_t;
+
+/**
+ * Viewport host service ("pj.viewport.v1", protocol_version 1).
+ *
+ * Optional zoom control, SCOPED to the tabs the calling plugin owns (see
+ * "pj.plot_tabs.v1"). A host that grants a plugin its own tabs must confine
+ * these slots to them: the user's plots are not a plugin's to reframe. A
+ * plugin owning no tab therefore has nothing to zoom, which is an error, not a
+ * silent no-op.
+ *
+ * That makes this service dependent on the other in practice, even though the
+ * registry treats the two as independently optional: a host offering this one
+ * WITHOUT "pj.plot_tabs.v1" leaves every plugin with nothing it may zoom, so
+ * these two are registered together or not at all.
+ *
+ * Note the boundary is the VIEW, not the transport: "pj.playback.v1" stays
+ * global by nature, since one time cursor is shared by every plot.
+ *
+ * All slots are [main-thread]. Times are display-axis seconds (same convention
+ * as "pj.playback.v1"). ABI-APPENDABLE: new slots may be added at the tail;
+ * struct_size gates read.
+ */
+typedef struct PJ_viewport_host_vtable_t {
+  uint32_t protocol_version; /* = 1 */
+  uint32_t struct_size;      /* = sizeof(PJ_viewport_host_vtable_t) */
+
+  /* [main-thread] Set the visible X window of every time-series plot the
+   * calling plugin owns to [t0_s, t1_s] (display-axis seconds). Each plot keeps
+   * its own Y range; XY plots and empty plots are untouched. Requires finite
+   * t0_s < t1_s. Owning no such plot is an error, and the host is expected to
+   * say which kind — no tab at all, or a tab with nothing to zoom — since the
+   * caller's remedy differs. */
+  bool (*zoom_to_time_range)(void* ctx, double t0_s, double t1_s, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Reset every plot the calling plugin owns to fit its data.
+   * Like zoom_to_time_range, owning nothing is an error. */
+  bool (*zoom_reset)(void* ctx, PJ_error_t* out_error) PJ_NOEXCEPT;
+} PJ_viewport_host_vtable_t;
+
+typedef struct {
+  void* ctx;
+  const PJ_viewport_host_vtable_t* vtable;
+} PJ_viewport_host_t;
+
+/**
+ * Plot-tab host service ("pj.plot_tabs.v1", protocol_version 1).
+ *
+ * Lets a plugin compose plotting tabs OF ITS OWN: create one, place and remove
+ * curves in it, read back what it holds, close it. Every slot is scoped to the
+ * calling binding — a tab this plugin did not create is rejected exactly as an
+ * unknown id is, so the service never discloses, mutates or even confirms the
+ * existence of the user's tabs. That scoping is the host's job, not the
+ * plugin's: it is enforced where ownership is known, and ownership is derived
+ * from `ctx`, never passed in.
+ *
+ * Ids are independent of visible titles: titles may repeat or be renamed
+ * without changing an id. Tab indices are presentation order, not identity.
+ * Ids are chosen by the plugin and namespaced per plugin by the host (the
+ * "pj.data_processors.v1" discipline), so an id is unique within this binding
+ * and cannot collide with another plugin's. The resemblance stops there, and
+ * the difference matters: a data processor's id survives a session reload
+ * because the host replays it from a persisted recipe, whereas a tab is a VIEW
+ * and this service promises nothing of the sort. Treat an id as live only for
+ * as long as `list_tab_ids` still returns it, and re-read rather than assume
+ * after anything that could have rebuilt the workspace.
+ *
+ * A tab created here is the host's to present: it carries whatever permanent
+ * mark the host uses for model-authored views, and the plugin cannot suppress
+ * it. Whether such a tab is saved with the workspace is likewise the host's
+ * policy, not this service's contract.
+ *
+ * All slots are [main-thread]. ABI-APPENDABLE: new slots may be added at the
+ * tail; struct_size gates read.
+ */
+typedef struct PJ_plot_tab_host_vtable_t {
+  uint32_t protocol_version; /* = 1 */
+  uint32_t struct_size;      /* = sizeof(PJ_plot_tab_host_vtable_t) */
+
+  /* [main-thread] Create (or replace, upsert by id) a tab owned by this plugin,
+   * holding one empty plot. An empty `title` lets the host name it. All string
+   * arguments are borrowed for the duration of the call. */
+  bool (*create_tab)(void* ctx, PJ_string_view_t id, PJ_string_view_t title, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Close one of this plugin's tabs. Unknown id is an error.
+   * Closing a tab discards the VIEW only: any derived series or markers drawn
+   * in it are data and outlive it. */
+  bool (*close_tab)(void* ctx, PJ_string_view_t id, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Enumerate the ids of THIS plugin's live tabs.
+   * Count-then-fill: pass capacity 0 to read *out_count, then call again with a
+   * buffer of that size. On success the first min(capacity, *out_count) entries
+   * of out_ids are filled and point into host storage valid only until the next
+   * call on this vtable. Owning no tab is success with *out_count == 0. */
+  bool (*list_tab_ids)(
+      void* ctx, PJ_string_view_t* out_ids, uint64_t capacity, uint64_t* out_count, PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Read back what a tab actually holds, as JSON
+   * {"title":"...","curves":[{"topic":"...","field":"...","dataset":"..."}]}.
+   * This is how a caller reports what was drawn instead of what it asked for:
+   * a curve the host could not resolve is simply absent. "dataset" is always
+   * the RESOLVED source name, even where the caller left it empty, so the
+   * report says which run a curve actually came from. The host emits valid
+   * JSON: any character needing escaping in a topic or field is escaped here.
+   * *out_config_json is borrowed, valid only until the next call on this
+   * vtable. Unknown id is an error. */
+  bool (*tab_config)(void* ctx, PJ_string_view_t id, PJ_string_view_t* out_config_json, PJ_error_t* out_error)
+      PJ_NOEXCEPT;
+
+  /* [main-thread] Draw one curve in a tab of this plugin's. The series is named
+   * by its parts, not a joined path, because field paths legitimately contain
+   * '/' and dataset names contain ':' — splitting a joined form is guesswork the
+   * host should not have to do. An empty `dataset_source` means the topic/field
+   * must be unique across loaded datasets; the host refuses an ambiguous one
+   * with the qualified candidates rather than picking. Adding a curve already
+   * present is not an error. */
+  bool (*add_curve)(
+      void* ctx, PJ_string_view_t id, PJ_string_view_t topic, PJ_string_view_t field, PJ_string_view_t dataset_source,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Take one curve back out. `dataset_source` resolves by the
+   * same rule as in add_curve — empty means "the topic/field must be unique" —
+   * so a curve can be removed with whatever form was used to add it, or with
+   * the resolved name tab_config reports. A curve that is not there is an
+   * error, so a mistaken path is visible rather than silently accepted. */
+  bool (*remove_curve)(
+      void* ctx, PJ_string_view_t id, PJ_string_view_t topic, PJ_string_view_t field, PJ_string_view_t dataset_source,
+      PJ_error_t* out_error) PJ_NOEXCEPT;
+
+  /* [main-thread] Remove every curve from a tab, keeping the tab itself. */
+  bool (*clear_tab)(void* ctx, PJ_string_view_t id, PJ_error_t* out_error) PJ_NOEXCEPT;
+} PJ_plot_tab_host_vtable_t;
+
+typedef struct {
+  void* ctx;
+  const PJ_plot_tab_host_vtable_t* vtable;
+} PJ_plot_tab_host_t;
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

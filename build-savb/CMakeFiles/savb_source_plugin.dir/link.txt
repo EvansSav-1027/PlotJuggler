@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -Wl,-Bsymbolic-functions -Wl,--version-script=/home/sav-sys-1027/PlotJuggler/build-savb/savb_source_plugin_exports.map -shared -Wl,-soname,libsavb_source_plugin.so -o bin/libsavb_source_plugin.so CMakeFiles/savb_source_plugin.dir/savb_source.cpp.o  libsavb_log.a _deps/plotjuggler_sdk-build/pj_base/libpj_base.a 

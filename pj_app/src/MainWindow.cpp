@@ -3998,8 +3998,13 @@ void MainWindow::applyGlobalToggles(PlotWidget* plot) {
   applyDots(plot);
   plot->setReferenceLine(referenceDisplaySeconds());
   plot->setKeepRatioXY(keep_ratio_);
+  plot->setDateTimeScale(!session_->sessionManager().useTimeOffset());
   applyLegendStatus(plot);
   plot->setTrackerParameter(tracker_info_);
+}
+
+void MainWindow::syncTimelineDateTime() {
+  ui_->timelineWidget->setTimeOfDayDisplay(!session_->sessionManager().useTimeOffset());
 }
 
 void MainWindow::applyShowPointsToDock(DockWidget* dock) {
@@ -8829,7 +8834,7 @@ void MainWindow::buildGlobalToolbar() {
   button_t0_ = add_button(
       "buttonTimeOffset", ":/resources/svg/t0.svg",
       "Use time offset: show time relative to each dataset's start (axis begins at 0) instead of "
-      "absolute time");
+      "absolute wall-clock time (UTC hh:mm:ss)");
   auto make_checkable = [](QToolButton* btn, bool initial_checked) {
     btn->setCheckable(true);
     btn->setChecked(initial_checked);
@@ -8843,6 +8848,7 @@ void MainWindow::buildGlobalToolbar() {
   // Mirrors the frame the SessionManager already holds (applied from QSettings
   // at startup, before this runs).
   make_checkable(button_t0_, session_->sessionManager().useTimeOffset());
+  syncTimelineDateTime();
   // buttonZoomOut is a one-shot action, not a toggle — no make_checkable.
   connect(button_zoom_out_, &QToolButton::clicked, this, [this]() {
     linkedZoomOut();
@@ -8912,6 +8918,12 @@ void MainWindow::buildGlobalToolbar() {
     }
     QSettings().setValue(u"MainWindow.useTimeOffset"_s, checked);
     onUseTimeOffsetToggled(checked);
+    // Off = absolute time: label the axis and readout as wall-clock time of day.
+    forEachPlot([checked](PlotWidget* plot) {
+      plot->setDateTimeScale(!checked);
+      plot->replot();
+    });
+    syncTimelineDateTime();
   });
 
   // Trailing stretch pins the icon stack at the top of the column.

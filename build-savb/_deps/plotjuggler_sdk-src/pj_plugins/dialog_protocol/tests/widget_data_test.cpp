@@ -1,0 +1,646 @@
+// Copyright 2026 Davide Faconti
+// SPDX-License-Identifier: Apache-2.0
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <limits>
+#include <nlohmann/json.hpp>
+#include <pj_plugins/sdk/widget_data.hpp>
+#include <string>
+#include <vector>
+
+using PJ::TableItem;
+using PJ::WidgetData;
+using json = nlohmann::json;
+
+static json parse(const WidgetData& wd) {
+  return json::parse(wd.toJson());
+}
+
+// --- Text properties ---
+
+TEST(WidgetDataTest, SetText) {
+  WidgetData wd;
+  wd.setText("host_input", "localhost");
+  auto j = parse(wd);
+  EXPECT_EQ(j["host_input"]["text"], "localhost");
+}
+
+TEST(WidgetDataTest, SetPlaceholder) {
+  WidgetData wd;
+  wd.setPlaceholder("host_input", "e.g. 127.0.0.1");
+  auto j = parse(wd);
+  EXPECT_EQ(j["host_input"]["placeholder"], "e.g. 127.0.0.1");
+}
+
+TEST(WidgetDataTest, SetReadOnly) {
+  WidgetData wd;
+  wd.setReadOnly("output_field", true);
+  auto j = parse(wd);
+  EXPECT_EQ(j["output_field"]["read_only"], true);
+}
+
+// --- ComboBox ---
+
+TEST(WidgetDataTest, SetCurrentIndex) {
+  WidgetData wd;
+  wd.setCurrentIndex("protocol_combo", 2);
+  auto j = parse(wd);
+  EXPECT_EQ(j["protocol_combo"]["current_index"], 2);
+}
+
+TEST(WidgetDataTest, SetItems) {
+  WidgetData wd;
+  std::vector<std::string> items = {"TCP", "UDP", "WebSocket"};
+  wd.setItems("protocol_combo", items);
+  auto j = parse(wd);
+  ASSERT_EQ(j["protocol_combo"]["items"].size(), 3u);
+  EXPECT_EQ(j["protocol_combo"]["items"][0], "TCP");
+  EXPECT_EQ(j["protocol_combo"]["items"][2], "WebSocket");
+}
+
+// --- CheckBox ---
+
+TEST(WidgetDataTest, SetChecked) {
+  WidgetData wd;
+  wd.setChecked("use_tls", true);
+  auto j = parse(wd);
+  EXPECT_EQ(j["use_tls"]["checked"], true);
+}
+
+// --- SpinBox ---
+
+TEST(WidgetDataTest, SetIntValue) {
+  WidgetData wd;
+  wd.setValue("port_input", 8080);
+  auto j = parse(wd);
+  EXPECT_EQ(j["port_input"]["value"], 8080);
+}
+
+TEST(WidgetDataTest, SetDoubleValue) {
+  WidgetData wd;
+  wd.setValue("rate_input", 3.14);
+  auto j = parse(wd);
+  EXPECT_DOUBLE_EQ(j["rate_input"]["value"].get<double>(), 3.14);
+}
+
+TEST(WidgetDataTest, SetRange) {
+  WidgetData wd;
+  wd.setRange("port_input", 1, 65535);
+  auto j = parse(wd);
+  EXPECT_EQ(j["port_input"]["min"], 1);
+  EXPECT_EQ(j["port_input"]["max"], 65535);
+}
+
+// --- ListWidget ---
+
+TEST(WidgetDataTest, SetListItems) {
+  WidgetData wd;
+  std::vector<std::string> items = {"topic_a", "topic_b"};
+  wd.setListItems("topic_list", items);
+  auto j = parse(wd);
+  ASSERT_EQ(j["topic_list"]["list_items"].size(), 2u);
+  EXPECT_EQ(j["topic_list"]["list_items"][1], "topic_b");
+}
+
+TEST(WidgetDataTest, SetSelectedItems) {
+  WidgetData wd;
+  std::vector<std::string> sel = {"topic_a"};
+  wd.setSelectedItems("topic_list", sel);
+  auto j = parse(wd);
+  ASSERT_EQ(j["topic_list"]["selected_items"].size(), 1u);
+  EXPECT_EQ(j["topic_list"]["selected_items"][0], "topic_a");
+}
+
+// --- TableWidget ---
+
+TEST(WidgetDataTest, SetTableHeaders) {
+  WidgetData wd;
+  std::vector<std::string> headers = {"Name", "Type", "Rate"};
+  wd.setTableHeaders("data_table", headers);
+  auto j = parse(wd);
+  ASSERT_EQ(j["data_table"]["headers"].size(), 3u);
+  EXPECT_EQ(j["data_table"]["headers"][1], "Type");
+}
+
+TEST(WidgetDataTest, SetTableRows) {
+  WidgetData wd;
+  std::vector<std::vector<std::string>> rows = {{"imu", "sensor", "100"}, {"gps", "sensor", "10"}};
+  wd.setTableRows("data_table", rows);
+  auto j = parse(wd);
+  ASSERT_EQ(j["data_table"]["rows"].size(), 2u);
+  EXPECT_EQ(j["data_table"]["rows"][0][0], "imu");
+  EXPECT_EQ(j["data_table"]["rows"][1][2], "10");
+}
+
+// --- TableWidget: typed rows (TableItem) ---
+
+// The string overload is the compatibility baseline: it must stay a pure-text
+// emission, or an old host would start seeing a key it cannot interpret.
+TEST(WidgetDataTest, SetTableRowsStringOverloadEmitsNoColumnValues) {
+  WidgetData wd;
+  std::vector<std::vector<std::string>> rows = {{"imu", "100"}, {"gps", "10"}};
+  wd.setTableRows("data_table", rows);
+  auto j = parse(wd);
+  EXPECT_FALSE(j["data_table"].contains("column_values"));
+  EXPECT_EQ(j["data_table"], json::parse(R"({"rows": [["imu", "100"], ["gps", "10"]]})"));
+}
+
+// Non-finite keys cannot cross the wire: nlohmann's dump() serializes NaN and
+// ±infinity as null, so the host sees a keyless cell (text rank). Pinned here so
+// the degradation stays deliberate and documented rather than accidental.
+TEST(WidgetDataTest, SetTableRowsTypedNonFiniteKeysSerializeAsNull) {
+  WidgetData wd;
+  wd.setTableRows(
+      "t", {{PJ::TableItem(std::numeric_limits<double>::infinity(), "inf")},
+            {PJ::TableItem(-std::numeric_limits<double>::infinity(), "-inf")},
+            {PJ::TableItem(std::numeric_limits<double>::quiet_NaN(), "nan")}});
+  auto j = parse(wd);
+  const auto& col = j["t"]["column_values"]["0"];
+  ASSERT_EQ(col.size(), 3u);
+  EXPECT_TRUE(col[0].is_null());
+  EXPECT_TRUE(col[1].is_null());
+  EXPECT_TRUE(col[2].is_null());
+}
+
+// A typed delivery followed by a string delivery on the SAME widget must drop the
+// stale keys: with a matching row count the host would otherwise pair the new
+// rows with the old keys and silently sort them wrong.
+TEST(WidgetDataTest, SetTableRowsStringOverloadClearsStaleColumnValues) {
+  WidgetData wd;
+  std::vector<std::vector<PJ::TableItem>> typed = {
+      {PJ::TableItem("a"), PJ::TableItem(std::uint64_t{2})}, {PJ::TableItem("b"), PJ::TableItem(std::uint64_t{1})}};
+  wd.setTableRows("t", typed);
+  ASSERT_TRUE(parse(wd)["t"].contains("column_values"));
+  std::vector<std::vector<std::string>> plain = {{"c", "20"}, {"d", "10"}};
+  wd.setTableRows("t", plain);
+  EXPECT_FALSE(parse(wd)["t"].contains("column_values"));
+}
+
+// `rows` is what an old host reads, so the typed overload must produce byte-identical
+// display text — the sort keys ride alongside, never inside it.
+TEST(WidgetDataTest, SetTableRowsTypedEmitsSameDisplayTextAsStringOverload) {
+  WidgetData typed;
+  typed.setTableRows(
+      "t", {{PJ::TableItem("imu"), PJ::TableItem(std::uint64_t{100})},
+            {PJ::TableItem("gps"), PJ::TableItem(std::uint64_t{10})}});
+
+  WidgetData text;
+  std::vector<std::vector<std::string>> rows = {{"imu", "100"}, {"gps", "10"}};
+  text.setTableRows("t", rows);
+
+  EXPECT_EQ(parse(typed)["t"]["rows"], parse(text)["t"]["rows"]);
+}
+
+// Only columns that carry a key appear: a text column must not pay for the feature,
+// and its absence is how the host knows to sort that column by text.
+TEST(WidgetDataTest, SetTableRowsTypedColumnValuesAreSparse) {
+  WidgetData wd;
+  wd.setTableRows(
+      "t2", {{PJ::TableItem("chan_a"), PJ::TableItem("mcap"), PJ::TableItem(std::uint64_t{1234})},
+             {PJ::TableItem("chan_b"), PJ::TableItem("mcap"), PJ::TableItem(std::uint64_t{720})}});
+  wd.setTableSortIndicator("t2", 2, false);
+
+  EXPECT_EQ(parse(wd), json::parse(R"({"t2": {
+        "column_values": {"2": [1234, 720]},
+        "rows": [["chan_a", "mcap", "1234"], ["chan_b", "mcap", "720"]],
+        "sort_indicator": {"asc": false, "col": 2}
+      }})"));
+}
+
+TEST(WidgetDataTest, SetTableRowsTypedWithNoValuesOmitsColumnValues) {
+  WidgetData wd;
+  wd.setTableRows("t", {{PJ::TableItem("a"), PJ::TableItem("b")}, {PJ::TableItem("c"), PJ::TableItem("d")}});
+  auto j = parse(wd);
+  EXPECT_FALSE(j["t"].contains("column_values"));
+  ASSERT_EQ(j["t"]["rows"].size(), 2u);
+  EXPECT_EQ(j["t"]["rows"][1][0], "c");
+}
+
+// The reason the key exists. An int64 nanosecond timestamp and a uint64 byte count
+// both exceed 2^53, so a sort key routed through a double would silently round —
+// producing ties between distinct rows and a wrong answer to "which is largest".
+TEST(WidgetDataTest, SetTableRowsTypedInt64AndUint64SurviveExactly) {
+  constexpr std::int64_t kNanos = 1780000000000000123;
+  constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+
+  WidgetData wd;
+  wd.setTableRows("t", {{PJ::TableItem(kNanos)}, {PJ::TableItem(kMax)}});
+  auto j = parse(wd);
+
+  const auto& col = j["t"]["column_values"]["0"];
+  ASSERT_EQ(col.size(), 2u);
+  EXPECT_EQ(col[0].get<std::int64_t>(), kNanos);
+  EXPECT_EQ(col[1].get<std::uint64_t>(), kMax);
+  // Exact, not merely close: the same timestamp forced through a double lands on
+  // ...0000000000000000. Anything that reintroduces a double here is a regression.
+  EXPECT_NE(static_cast<std::int64_t>(static_cast<double>(kNanos)), kNanos);
+}
+
+TEST(WidgetDataTest, SetTableRowsTypedDoublesSurviveExactly) {
+  constexpr double kUlogParam = 560535533.0;
+  constexpr double kMax = std::numeric_limits<double>::max();
+
+  WidgetData wd;
+  // The lossy "%g" rendering next to the exact value is the point of TableItem:
+  // text and value are different information, not duplicated information.
+  wd.setTableRows("t", {{PJ::TableItem(kUlogParam, "5.60536e+08")}, {PJ::TableItem(kMax, "1.79769e+308")}});
+  auto j = parse(wd);
+
+  const auto& col = j["t"]["column_values"]["0"];
+  ASSERT_EQ(col.size(), 2u);
+  EXPECT_EQ(col[0].get<double>(), kUlogParam);
+  EXPECT_EQ(col[1].get<double>(), kMax);
+  EXPECT_EQ(j["t"]["rows"][0][0], "5.60536e+08");
+}
+
+TEST(WidgetDataTest, SetTableRowsTypedFloatSurvivesExactly) {
+  WidgetData wd;
+  wd.setTableRows("t", {{PJ::TableItem(1.5f)}, {PJ::TableItem(-0.25f)}});
+  auto j = parse(wd);
+  const auto& col = j["t"]["column_values"]["0"];
+  ASSERT_EQ(col.size(), 2u);
+  EXPECT_EQ(col[0].get<double>(), 1.5);
+  EXPECT_EQ(col[1].get<double>(), -0.25);
+}
+
+// A hidden key: what the user reads and what the column orders by need not match.
+TEST(WidgetDataTest, SetTableRowsTypedHiddenSortKey) {
+  constexpr std::int64_t kNanos = 1784283780000000000;
+
+  WidgetData wd;
+  wd.setTableRows("t", {{PJ::TableItem(kNanos, "2026-07-17 10:23")}});
+  auto j = parse(wd);
+  EXPECT_EQ(j["t"]["rows"][0][0], "2026-07-17 10:23");
+  EXPECT_EQ(j["t"]["column_values"]["0"][0].get<std::int64_t>(), kNanos);
+}
+
+// ulog mixes real numbers with "N/A" in one column. The keyless cell must hold its
+// slot as null: shifting it would re-key every row below it.
+TEST(WidgetDataTest, SetTableRowsTypedValuelessCellIsNull) {
+  WidgetData wd;
+  wd.setTableRows("t", {{PJ::TableItem(3.5)}, {PJ::TableItem("N/A")}, {PJ::TableItem(1.5)}});
+  auto j = parse(wd);
+
+  const auto& col = j["t"]["column_values"]["0"];
+  ASSERT_EQ(col.size(), 3u);
+  EXPECT_EQ(col[0].get<double>(), 3.5);
+  EXPECT_TRUE(col[1].is_null());
+  EXPECT_EQ(col[2].get<double>(), 1.5);
+  EXPECT_EQ(j["t"]["rows"][1][0], "N/A");
+}
+
+TEST(WidgetDataTest, SetTableSortIndicator) {
+  WidgetData wd;
+  wd.setTableSortIndicator("t", 3, true);
+  auto j = parse(wd);
+  EXPECT_EQ(j["t"]["sort_indicator"]["col"], 3);
+  EXPECT_EQ(j["t"]["sort_indicator"]["asc"], true);
+}
+
+// --- Label / Button ---
+
+TEST(WidgetDataTest, SetLabel) {
+  WidgetData wd;
+  wd.setLabel("status_label", "Connected");
+  auto j = parse(wd);
+  EXPECT_EQ(j["status_label"]["label"], "Connected");
+}
+
+TEST(WidgetDataTest, SetButtonText) {
+  WidgetData wd;
+  wd.setButtonText("connect_btn", "Disconnect");
+  auto j = parse(wd);
+  EXPECT_EQ(j["connect_btn"]["button_text"], "Disconnect");
+}
+
+TEST(WidgetDataTest, SetButtonIconNamed) {
+  WidgetData wd;
+  wd.setButtonIconNamed("play_btn", "media-play");
+  auto j = parse(wd);
+  EXPECT_EQ(j["play_btn"]["button_icon_name"], "media-play");
+}
+
+// --- Field validity indicator ---
+
+TEST(WidgetDataTest, SetFieldValid) {
+  WidgetData wd;
+  wd.setFieldValid("lua_editor", false, "syntax error on line 3");
+  auto j = parse(wd);
+  EXPECT_EQ(j["lua_editor"]["valid"], false);
+  EXPECT_EQ(j["lua_editor"]["valid_tooltip"], "syntax error on line 3");
+}
+
+TEST(WidgetDataTest, SetFieldValidDefaultTooltip) {
+  WidgetData wd;
+  wd.setFieldValid("lua_editor", true);
+  auto j = parse(wd);
+  EXPECT_EQ(j["lua_editor"]["valid"], true);
+  EXPECT_EQ(j["lua_editor"]["valid_tooltip"], "");
+}
+
+// --- File picker ---
+
+TEST(WidgetDataTest, SetFilePicker) {
+  WidgetData wd;
+  wd.setFilePicker("cert_btn", "Browse...", "*.pem *.crt", "Select Certificate");
+  auto j = parse(wd);
+  EXPECT_EQ(j["cert_btn"]["action"], "file_picker");
+  EXPECT_EQ(j["cert_btn"]["filter"], "*.pem *.crt");
+  EXPECT_EQ(j["cert_btn"]["title"], "Select Certificate");
+  EXPECT_EQ(j["cert_btn"]["button_text"], "Browse...");
+}
+
+TEST(WidgetDataTest, SetStructuredFilePickerSerializesEveryFieldAndLegacyEquivalent) {
+  PJ::FilePickerOptions options;
+  options.mode = PJ::FilePickerMode::OpenFiles;
+  options.title = "Select ROS bag files";
+  options.accept_label = "Open";
+  options.initial_directory = "/data/bags";
+  options.suggested_name = "recording.mcap";
+  options.default_suffix = "mcap";
+  options.filters = {{"bags", "ROS bag files", {"*.bag", "*.db3", "*.mcap"}}, {"all", "All files", {"*"}}};
+  options.initially_selected_filter_id = "bags";
+  options.confirm_overwrite = false;
+
+  WidgetData wd;
+  wd.setFilePicker("openBags", "Open bags...", options);
+  auto j = parse(wd);
+
+  EXPECT_EQ(j["openBags"]["button_text"], "Open bags...");
+  EXPECT_EQ(j["openBags"]["file_picker"], json::parse(R"({
+    "mode": "open_files",
+    "title": "Select ROS bag files",
+    "accept_label": "Open",
+    "initial_directory": "/data/bags",
+    "suggested_name": "recording.mcap",
+    "default_suffix": "mcap",
+    "filters": [
+      {"id": "bags", "label": "ROS bag files", "patterns": ["*.bag", "*.db3", "*.mcap"]},
+      {"id": "all", "label": "All files", "patterns": ["*"]}
+    ],
+    "initially_selected_filter_id": "bags",
+    "confirm_overwrite": false
+  })"));
+  EXPECT_EQ(j["openBags"]["action"], "file_picker");
+  EXPECT_EQ(j["openBags"]["filter"], "ROS bag files (*.bag *.db3 *.mcap);;All files (*)");
+  EXPECT_EQ(j["openBags"]["title"], options.title);
+  EXPECT_FALSE(j["openBags"].contains("default_suffix"));
+}
+
+TEST(WidgetDataTest, LegacySaveAndFolderPickerOverloadsRemainUnchanged) {
+  WidgetData wd;
+  wd.setSaveFilePicker("save", "Save...", "JSON (*.json)", "Save configuration", "json");
+  wd.setFolderPicker("folder", "Choose...", "Select output folder");
+  auto j = parse(wd);
+
+  EXPECT_EQ(
+      j["save"],
+      json::parse(
+          R"json({"action":"save_file_picker","button_text":"Save...","default_suffix":"json","filter":"JSON (*.json)","title":"Save configuration"})json"));
+  EXPECT_EQ(
+      j["folder"],
+      json::parse(R"({"action":"folder_picker","button_text":"Choose...","title":"Select output folder"})"));
+  EXPECT_FALSE(j["save"].contains("file_picker"));
+  EXPECT_FALSE(j["folder"].contains("file_picker"));
+}
+
+// --- DialogButtonBox ---
+
+TEST(WidgetDataTest, SetOkEnabled) {
+  WidgetData wd;
+  wd.setOkEnabled(false);
+  auto j = parse(wd);
+  EXPECT_EQ(j["buttonBox"]["ok_enabled"], false);
+}
+
+// --- TabWidget ---
+
+TEST(WidgetDataTest, SetTabIndex) {
+  WidgetData wd;
+  wd.setTabIndex("tab_widget", 1);
+  auto j = parse(wd);
+  EXPECT_EQ(j["tab_widget"]["tab_index"], 1);
+}
+
+// --- StackedWidget ---
+
+TEST(WidgetDataTest, SetStackedPage) {
+  WidgetData wd;
+  wd.setStackedPage("configuration_stack", "advanced_page");
+  auto j = parse(wd);
+  EXPECT_EQ(j["configuration_stack"]["stacked_page"], "advanced_page");
+}
+
+TEST(WidgetDataTest, SetStackedIndex) {
+  WidgetData wd;
+  wd.setStackedIndex("configuration_stack", 2);
+  auto j = parse(wd);
+  EXPECT_EQ(j["configuration_stack"]["stacked_index"], 2);
+}
+
+TEST(WidgetDataTest, InvalidStackedSelectionIsSerializedForHostValidation) {
+  WidgetData wd;
+  wd.setStackedPage("configuration_stack", "").setStackedIndex("configuration_stack", -1);
+  auto j = parse(wd);
+  EXPECT_EQ(j["configuration_stack"]["stacked_page"], "");
+  EXPECT_EQ(j["configuration_stack"]["stacked_index"], -1);
+}
+
+// --- Generic ---
+
+TEST(WidgetDataTest, SetEnabled) {
+  WidgetData wd;
+  wd.setEnabled("connect_btn", false);
+  auto j = parse(wd);
+  EXPECT_EQ(j["connect_btn"]["enabled"], false);
+}
+
+TEST(WidgetDataTest, SetVisible) {
+  WidgetData wd;
+  wd.setVisible("cert_btn", true);
+  auto j = parse(wd);
+  EXPECT_EQ(j["cert_btn"]["visible"], true);
+}
+
+// --- Multiple properties on same widget ---
+
+TEST(WidgetDataTest, MergePropertiesOnSameWidget) {
+  WidgetData wd;
+  wd.setText("host_input", "localhost");
+  wd.setPlaceholder("host_input", "e.g. 127.0.0.1");
+  wd.setReadOnly("host_input", false);
+  auto j = parse(wd);
+  EXPECT_EQ(j["host_input"]["text"], "localhost");
+  EXPECT_EQ(j["host_input"]["placeholder"], "e.g. 127.0.0.1");
+  EXPECT_EQ(j["host_input"]["read_only"], false);
+}
+
+// --- Clear ---
+
+TEST(WidgetDataTest, Clear) {
+  WidgetData wd;
+  wd.setText("host_input", "localhost");
+  EXPECT_NE(parse(wd).size(), 0u);
+  wd.clear();
+  EXPECT_EQ(parse(wd).size(), 0u);
+}
+
+// --- Chaining ---
+
+TEST(WidgetDataTest, Chaining) {
+  WidgetData wd;
+  auto json_str = wd.setText("host", "x").setValue("port", 80).setChecked("tls", true).toJson();
+  auto j = json::parse(json_str);
+  EXPECT_EQ(j["host"]["text"], "x");
+  EXPECT_EQ(j["port"]["value"], 80);
+  EXPECT_EQ(j["tls"]["checked"], true);
+}
+
+TEST(WidgetDataTest, SetCodeCursor) {
+  WidgetData wd;
+  wd.setCodeContent("editor", "robot ==").setCodeCursor("editor", 8);
+  auto j = parse(wd);
+  EXPECT_EQ(j["editor"]["code_content"], "robot ==");
+  EXPECT_EQ(j["editor"]["code_cursor"], 8);
+}
+
+TEST(WidgetDataTest, SetCodeCaretTracking) {
+  WidgetData wd;
+  wd.setCodeCaretTracking("editor");
+  auto j = parse(wd);
+  EXPECT_EQ(j["editor"]["code_caret_tracking"], true);
+}
+
+TEST(WidgetDataTest, SetCodeCaretTrackingExplicitFalse) {
+  WidgetData wd;
+  wd.setCodeCaretTracking("editor", false);
+  auto j = parse(wd);
+  EXPECT_EQ(j["editor"]["code_caret_tracking"], false);
+}
+
+TEST(WidgetDataTest, TableDeltaOpsSerializeUnderOneKey) {
+  WidgetData wd;
+  wd.appendTableRows("tbl", 7, std::vector<std::vector<std::string>>{{"a", "b"}, {"c", "d"}});
+  wd.updateTableCells("tbl", 7, {{0, 1, "x"}});
+  wd.removeTableRows("tbl", 7, {3, 5});
+  auto j = parse(wd);
+  const auto& delta = j["tbl"]["table_delta"];
+  EXPECT_EQ(delta["seq"], 7);
+  ASSERT_EQ(delta["append"].size(), 2U);
+  EXPECT_EQ(delta["append"][1][0], "c");
+  ASSERT_EQ(delta["update_cells"].size(), 1U);
+  EXPECT_EQ(delta["update_cells"][0][0], 0);
+  EXPECT_EQ(delta["update_cells"][0][1], 1);
+  EXPECT_EQ(delta["update_cells"][0][2], "x");
+  EXPECT_EQ(delta["remove_rows"], nlohmann::json({3, 5}));
+}
+
+TEST(WidgetDataTest, TableDeltaDifferingSeqStartsFreshDelta) {
+  WidgetData wd;
+  wd.appendTableRows("tbl", 1, std::vector<std::vector<std::string>>{{"old"}});
+  wd.updateTableCells("tbl", 2, {{0, 0, "new"}});
+  auto j = parse(wd);
+  const auto& delta = j["tbl"]["table_delta"];
+  // The seq-1 append must not survive relabeled under seq 2.
+  EXPECT_EQ(delta["seq"], 2);
+  EXPECT_FALSE(delta.contains("append"));
+  ASSERT_EQ(delta["update_cells"].size(), 1U);
+}
+
+TEST(WidgetDataTest, TypedAppendEmitsSparseAppendValues) {
+  WidgetData wd;
+  wd.appendTableRows(
+      "tbl", 3,
+      std::vector<std::vector<TableItem>>{
+          {TableItem("plain"), TableItem(int64_t{42}, "42 ms")}, {TableItem("other"), TableItem("keyless")}});
+  auto j = parse(wd);
+  const auto& delta = j["tbl"]["table_delta"];
+  EXPECT_EQ(delta["seq"], 3);
+  ASSERT_EQ(delta["append"].size(), 2U);
+  EXPECT_EQ(delta["append"][0][1], "42 ms");
+  // Sparse, mirroring column_values: only column 1 carries any key; the
+  // keyless cell is null there; column 0 is absent entirely.
+  ASSERT_TRUE(delta.contains("append_values"));
+  EXPECT_FALSE(delta["append_values"].contains("0"));
+  ASSERT_EQ(delta["append_values"]["1"].size(), 2U);
+  EXPECT_EQ(delta["append_values"]["1"][0], 42);
+  EXPECT_TRUE(delta["append_values"]["1"][1].is_null());
+}
+
+TEST(WidgetDataTest, TypedUpdateCellCarriesValue) {
+  WidgetData wd;
+  wd.updateTableCells("tbl", 4, {{0, 1, {int64_t{7}, "7 s"}}, {2, 0, "text-only"}});
+  auto j = parse(wd);
+  const auto& cells = j["tbl"]["table_delta"]["update_cells"];
+  ASSERT_EQ(cells.size(), 2U);
+  ASSERT_EQ(cells[0].size(), 4U);
+  EXPECT_EQ(cells[0][2], "7 s");
+  EXPECT_EQ(cells[0][3], 7);
+  // A keyless cell stays 3-element: update is a full cell replacement, so no
+  // fourth element means the cell's sort key is cleared, not preserved.
+  EXPECT_EQ(cells[1].size(), 3U);
+}
+
+// --- QTreeWidget ---
+
+TEST(WidgetDataTest, TreeSnapshotAndStateChannelsUseCanonicalWireShape) {
+  PJ::TreeCell root_cell{"Sensors", PJ::NumericValue(std::uint64_t{1} << 60), "All sensor topics", "folder"};
+  PJ::TreeCell child_cell{"/imu", PJ::NumericValue(-2.5), "IMU stream", "topic"};
+  std::vector<PJ::TreeItem> items = {
+      {"sensors", "", {root_cell}, false, false, PJ::TreeCheckState::PartiallyChecked, true},
+      {"imu",
+       "sensors",
+       {child_cell, PJ::TreeCell{"sensor_msgs/Imu", std::nullopt, "", ""}},
+       true,
+       true,
+       PJ::TreeCheckState::Checked,
+       false},
+      {"unchecked", "", {}, true, true, PJ::TreeCheckState::Unchecked, false},
+      {"plain", "", {}, true, true, PJ::TreeCheckState::None, false},
+  };
+
+  WidgetData wd;
+  wd.setTreeHeaders("topicTree", {"Topic", "Type"})
+      .setTreeItems("topicTree", items)
+      .setTreeSelectedIds("topicTree", {"imu"})
+      .setTreeExpandedIds("topicTree", {"sensors"})
+      .setTreeVisibleIds("topicTree", {"imu", "unknown-yet"})
+      .setTreeSelectionMode("topicTree", true);
+
+  const auto j = parse(wd);
+  const auto& tree = j["topicTree"];
+  EXPECT_EQ(tree["tree_headers"], nlohmann::json({"Topic", "Type"}));
+  ASSERT_EQ(tree["tree_items"].size(), 4U);
+  const auto& root = tree["tree_items"][0];
+  EXPECT_EQ(root["id"], "sensors");
+  EXPECT_EQ(root["parent_id"], "");
+  EXPECT_FALSE(root["enabled"]);
+  EXPECT_FALSE(root["selectable"]);
+  EXPECT_TRUE(root["may_have_children"]);
+  EXPECT_EQ(root["check_state"], "partially_checked");
+  EXPECT_EQ(root["cells"][0]["text"], "Sensors");
+  EXPECT_EQ(root["cells"][0]["sort_value"], std::uint64_t{1} << 60);
+  EXPECT_EQ(root["cells"][0]["tooltip"], "All sensor topics");
+  EXPECT_EQ(root["cells"][0]["icon"], "folder");
+  EXPECT_EQ(tree["tree_items"][1]["check_state"], "checked");
+  EXPECT_EQ(tree["tree_items"][2]["check_state"], "unchecked");
+  EXPECT_EQ(tree["tree_items"][3]["check_state"], "none");
+  EXPECT_EQ(tree["tree_selected_ids"], nlohmann::json({"imu"}));
+  EXPECT_EQ(tree["tree_expanded_ids"], nlohmann::json({"sensors"}));
+  EXPECT_EQ(tree["tree_visible_ids"], nlohmann::json({"imu", "unknown-yet"}));
+  EXPECT_TRUE(tree["tree_multi_selection"]);
+}
+
+TEST(WidgetDataTest, ClearTreeVisibleIdsEmitsJsonNull) {
+  WidgetData wd;
+  wd.clearTreeVisibleIds("topicTree");
+  EXPECT_TRUE(parse(wd)["topicTree"]["tree_visible_ids"].is_null());
+}
+
+TEST(WidgetDataTest, SetTreeVisibleIdsAfterClearReEmitsFilterInSameBuilder) {
+  WidgetData wd;
+  wd.clearTreeVisibleIds("topicTree").setTreeVisibleIds("topicTree", {"imu", "gps"});
+  EXPECT_EQ(parse(wd)["topicTree"]["tree_visible_ids"], nlohmann::json({"imu", "gps"}));
+}

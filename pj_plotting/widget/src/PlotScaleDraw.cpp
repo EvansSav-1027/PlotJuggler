@@ -5,7 +5,12 @@
 
 #include <qwt_text.h>
 
+#include <QDateTime>
 #include <QLocale>
+#include <QTimeZone>
+#include <cmath>
+
+using namespace Qt::StringLiterals;
 
 namespace PJ {
 
@@ -24,6 +29,10 @@ QwtText PlotScaleDraw::label(double value) const {
     str.chop(point.size());
   }
   return str;
+}
+
+QwtText TimeScaleDraw::label(double value) const {
+  return QDateTime::fromMSecsSinceEpoch(std::llround(value * 1000.0), QTimeZone::UTC).toString(u"hh:mm:ss.z"_s);
 }
 
 }  // namespace PJ

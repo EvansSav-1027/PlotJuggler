@@ -1,0 +1,12 @@
+# This is a generated file and its contents are an internal implementation detail.
+# The download step will be re-executed if anything in this file changes.
+# No other meaning or use of this file is supported.
+
+method=url
+command=/usr/bin/cmake;-P;/home/sav-sys-1027/PlotJuggler/build-savb/_deps/fastfloat-subbuild/fastfloat-populate-prefix/src/fastfloat-populate-stamp/download-fastfloat-populate.cmake;COMMAND;/usr/bin/cmake;-P;/home/sav-sys-1027/PlotJuggler/build-savb/_deps/fastfloat-subbuild/fastfloat-populate-prefix/src/fastfloat-populate-stamp/verify-fastfloat-populate.cmake;COMMAND;/usr/bin/cmake;-P;/home/sav-sys-1027/PlotJuggler/build-savb/_deps/fastfloat-subbuild/fastfloat-populate-prefix/src/fastfloat-populate-stamp/extract-fastfloat-populate.cmake
+source_dir=/home/sav-sys-1027/PlotJuggler/build-savb/_deps/fastfloat-src
+work_dir=/home/sav-sys-1027/PlotJuggler/build-savb/_deps
+url(s)=https://github.com/fastfloat/fast_float/archive/refs/tags/v8.0.2.tar.gz
+hash=
+no_extract=
+

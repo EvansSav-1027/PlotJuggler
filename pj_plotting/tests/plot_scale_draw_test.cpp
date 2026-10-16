@@ -82,6 +82,36 @@ TEST_F(PlotScaleDrawTest, InstalledOnAllPlotAxes) {
   }
 }
 
+QString timeLabelText(double value) {
+  const PJ::TimeScaleDraw draw;
+  return draw.label(value).text();
+}
+
+// Epoch seconds label as UTC time of day, with no date.
+TEST_F(PlotScaleDrawTest, TimeScaleDrawLabelsEpochSecondsAsUtcTimeOfDay) {
+  EXPECT_EQ(timeLabelText(1760617812.25), "12:30:12.25");
+  EXPECT_EQ(timeLabelText(3723.5), "01:02:03.5");
+  EXPECT_EQ(timeLabelText(0.0), "00:00:00.0");
+}
+
+// The date-time scale goes on the bottom axis of a time-series plot only; an XY
+// plot keeps numeric labels and gets the time labels back when it returns.
+TEST_F(PlotScaleDrawTest, DateTimeScaleFollowsXYMode) {
+  TestPlot plot;
+  const auto bottom_is_time = [&plot] {
+    return dynamic_cast<const PJ::TimeScaleDraw*>(plot.qwtPlot()->axisScaleDraw(QwtPlot::xBottom)) != nullptr;
+  };
+  plot.setDateTimeScale(true);
+  EXPECT_TRUE(bottom_is_time());
+  EXPECT_NE(dynamic_cast<const PJ::PlotScaleDraw*>(plot.qwtPlot()->axisScaleDraw(QwtPlot::yLeft)), nullptr);
+  plot.setModeXY(true);
+  EXPECT_FALSE(bottom_is_time());
+  plot.setModeXY(false);
+  EXPECT_TRUE(bottom_is_time());
+  plot.setDateTimeScale(false);
+  EXPECT_NE(dynamic_cast<const PJ::PlotScaleDraw*>(plot.qwtPlot()->axisScaleDraw(QwtPlot::xBottom)), nullptr);
+}
+
 // "Lines and Dots" renders as plain Lines plus PlotCurve's batched dots pass
 // (stock Qwt has no such style; per-sample symbols are pathological on the GL
 // paint engine); toggling back to Lines must disable the pass.

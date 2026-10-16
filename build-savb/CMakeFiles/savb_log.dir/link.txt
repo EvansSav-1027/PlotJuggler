@@ -1,0 +1,2 @@
+/usr/bin/ar qc libsavb_log.a CMakeFiles/savb_log.dir/savb_log.cpp.o
+/usr/bin/ranlib libsavb_log.a

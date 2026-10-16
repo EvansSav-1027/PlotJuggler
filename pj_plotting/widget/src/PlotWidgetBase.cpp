@@ -485,10 +485,28 @@ void PlotWidgetBase::setModeXY(bool enable) {
   if (plot_ != nullptr && plot_->magnifier != nullptr) {
     plot_->magnifier->setTimeXAxis(!enable);
   }
+  setDateTimeScale(date_time_scale_);
 }
 
 bool PlotWidgetBase::isXYPlot() const noexcept {
   return xy_mode_;
+}
+
+void PlotWidgetBase::setDateTimeScale(bool enable) {
+  date_time_scale_ = enable;
+  if (plot_ == nullptr) {
+    return;
+  }
+  const bool want_time = enable && !xy_mode_;
+  const bool is_time = dynamic_cast<const TimeScaleDraw*>(plot_->axisScaleDraw(QwtPlot::xBottom)) != nullptr;
+  if (want_time == is_time) {
+    return;
+  }
+  if (want_time) {
+    plot_->setAxisScaleDraw(QwtPlot::xBottom, new TimeScaleDraw);
+  } else {
+    plot_->setAxisScaleDraw(QwtPlot::xBottom, new PlotScaleDraw);
+  }
 }
 
 void PlotWidgetBase::setLegendSize(int size) {

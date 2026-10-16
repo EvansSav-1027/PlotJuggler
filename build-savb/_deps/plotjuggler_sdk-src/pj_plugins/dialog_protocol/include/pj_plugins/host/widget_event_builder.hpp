@@ -1,0 +1,259 @@
+#pragma once
+// Copyright 2026 Davide Faconti
+// SPDX-License-Identifier: Apache-2.0
+
+#include <nlohmann/json.hpp>
+#include <pj_plugins/sdk/widget_data.hpp>  // TimelineMark, TreeCheckState
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace PJ {
+
+/// Static factory methods that produce event JSON strings for sendEvent().
+/// Each method returns a complete JSON string matching what PJ::WidgetEvent expects.
+struct WidgetEventBuilder {
+  /// QLineEdit: text changed
+  [[nodiscard]] static std::string textChanged(std::string_view text) {
+    nlohmann::json j;
+    j["text"] = text;
+    return j.dump();
+  }
+
+  /// QComboBox: index changed (index only)
+  [[nodiscard]] static std::string indexChanged(int index) {
+    nlohmann::json j;
+    j["current_index"] = index;
+    return j.dump();
+  }
+
+  /// QComboBox: index changed (index + current text)
+  [[nodiscard]] static std::string indexChanged(int index, std::string_view current_text) {
+    nlohmann::json j;
+    j["current_index"] = index;
+    j["current_text"] = current_text;
+    return j.dump();
+  }
+
+  /// QCheckBox, QRadioButton: toggled
+  [[nodiscard]] static std::string toggled(bool checked) {
+    nlohmann::json j;
+    j["checked"] = checked;
+    return j.dump();
+  }
+
+  /// QSpinBox: value changed (int)
+  [[nodiscard]] static std::string valueChanged(int value) {
+    nlohmann::json j;
+    j["value"] = value;
+    return j.dump();
+  }
+
+  /// QDoubleSpinBox: value changed (double)
+  [[nodiscard]] static std::string valueChanged(double value) {
+    nlohmann::json j;
+    j["value"] = value;
+    return j.dump();
+  }
+
+  /// QListWidget: selection changed
+  [[nodiscard]] static std::string selectionChanged(const std::vector<std::string>& selected) {
+    nlohmann::json j;
+    j["selected_items"] = selected;
+    return j.dump();
+  }
+
+  /// QPushButton: clicked
+  [[nodiscard]] static std::string clicked() {
+    nlohmann::json j;
+    j["clicked"] = true;
+    return j.dump();
+  }
+
+  /// File picker: file selected
+  [[nodiscard]] static std::string fileSelected(std::string_view path) {
+    nlohmann::json j;
+    j["file_selected"] = path;
+    return j.dump();
+  }
+
+  /// Folder picker: folder selected
+  [[nodiscard]] static std::string folderSelected(std::string_view path) {
+    nlohmann::json j;
+    j["folder_selected"] = path;
+    return j.dump();
+  }
+
+  /// Structured file-picker result. A fully valid Selected result co-emits its
+  /// first path as `file_selected`, or `folder_selected` for SelectDirectory.
+  /// Malformed Selected and all other statuses emit only `file_picker_result`.
+  /// @since 0.21.0
+  [[nodiscard]] static std::string filePickerResult(const FilePickerResult& result) {
+    nlohmann::json j;
+    j["file_picker_result"] = {
+        {"status", filePickerStatusWireValue(result.status)},
+        {"mode", filePickerModeWireValue(result.mode)},
+        {"paths", result.paths},
+        {"display_names", result.display_names},
+        {"selected_filter_id", result.selected_filter_id},
+        {"error", result.error},
+    };
+    if (auto legacy = detail::filePickerLegacySelection(result)) {
+      j[std::string(legacy->key)] = legacy->path;
+    }
+    return j.dump();
+  }
+
+  /// QTabWidget: tab changed
+  [[nodiscard]] static std::string tabChanged(int index) {
+    nlohmann::json j;
+    j["tab_index"] = index;
+    return j.dump();
+  }
+
+  /// QStackedWidget: current page changed. Always emits both the transient
+  /// index and the page's stable Qt objectName.
+  /// @since 0.21.0
+  [[nodiscard]] static std::string stackedPageChanged(int index, std::string_view page_object_name) {
+    nlohmann::json j;
+    j["stacked_index"] = index;
+    j["stacked_page"] = page_object_name;
+    return j.dump();
+  }
+
+  /// QTreeWidget: selection changed. `ids` is the complete logical selected-ID
+  /// set, including selected items hidden by the current visibility filter.
+  /// @since 0.21.0
+  [[nodiscard]] static std::string treeSelectionChanged(const std::vector<std::string>& ids) {
+    nlohmann::json j;
+    j["tree_selection_changed"] = ids;
+    return j.dump();
+  }
+
+  /// QTreeWidget: an item was activated by keyboard or double-click.
+  /// @since 0.21.0
+  [[nodiscard]] static std::string treeItemActivated(std::string_view id, int column) {
+    nlohmann::json j;
+    j["tree_item_activated"] = {{"id", id}, {"column", column}};
+    return j.dump();
+  }
+
+  /// QTreeWidget: an item's expanded state changed.
+  /// @since 0.21.0
+  [[nodiscard]] static std::string treeExpansionChanged(std::string_view id, bool expanded) {
+    nlohmann::json j;
+    j["tree_expansion_changed"] = {{"id", id}, {"expanded", expanded}};
+    return j.dump();
+  }
+
+  /// QTreeWidget: an item's column-0 check state changed.
+  /// @since 0.21.0
+  [[nodiscard]] static std::string treeCheckStateChanged(std::string_view id, TreeCheckState state) {
+    nlohmann::json j;
+    j["tree_check_state_changed"] = {{"id", id}, {"state", treeCheckStateWireValue(state)}};
+    return j.dump();
+  }
+
+  /// QListWidget: item double-clicked
+  [[nodiscard]] static std::string itemDoubleClicked(int index) {
+    nlohmann::json j;
+    j["item_double_clicked_index"] = index;
+    return j.dump();
+  }
+
+  /// QListWidget (deletable): a row's trailing delete (trash) button was clicked.
+  [[nodiscard]] static std::string itemDeleteRequested(int index) {
+    nlohmann::json j;
+    j["item_delete_index"] = index;
+    return j.dump();
+  }
+
+  /// QListWidget: a row's context menu (declared via the widget's
+  /// pj_context_actions .ui property, not part of this protocol) fired one of
+  /// its actions.
+  [[nodiscard]] static std::string itemContextAction(int index, std::string_view action_id) {
+    nlohmann::json j;
+    j["item_context_action"] = {{"index", index}, {"action", action_id}};
+    return j.dump();
+  }
+
+  /// QTableWidget: a horizontal-header section was clicked (column index).
+  /// Lets a plugin own column sorting — it re-sorts its row model and re-emits
+  /// rows, keeping index-based selection/visibility consistent.
+  [[nodiscard]] static std::string headerClicked(int section) {
+    nlohmann::json j;
+    j["header_section"] = section;
+    return j.dump();
+  }
+
+  /// QTableWidget: a radio button in the radio column was selected (row index).
+  [[nodiscard]] static std::string tableRadioSelected(int row) {
+    nlohmann::json j;
+    j["table_radio_row"] = row;
+    return j.dump();
+  }
+
+  /// Code editor: code changed. `cursor` is the caret offset (bytes) in the new
+  /// text, or negative when unknown; it is serialized only when >= 0, so callers
+  /// that omit it stay wire-compatible with readers that ignore the field.
+  [[nodiscard]] static std::string codeChanged(std::string_view code, int cursor = -1) {
+    nlohmann::json j;
+    j["code_changed"] = code;
+    if (cursor >= 0) {
+      j["code_cursor"] = cursor;
+    }
+    return j.dump();
+  }
+
+  /// Drag-and-drop: items dropped on a widget (curves, files, or any draggable payload).
+  [[nodiscard]] static std::string itemsDropped(const std::vector<std::string>& labels) {
+    nlohmann::json j;
+    j["items_dropped"] = labels;
+    return j.dump();
+  }
+
+  /// DateRangePicker: date/time range filter changed. from/to are ISO-8601
+  /// datetime strings (empty = unbounded on that side).
+  [[nodiscard]] static std::string dateRangeChanged(std::string_view from_iso, std::string_view to_iso) {
+    nlohmann::json j;
+    j["date_from_iso"] = from_iso;
+    j["date_to_iso"] = to_iso;
+    return j.dump();
+  }
+
+  /// QDateTimeEdit: displayed datetime edited (ISO-8601, e.g. "2026-05-21T13:45:00").
+  /// Wall-clock local time; include fractional seconds only when meaningful.
+  [[nodiscard]] static std::string dateTimeChanged(std::string_view iso8601) {
+    nlohmann::json j;
+    j["datetime_iso"] = iso8601;
+    return j.dump();
+  }
+
+  /// RangeSlider: lower/upper handle position changed (slider units).
+  [[nodiscard]] static std::string rangeChanged(int lower, int upper) {
+    nlohmann::json j;
+    j["range_lower"] = lower;
+    j["range_upper"] = upper;
+    return j.dump();
+  }
+
+  /// MarkerTimeline: the mark set changed (user drag / resize / delete). Carries
+  /// the whole set so the plugin replaces its draft wholesale.
+  [[nodiscard]] static std::string markerTimelineChanged(const std::vector<TimelineMark>& marks) {
+    nlohmann::json j;
+    j["marker_timeline_marks"] = timelineMarksToJson(marks);
+    return j.dump();
+  }
+
+  /// ChartPreviewWidget: visible range changed via zoom or pan.
+  [[nodiscard]] static std::string chartViewChanged(double x_min, double x_max, double y_min, double y_max) {
+    nlohmann::json j;
+    j["chart_x_min"] = x_min;
+    j["chart_x_max"] = x_max;
+    j["chart_y_min"] = y_min;
+    j["chart_y_max"] = y_max;
+    return j.dump();
+  }
+};
+
+}  // namespace PJ

@@ -1,0 +1,252 @@
+#pragma once
+// Copyright 2026 Davide Faconti
+// SPDX-License-Identifier: Apache-2.0
+
+#include <cstdint>
+#include <string_view>
+
+#include "pj_base/data_source_protocol.h"
+#include "pj_base/plugin_data_api.h"
+#include "pj_base/sdk/data_source_host_views.hpp"
+#include "pj_base/sdk/plugin_data_api.hpp"
+
+namespace PJ::sdk {
+
+/// Traits mapping canonical service names to their ABI vtable types and
+/// corresponding C++ view wrappers. Each trait gives ServiceRegistry a
+/// typed path from `get_service("name")` to `View{fat_pointer}`.
+///
+/// Naming rule (enforced at compile time by `isValidServiceName` below):
+///
+///   Stable:       "pj.<name>.v<N>"                      e.g. "pj.source_write.v1"
+///   Experimental: "pj.experimental.<name>/draft-<N>"    e.g. "pj.experimental.diagnostics/draft-1"
+///
+/// Stable services are frozen for at least three releases before deprecation.
+/// Experimental services carry no compatibility guarantees — the host may
+/// warn, reject, or require a manifest opt-in to use them. When an
+/// experimental service graduates, it gets a new stable name and version;
+/// both may coexist during a migration window.
+///
+/// A registered service with a higher vtable protocol_version is still a
+/// valid match for a consumer that requests a lower kMinVersion.
+
+namespace detail {
+
+constexpr bool isDigitRun(std::string_view s) {
+  if (s.empty()) {
+    return false;
+  }
+  for (char c : s) {
+    if (c < '0' || c > '9') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// Returns true iff @p name matches `"pj.<x>.v<N>"` (stable) or
+/// `"pj.experimental.<x>/draft-<N>"` (unstable). Empty components, missing
+/// version suffixes, and non-prefixed names all fail.
+constexpr bool isValidServiceName(std::string_view name) {
+  if (!name.starts_with("pj.")) {
+    return false;
+  }
+  if (name.starts_with("pj.experimental.")) {
+    auto slash = name.find('/');
+    if (slash == std::string_view::npos) {
+      return false;
+    }
+    auto after = name.substr(slash + 1);
+    if (!after.starts_with("draft-")) {
+      return false;
+    }
+    return isDigitRun(after.substr(6));  // strlen("draft-")
+  }
+  // Stable: must end with ".v<N>".
+  auto last_dot = name.rfind('.');
+  if (last_dot == std::string_view::npos || last_dot <= 3) {
+    return false;
+  }
+  auto tail = name.substr(last_dot + 1);
+  if (tail.size() < 2 || tail[0] != 'v') {
+    return false;
+  }
+  return isDigitRun(tail.substr(1));
+}
+
+}  // namespace detail
+
+struct SourceWriteHostService {
+  static constexpr const char* kName = "pj.source_write.v1";
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_source_write_host_t;
+  using Vtable = PJ_source_write_host_vtable_t;
+  using View = SourceWriteHostView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+/// Object write host for DataSource plugins — writes into ObjectStore
+/// (peer to DataEngine) for topics carrying opaque payloads (markers,
+/// images, point clouds, scene primitives). Optional: plugins that
+/// publish only scalar data never resolve this.
+struct SourceObjectWriteHostService {
+  static constexpr const char* kName = "pj.source_object_write.v1";
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_object_write_host_t;
+  using Vtable = PJ_object_write_host_vtable_t;
+  using View = SourceObjectWriteHostView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+struct ParserWriteHostService {
+  static constexpr const char* kName = "pj.parser_write.v1";
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_parser_write_host_t;
+  using Vtable = PJ_parser_write_host_vtable_t;
+  using View = ParserWriteHostView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+/// Parser-scoped object write host. Optional: registered by the host only
+/// when the parser is bound to a media topic. A media-capable parser
+/// resolves both ParserWriteHostService (scalars) and this one (object
+/// payload) at bind time and writes both from a single parse() call.
+struct ParserObjectWriteHostService {
+  static constexpr const char* kName = "pj.parser_object_write.v1";
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_parser_object_write_host_t;
+  using Vtable = PJ_parser_object_write_host_vtable_t;
+  using View = ParserObjectWriteHostView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+/// Optional non-fatal diagnostics channel for MessageParser plugins.
+/// Absence is safe: ParserRuntimeHostView discards reports from an unbound
+/// view. Fatal parse failures continue to use Status.
+///
+/// @since 0.21.0
+struct ParserRuntimeHostService {
+  static constexpr const char* kName = PJ_PARSER_RUNTIME_HOST_SERVICE_V1;
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_parser_runtime_host_t;
+  using Vtable = PJ_parser_runtime_host_vtable_t;
+  using View = ParserRuntimeHostView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+/// Object read host for Toolbox plugins — reads from ObjectStore. Optional:
+/// toolboxes that consume only scalar data (via ToolboxHostService) never
+/// resolve this. Transformer-style toolboxes that process bytes from object
+/// topics (object-detection on images, point-cloud filtering, etc.) resolve
+/// it alongside the scalar host.
+struct ToolboxObjectReadHostService {
+  static constexpr const char* kName = "pj.toolbox_object_read.v1";
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_object_read_host_t;
+  using Vtable = PJ_object_read_host_vtable_t;
+  using View = ToolboxObjectReadHostView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+struct ToolboxHostService {
+  // "pj.toolbox_write.v1" for symmetry with "pj.source_write.v1" and
+  // "pj.parser_write.v1" — this service IS the toolbox write surface
+  // (create_data_source / ensure_topic / ensure_field / append_record /
+  // acquire_catalog_snapshot / read_series). The C++ trait is named
+  // ToolboxHostService for historical reasons (the vtable type is
+  // PJ_toolbox_host_t); the canonical service id uses the _write suffix.
+  static constexpr const char* kName = "pj.toolbox_write.v1";
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_toolbox_host_t;
+  using Vtable = PJ_toolbox_host_vtable_t;
+  using View = ToolboxHostView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+struct ColorMapRegistryService {
+  static constexpr const char* kName = "pj.colormap.v1";
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_colormap_registry_t;
+  using Vtable = PJ_colormap_registry_vtable_t;
+  using View = ColorMapRegistryView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+/// Optional service for plugins that submit WHOLE-SERIES data processors to the host
+/// by data (kind + language + script + input/output names + params JSON + flags).
+/// Nothing executable crosses the boundary; the host compiles, runs, and routes the
+/// output by `kind`: "transform" materializes DerivedEngine timeseries, "markers"
+/// publishes a PlotMarkers set to the ObjectStore. See the C ABI doc-comment on
+/// PJ_data_processors_host_vtable_t.
+struct DataProcessorsHostService {
+  static constexpr const char* kName = "pj.data_processors.v1";
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_data_processors_host_t;
+  using Vtable = PJ_data_processors_host_vtable_t;
+  using View = DataProcessorsHostView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+/// Optional playback control for any plugin family: play/pause/seek/rate and
+/// a state snapshot over the host's playback cursor, plus absolute-ns ->
+/// display-seconds conversion. All times are display-axis seconds (the numbers
+/// the plot X axes and the playback slider show); see the C ABI doc-comment on
+/// PJ_playback_host_vtable_t for the current-frame caveat.
+struct PlaybackHostService {
+  static constexpr const char* kName = "pj.playback.v1";
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_playback_host_t;
+  using Vtable = PJ_playback_host_vtable_t;
+  using View = PlaybackHostView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+/// Optional viewport control: zoom the calling plugin's own time-series plots to
+/// a display-seconds X window, or reset its own plots to fit their data. Hosts
+/// without plots (headless) simply do not register it.
+struct ViewportHostService {
+  static constexpr const char* kName = "pj.viewport.v1";
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_viewport_host_t;
+  using Vtable = PJ_viewport_host_vtable_t;
+  using View = ViewportHostView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+/// "pj.plot_tabs.v1" — compose plotting tabs of the plugin's own: create, place
+/// and remove curves, read back what they hold, close. Scoped by the host to
+/// this plugin's tabs, which is also what bounds "pj.viewport.v1". Hosts with
+/// no plot workspace (headless) simply do not register it.
+struct PlotTabHostService {
+  static constexpr const char* kName = "pj.plot_tabs.v1";
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_plot_tab_host_t;
+  using Vtable = PJ_plot_tab_host_vtable_t;
+  using View = PlotTabHostView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+/// Optional QSettings-like key/value persistence exposed to any plugin family.
+/// Host-backed (QSettings in the GUI app, JSON in a headless host); keys are
+/// namespaced per plugin by the host.
+struct SettingsStoreService {
+  static constexpr const char* kName = "pj.settings.v1";
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_settings_store_t;
+  using Vtable = PJ_settings_store_vtable_t;
+  using View = SettingsView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+/// Runtime host exposed to DataSource plugins — progress, diagnostics,
+/// state notification, parser binding, modal message boxes.
+struct DataSourceRuntimeHostService {
+  static constexpr const char* kName = "pj.runtime.v1";
+  static constexpr uint32_t kMinVersion = 1;
+  using Raw = PJ_data_source_runtime_host_t;
+  using Vtable = PJ_data_source_runtime_host_vtable_t;
+  using View = ::PJ::DataSourceRuntimeHostView;
+  static_assert(detail::isValidServiceName(kName), "kName must match the pj naming rule");
+};
+
+}  // namespace PJ::sdk

@@ -4,6 +4,7 @@
 #include "ui/TimelineWidget.h"
 
 #include <QByteArray>
+#include <QDateTime>
 #include <QFile>
 #include <QImage>
 #include <QLabel>
@@ -12,6 +13,7 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSvgRenderer>
+#include <QTimeZone>
 #include <Qt>
 #include <algorithm>
 #include <cmath>
@@ -22,6 +24,8 @@
 #include "pj_widgets/RealSlider.h"
 #include "pj_widgets/SvgUtil.h"
 #include "ui_TimelineWidget.h"
+
+using namespace Qt::StringLiterals;
 
 namespace PJ {
 
@@ -101,10 +105,23 @@ void TimelineWidget::onEngineTimeChanged(double t) {
   applyEngineTime(t);
 }
 
+void TimelineWidget::setTimeOfDayDisplay(bool enabled) {
+  if (time_of_day_display_ == enabled) {
+    return;
+  }
+  time_of_day_display_ = enabled;
+  if (engine_ != nullptr) {
+    applyEngineTime(toAxisDouble(engine_->currentTime()));
+  }
+}
+
 void TimelineWidget::applyEngineTime(double t) {
   updating_from_engine_ = true;
   ui_->timeSlider->setRealValue(t);
-  const QString formatted = QString::number(t, 'f', 3);
+  const QString formatted = time_of_day_display_
+                                ? QDateTime::fromMSecsSinceEpoch(std::llround(t * 1000.0), QTimeZone::UTC)
+                                      .toString(u"HH:mm:ss.zzz"_s)
+                                : QString::number(t, 'f', 3);
   if (formatted != ui_->displayTime->text()) {
     ui_->displayTime->setText(formatted);
   }

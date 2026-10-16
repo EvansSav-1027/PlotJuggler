@@ -88,6 +88,12 @@ class PlotWidgetBase : public QWidget {
   virtual void setModeXY(bool enable);
   [[nodiscard]] bool isXYPlot() const noexcept;
 
+  // Label the bottom axis as wall-clock time of day (TimeScaleDraw) — the app
+  // sets this while "Use time offset" is off.
+  // Remembered across setModeXY — an XY plot keeps numeric labels while the
+  // flag is set and gets the time labels back when it returns to time-series.
+  void setDateTimeScale(bool enable);
+
   void setLegendSize(int size);
   void setLegendAlignment(Qt::Alignment alignment);
   void setLegendVisible(bool visible);
@@ -197,6 +203,7 @@ class PlotWidgetBase : public QWidget {
 
   QwtPlotPimpl* plot_ = nullptr;
   bool xy_mode_ = false;
+  bool date_time_scale_ = false;
   QRectF max_zoom_rect_;
   bool keep_aspect_ratio_ = false;
   LineWidth line_width_ = LineWidth::kPoints10;

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libpj_toolbox_host.a CMakeFiles/pj_toolbox_host.dir/src/toolbox_library.cpp.o
+/usr/bin/ranlib libpj_toolbox_host.a

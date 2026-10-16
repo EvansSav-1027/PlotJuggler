@@ -27,6 +27,10 @@ class TimelineWidget : public QWidget {
   void setPlaybackEngine(PlaybackEngine* engine);
   void setSeekLocked(bool locked);
 
+  // With `enabled` ("Use time offset" off: engine time is epoch seconds), the
+  // current time shows as UTC "HH:mm:ss.zzz" instead of a number of seconds.
+  void setTimeOfDayDisplay(bool enabled);
+
  public slots:
   void onStylesheetChanged(QString theme);
 
@@ -85,6 +89,7 @@ class TimelineWidget : public QWidget {
   // No scrubbable data (range collapsed to a point): the transport is disabled.
   // Starts true so a freshly-constructed strip is disabled until data loads.
   bool range_empty_ = true;
+  bool time_of_day_display_ = false;
   QTimer seek_throttle_timer_;
   double pending_seek_value_ = 0.0;
   bool has_pending_seek_ = false;

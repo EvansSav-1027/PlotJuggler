@@ -1,0 +1,213 @@
+"""Conan 2 recipe for plotjuggler_sdk.
+
+Exposes CMake components under the `plotjuggler_sdk::` namespace:
+
+  base         — pj_base, vocabulary types (always available)
+  plugin_sdk   — umbrella for plugin authors (base + dialog SDK + parser SDK)
+  plugin_host  — umbrella for host loaders (data_source/parser/toolbox/dialog)
+  parser_module — standalone functional parser-module authoring headers
+  source       — compiled source-provider support
+  descriptor_import_support — compatibility alias for source
+
+A consuming Conan recipe declares `plotjuggler_sdk/<version>` and then:
+
+    find_package(plotjuggler_sdk REQUIRED COMPONENTS plugin_sdk)
+    target_link_libraries(my_plugin PRIVATE plotjuggler_sdk::plugin_sdk)
+
+The `plugin_sdk` component also ships `PjPlugin.cmake`, so authors can call
+`pj_configure_plugin()` / `pj_embed_file()` without copying helpers into their tree.
+`PjSdkTestFixtures.cmake` compiles the installed share/ fixture sources.
+The utilities and provider guides ship under share/plotjuggler_sdk/docs/.
+
+The columnar storage engine (formerly the `datastore` component) is no longer
+part of this SDK package — it now lives in the PlotJuggler application repo,
+since plugins reach it only through the C ABI, never by linking it.
+
+Local development (build.sh) uses this same recipe with `with_tests=True` so
+gtest is resolved as a test_require.
+"""
+
+from conan import ConanFile
+from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain
+from conan.tools.files import copy, load
+import os
+from pathlib import Path
+
+
+class PlotjugglerSdkConan(ConanFile):
+    name = "plotjuggler_sdk"
+    # Apache-2.0 covers the whole SDK (pj_base + pj_plugins). See LICENSE.
+    license = "Apache-2.0"
+    url = "https://github.com/PlotJuggler/plotjuggler_sdk"
+    description = "C++20 foundation libraries for PlotJuggler: plugin SDK and plugin host loaders."
+    topics = ("plotjuggler", "plugin-sdk", "telemetry", "data-visualization")
+    package_type = "static-library"
+
+    settings = "os", "compiler", "build_type", "arch"
+    options = {
+        "fPIC": [True, False],
+        "with_host": [True, False],
+        "with_tests": [True, False],
+        "assert_throws": [True, False],
+    }
+    default_options = {
+        "fPIC": True,
+        "with_host": True,
+        "with_tests": False,
+        "assert_throws": False,
+        # fmt is an implementation detail. Compile it header-only so the
+        # static archives do not export a downstream fmt link dependency.
+        "fmt/*:header_only": True,
+    }
+
+    exports_sources = (
+        "VERSION",
+        "CMakeLists.txt",
+        "LICENSE",
+        "LICENSE-APACHE",
+        "cmake/*",
+        "docs/*.md",
+        "pj_base/*",
+        "tools/feature_floors/*",
+        "pj_plugins/*",
+        "examples/*",
+        "!*/__pycache__/*",
+    )
+
+    def set_version(self):
+        version_file = Path(self.recipe_folder) / "VERSION"
+        self.version = load(self, version_file).strip()
+
+    def config_options(self):
+        if self.settings.os == "Windows":
+            del self.options.fPIC
+
+    def requirements(self):
+        # nlohmann_json appears in public headers (widget_data, plugin_catalog).
+        self.requires("nlohmann_json/3.12.0", transitive_headers=True)
+
+        # fmt is private and header-only at build time; do not propagate it
+        # into consumers of this static-library package.
+        self.requires(
+            "fmt/12.1.0",
+            headers=True,
+            libs=False,
+            visible=False,
+            transitive_headers=False,
+            transitive_libs=False,
+        )
+
+        # fast_float backs the floating-point branch of PJ::parseNumber. It
+        # is header-only and stays private: never appears in any public
+        # pj_base header, never propagated to downstream consumers.
+        self.requires(
+            "fast_float/8.1.0",
+            headers=True,
+            libs=False,
+            visible=False,
+            transitive_headers=False,
+            transitive_libs=False,
+        )
+
+    def build_requirements(self):
+        # Tests are local-dev only. Consumers of plotjuggler_sdk never see this.
+        if self.options.with_tests:
+            self.test_requires("gtest/1.17.0")
+
+    def generate(self):
+        deps = CMakeDeps(self)
+        deps.generate()
+
+        tc = CMakeToolchain(self)
+        tc.cache_variables["PJ_INSTALL_SDK"] = True
+        tc.cache_variables["PJ_BUILD_TESTS"] = bool(self.options.with_tests)
+        tc.cache_variables["PJ_BUILD_PORTED_PLUGINS"] = False
+        tc.cache_variables["PJ_ASSERT_THROWS"] = bool(self.options.assert_throws)
+        tc.generate()
+
+    def build(self):
+        cmake = CMake(self)
+        cmake.configure()
+        cmake.build()
+
+    def package(self):
+        cmake = CMake(self)
+        cmake.install()
+        # Ships LICENSE (the per-module map) plus the full Apache-2.0 text
+        # (LICENSE-APACHE).
+        copy(
+            self,
+            "LICENSE*",
+            src=self.source_folder,
+            dst=os.path.join(self.package_folder, "licenses"),
+        )
+
+    def package_info(self):
+        self.cpp_info.set_property("cmake_file_name", "plotjuggler_sdk")
+        # Consumers request the components they use; there is no umbrella target.
+
+        # Conan 2's CMakeDeps only aggregates cmake_build_modules declared at
+        # the package level (self.cpp_info), not at component level — declaring
+        # it on the `sdk` component below silently produced an empty
+        # plotjuggler_sdk_BUILD_MODULES_PATHS_RELEASE in the generated data
+        # file. Ship the plugin-authoring helpers (PjPlugin.cmake) and the
+        # parser-module helper from the package root so CMakeDeps actually
+        # include()s them after find_package() returns.
+        self.cpp_info.set_property("cmake_build_modules", [
+            os.path.join("lib", "cmake", "plotjuggler_sdk", "PjPlugin.cmake"),
+            os.path.join("lib", "cmake", "plotjuggler_sdk", "PjParserModule.cmake"),
+            os.path.join("lib", "cmake", "plotjuggler_sdk", "PjSdkTestFixtures.cmake"),
+        ])
+
+        # --- base ---
+        base = self.cpp_info.components["base"]
+        base.set_property("cmake_target_name", "plotjuggler_sdk::base")
+        base.libs = ["pj_base"]
+        base.includedirs = ["include"]
+
+        # --- plugin_sdk (umbrella INTERFACE: pj_base + pj_dialog_sdk) ---
+        sdk = self.cpp_info.components["plugin_sdk"]
+        sdk.set_property("cmake_target_name", "plotjuggler_sdk::plugin_sdk")
+        sdk.libs = []  # INTERFACE only
+        sdk.includedirs = ["include"]
+        sdk.requires = ["base", "nlohmann_json::nlohmann_json"]
+
+        # --- parser_module (header-only functional parser-module authoring kit;
+        # pj_add_parser_module() comes from the PjParserModule build module) ---
+        kit = self.cpp_info.components["parser_module"]
+        kit.set_property("cmake_target_name", "plotjuggler_sdk::parser_module")
+        kit.libs = []  # INTERFACE only: authored modules link no SDK library
+        kit.includedirs = ["include"]
+
+        # --- source (descriptor-import provider support) ---
+        source = self.cpp_info.components["source"]
+        source.set_property("cmake_target_name", "plotjuggler_sdk::source")
+        source.libs = ["pj_source"]
+        source.includedirs = ["include"]
+        source.requires = ["base", "nlohmann_json::nlohmann_json"]
+
+        support = self.cpp_info.components["descriptor_import_support"]
+        support.set_property("cmake_target_name", "plotjuggler_sdk::descriptor_import_support")
+        support.libs = []
+        support.requires = ["source"]
+
+
+        # --- plugin_host (umbrella linking every host-side loader) ---
+        if self.options.with_host:
+            host = self.cpp_info.components["plugin_host"]
+            host.set_property("cmake_target_name", "plotjuggler_sdk::plugin_host")
+            # Static archives: dependents before their dependencies.
+            host.libs = [
+                "pj_data_source_host",
+                "pj_message_parser_host",
+                "pj_toolbox_host",
+                "pj_dialog_library",
+                "pj_plugin_catalog",
+                "pj_parser_module_host",
+                "pj_parser_claim_catalog",
+                "pj_plugin_loader_detail",
+            ]
+            host.includedirs = ["include"]
+            host.requires = ["base", "nlohmann_json::nlohmann_json"]
+            if self.settings.os in ("Linux", "FreeBSD"):
+                host.system_libs = ["dl"]

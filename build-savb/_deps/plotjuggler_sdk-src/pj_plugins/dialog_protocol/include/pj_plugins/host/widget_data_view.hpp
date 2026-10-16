@@ -1,0 +1,1433 @@
+#pragma once
+// Copyright 2026 Davide Faconti
+// SPDX-License-Identifier: Apache-2.0
+
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <map>
+#include <nlohmann/json.hpp>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "pj_base/number_parse.hpp"
+#include "pj_plugins/sdk/widget_data.hpp"  // TimelineMark
+
+namespace PJ {
+
+/// A QTreeWidget visibility-channel update. Filter carries the exact ID set
+/// supplied by the plugin (including an empty, active zero-match filter), while
+/// Reset removes the current filter.
+/// @since 0.21.0
+struct TreeVisibilityUpdate {
+  enum class Mode { Filter, Reset };
+  Mode mode = Mode::Filter;
+  std::vector<std::string> ids;
+};
+
+/// Read-only view of the JSON returned by get_widget_data().
+/// Each getter takes a widget name and reads the corresponding property.
+/// Returns std::nullopt for missing widgets or missing/wrong-typed fields.
+class WidgetDataView {
+ public:
+  explicit WidgetDataView(std::string_view json) : data_(nlohmann::json::parse(json, nullptr, false)) {
+    if (data_.is_discarded()) {
+      data_ = nlohmann::json::object();
+    }
+  }
+
+  // --- QLineEdit ---
+  [[nodiscard]] std::optional<std::string> text(std::string_view name) const {
+    return getString(name, "text");
+  }
+  [[nodiscard]] std::optional<std::string> placeholder(std::string_view name) const {
+    return getString(name, "placeholder");
+  }
+  [[nodiscard]] std::optional<bool> readOnly(std::string_view name) const {
+    return getBool(name, "read_only");
+  }
+
+  // --- QComboBox ---
+  [[nodiscard]] std::optional<int> currentIndex(std::string_view name) const {
+    return getInt(name, "current_index");
+  }
+  [[nodiscard]] std::optional<std::vector<std::string>> items(std::string_view name) const {
+    return getStringArray(name, "items");
+  }
+
+  // --- QCheckBox, QRadioButton ---
+  [[nodiscard]] std::optional<bool> checked(std::string_view name) const {
+    return getBool(name, "checked");
+  }
+
+  // --- QSpinBox ---
+  [[nodiscard]] std::optional<int> valueInt(std::string_view name) const {
+    return getInt(name, "value");
+  }
+
+  // --- QDoubleSpinBox ---
+  [[nodiscard]] std::optional<double> valueDouble(std::string_view name) const {
+    return getDouble(name, "value");
+  }
+
+  [[nodiscard]] std::optional<int> rangeMin(std::string_view name) const {
+    return getInt(name, "min");
+  }
+  [[nodiscard]] std::optional<int> rangeMax(std::string_view name) const {
+    return getInt(name, "max");
+  }
+
+  // --- QListWidget ---
+  [[nodiscard]] std::optional<std::vector<std::string>> listItems(std::string_view name) const {
+    return getStringArray(name, "list_items");
+  }
+  [[nodiscard]] std::optional<std::vector<std::string>> selectedItems(std::string_view name) const {
+    return getStringArray(name, "selected_items");
+  }
+  [[nodiscard]] std::optional<bool> listDeletable(std::string_view name) const {
+    return getBool(name, "list_deletable");
+  }
+  [[nodiscard]] std::optional<std::string> listPlaceholder(std::string_view name) const {
+    return getString(name, "list_placeholder");
+  }
+  [[nodiscard]] std::optional<std::vector<std::string>> listItemColors(std::string_view name) const {
+    return getStringArray(name, "list_item_colors");
+  }
+  [[nodiscard]] std::optional<std::vector<std::string>> listDisabledItems(std::string_view name) const {
+    return getStringArray(name, "list_disabled_items");
+  }
+  [[nodiscard]] std::optional<bool> listMultiSelect(std::string_view name) const {
+    return getBool(name, "list_multi_select");
+  }
+
+  // --- QTreeWidget ---
+
+  /// Tree column labels. This state channel is independent of treeItems().
+  /// @since 0.21.0
+  [[nodiscard]] std::optional<std::vector<std::string>> treeHeaders(std::string_view name) const {
+    return getStrictStringArray(name, "tree_headers");
+  }
+
+  /// Decode one complete tree_items snapshot, preserving its flat array order
+  /// exactly (and therefore plugin-declared sibling insertion order). Ragged
+  /// cell arrays are valid; the host renders missing trailing cells as empty.
+  ///
+  /// Like the strict tableDelta() reader, any malformed member rejects the
+  /// entire update and returns nullopt. If `validation_error` is non-null it is
+  /// cleared for an absent/valid update and populated with the rejection reason
+  /// for an invalid update, giving embedding hosts a diagnostic to report.
+  /// @since 0.21.0
+  [[nodiscard]] std::optional<std::vector<TreeItem>> treeItems(
+      std::string_view name, std::string* validation_error = nullptr) const {
+    if (validation_error != nullptr) {
+      validation_error->clear();
+    }
+    const nlohmann::json* w = widget(name);
+    if (w == nullptr) {
+      return std::nullopt;
+    }
+    auto items_it = w->find("tree_items");
+    if (items_it == w->end()) {
+      return std::nullopt;
+    }
+    if (!items_it->is_array()) {
+      return rejectTreeItems(validation_error, "tree_items must be an array");
+    }
+
+    std::vector<TreeItem> items;
+    items.reserve(items_it->size());
+    std::unordered_map<std::string, std::size_t> id_indexes;
+    id_indexes.reserve(items_it->size());
+
+    for (std::size_t item_index = 0; item_index < items_it->size(); ++item_index) {
+      const auto& encoded_item = (*items_it)[item_index];
+      const std::string item_prefix = "tree_items[" + std::to_string(item_index) + "]";
+      if (!encoded_item.is_object()) {
+        return rejectTreeItems(validation_error, item_prefix + " must be an object");
+      }
+
+      TreeItem item;
+      auto id_it = encoded_item.find("id");
+      if (id_it == encoded_item.end() || !id_it->is_string()) {
+        return rejectTreeItems(validation_error, item_prefix + ".id must be a string");
+      }
+      item.id = id_it->get<std::string>();
+      if (item.id.empty()) {
+        return rejectTreeItems(validation_error, item_prefix + ".id must not be empty");
+      }
+      if (id_indexes.find(item.id) != id_indexes.end()) {
+        return rejectTreeItems(validation_error, "tree_items contains duplicate id '" + item.id + "'");
+      }
+
+      auto parent_it = encoded_item.find("parent_id");
+      if (parent_it == encoded_item.end() || !parent_it->is_string()) {
+        return rejectTreeItems(validation_error, item_prefix + ".parent_id must be a string");
+      }
+      item.parent_id = parent_it->get<std::string>();
+      if (item.parent_id == item.id) {
+        return rejectTreeItems(validation_error, "tree item '" + item.id + "' must not be its own parent");
+      }
+
+      auto cells_it = encoded_item.find("cells");
+      if (cells_it == encoded_item.end() || !cells_it->is_array()) {
+        return rejectTreeItems(validation_error, item_prefix + ".cells must be an array");
+      }
+      item.cells.reserve(cells_it->size());
+      for (std::size_t cell_index = 0; cell_index < cells_it->size(); ++cell_index) {
+        const auto& encoded_cell = (*cells_it)[cell_index];
+        const std::string cell_prefix = item_prefix + ".cells[" + std::to_string(cell_index) + "]";
+        if (!encoded_cell.is_object()) {
+          return rejectTreeItems(validation_error, cell_prefix + " must be an object");
+        }
+
+        TreeCell cell;
+        auto text_it = encoded_cell.find("text");
+        if (text_it == encoded_cell.end() || !text_it->is_string()) {
+          return rejectTreeItems(validation_error, cell_prefix + ".text must be a string");
+        }
+        cell.text = text_it->get<std::string>();
+
+        if (auto sort_it = encoded_cell.find("sort_value"); sort_it != encoded_cell.end() && !sort_it->is_null()) {
+          cell.sort_value = numericFromJson(*sort_it);
+          if (!cell.sort_value.has_value()) {
+            return rejectTreeItems(validation_error, cell_prefix + ".sort_value must be a number or null");
+          }
+        }
+
+        if (auto tooltip_it = encoded_cell.find("tooltip"); tooltip_it != encoded_cell.end()) {
+          if (!tooltip_it->is_string()) {
+            return rejectTreeItems(validation_error, cell_prefix + ".tooltip must be a string");
+          }
+          cell.tooltip = tooltip_it->get<std::string>();
+        }
+        if (auto icon_it = encoded_cell.find("icon"); icon_it != encoded_cell.end()) {
+          if (!icon_it->is_string()) {
+            return rejectTreeItems(validation_error, cell_prefix + ".icon must be a string");
+          }
+          cell.icon = icon_it->get<std::string>();
+        }
+        item.cells.push_back(std::move(cell));
+      }
+
+      if (!decodeOptionalBool(encoded_item, "enabled", item.enabled)) {
+        return rejectTreeItems(validation_error, item_prefix + ".enabled must be a boolean");
+      }
+      if (!decodeOptionalBool(encoded_item, "selectable", item.selectable)) {
+        return rejectTreeItems(validation_error, item_prefix + ".selectable must be a boolean");
+      }
+      if (!decodeOptionalBool(encoded_item, "may_have_children", item.may_have_children)) {
+        return rejectTreeItems(validation_error, item_prefix + ".may_have_children must be a boolean");
+      }
+
+      if (auto state_it = encoded_item.find("check_state"); state_it != encoded_item.end()) {
+        if (!state_it->is_string()) {
+          return rejectTreeItems(validation_error, item_prefix + ".check_state must be a string");
+        }
+        auto state = treeCheckStateFromWireValue(state_it->get_ref<const std::string&>());
+        if (!state.has_value()) {
+          return rejectTreeItems(
+              validation_error, item_prefix + ".check_state has invalid value '" + state_it->get<std::string>() + "'");
+        }
+        item.check_state = *state;
+      }
+
+      id_indexes.emplace(item.id, items.size());
+      items.push_back(std::move(item));
+    }
+
+    for (const auto& item : items) {
+      if (!item.parent_id.empty() && id_indexes.find(item.parent_id) == id_indexes.end()) {
+        return rejectTreeItems(
+            validation_error, "tree item '" + item.id + "' references missing parent '" + item.parent_id + "'");
+      }
+    }
+
+    // Every item has at most one outgoing parent edge, so an iterative color
+    // walk detects cycles without recursion depth depending on the tree size.
+    std::vector<unsigned char> visit_state(items.size(), 0);
+    for (std::size_t start = 0; start < items.size(); ++start) {
+      if (visit_state[start] == 2) {
+        continue;
+      }
+      std::vector<std::size_t> path;
+      std::size_t current = start;
+      while (visit_state[current] == 0) {
+        visit_state[current] = 1;
+        path.push_back(current);
+        if (items[current].parent_id.empty()) {
+          break;
+        }
+        current = id_indexes.at(items[current].parent_id);
+      }
+      if (visit_state[current] == 1 && !items[current].parent_id.empty()) {
+        return rejectTreeItems(
+            validation_error, "tree_items contains a parent cycle involving '" + items[current].id + "'");
+      }
+      for (const std::size_t index : path) {
+        visit_state[index] = 2;
+      }
+    }
+
+    return items;
+  }
+
+  /// IDs absent from the current snapshot are intentionally preserved here;
+  /// pruning and its diagnostic are host-side. An empty array clears selection.
+  /// @since 0.21.0
+  [[nodiscard]] std::optional<std::vector<std::string>> treeSelectedIds(std::string_view name) const {
+    return getStrictStringArray(name, "tree_selected_ids");
+  }
+
+  /// IDs absent from the current snapshot are intentionally preserved here;
+  /// pruning and its diagnostic are host-side. An empty array clears expansion.
+  /// @since 0.21.0
+  [[nodiscard]] std::optional<std::vector<std::string>> treeExpandedIds(std::string_view name) const {
+    return getStrictStringArray(name, "tree_expanded_ids");
+  }
+
+  /// Compatibility spelling retained for code that names the result through
+  /// WidgetDataView; the public result type itself lives at namespace scope.
+  /// @since 0.21.0
+  using TreeVisibilityUpdate = PJ::TreeVisibilityUpdate;
+
+  /// Tri-state visibility update: nullopt means absent/unchanged, Reset means
+  /// JSON null/remove the filter, and Filter means an ID array. A Filter with
+  /// no IDs is an active zero-match filter. Unknown IDs remain exposed for the
+  /// host to prune; the host also computes the visible ancestors of matches.
+  /// @since 0.21.0
+  [[nodiscard]] std::optional<TreeVisibilityUpdate> treeVisibilityUpdate(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (w == nullptr) {
+      return std::nullopt;
+    }
+    auto it = w->find("tree_visible_ids");
+    if (it == w->end()) {
+      return std::nullopt;
+    }
+    if (it->is_null()) {
+      return TreeVisibilityUpdate{TreeVisibilityUpdate::Mode::Reset, {}};
+    }
+    if (!it->is_array()) {
+      return std::nullopt;
+    }
+    auto ids = decodeStrictStringArray(*it);
+    if (!ids.has_value()) {
+      return std::nullopt;
+    }
+    TreeVisibilityUpdate update;
+    update.ids = std::move(*ids);
+    return update;
+  }
+
+  /// false selects single-selection mode; true selects extended selection.
+  /// @since 0.21.0
+  [[nodiscard]] std::optional<bool> treeMultiSelection(std::string_view name) const {
+    return getBool(name, "tree_multi_selection");
+  }
+
+  // --- QTableWidget ---
+  [[nodiscard]] std::optional<std::vector<std::string>> tableHeaders(std::string_view name) const {
+    return getStringArray(name, "headers");
+  }
+
+  [[nodiscard]] std::optional<std::vector<std::vector<std::string>>> tableRows(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find("rows");
+    if (it == w->end() || !it->is_array()) {
+      return std::nullopt;
+    }
+    std::vector<std::vector<std::string>> result;
+    result.reserve(it->size());
+    for (const auto& row : *it) {
+      if (!row.is_array()) {
+        return std::nullopt;
+      }
+      std::vector<std::string> cells;
+      cells.reserve(row.size());
+      for (const auto& cell : row) {
+        if (cell.is_string()) {
+          cells.push_back(cell.get<std::string>());
+        } else {
+          // Keep the row's shape. Dropping an unrecognized cell would shift every
+          // column after it and silently mis-align the whole row.
+          cells.emplace_back();
+        }
+      }
+      result.push_back(std::move(cells));
+    }
+    return result;
+  }
+
+  /// Sparse per-column sort keys (see WidgetData::setTableRows for TableItem rows).
+  /// Maps column index -> one entry per row, in the same order as tableRows(). A
+  /// nullopt entry, or a column absent from the map, sorts by the cell's text.
+  /// Columns whose value count disagrees with `rows` are dropped: a partial key
+  /// column would sort some rows by number and others by text.
+  [[nodiscard]] std::map<int, std::vector<std::optional<NumericValue>>> tableColumnValues(std::string_view name) const {
+    std::map<int, std::vector<std::optional<NumericValue>>> result;
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return result;
+    }
+    auto rows_it = w->find("rows");
+    const std::size_t row_count = (rows_it != w->end() && rows_it->is_array()) ? rows_it->size() : 0;
+    auto it = w->find("column_values");
+    if (it == w->end() || !it->is_object()) {
+      return result;
+    }
+    for (auto kv = it->begin(); kv != it->end(); ++kv) {
+      const nlohmann::json& values = kv.value();
+      const auto col = parseNumber<int>(kv.key());
+      if (!col.has_value() || *col < 0 || !values.is_array() || values.size() != row_count) {
+        continue;
+      }
+      std::vector<std::optional<NumericValue>> decoded;
+      decoded.reserve(values.size());
+      for (const auto& v : values) {
+        decoded.emplace_back(numericFromJson(v));
+      }
+      result.emplace(*col, std::move(decoded));
+    }
+    return result;
+  }
+
+  /// Sort arrow a plugin-sorted table asked the host to draw: {column, ascending}.
+  /// Purely cosmetic — it never changes row order (see setTableSortIndicator).
+  [[nodiscard]] std::optional<std::pair<int, bool>> tableSortIndicator(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find("sort_indicator");
+    if (it == w->end() || !it->is_object()) {
+      return std::nullopt;
+    }
+    auto col = it->find("col");
+    auto asc = it->find("asc");
+    if (col == it->end() || !col->is_number_integer() || asc == it->end() || !asc->is_boolean()) {
+      return std::nullopt;
+    }
+    return std::make_pair(col->get<int>(), asc->get<bool>());
+  }
+
+  /// Column to render as an exclusive radio-button group (see setTableRadioColumn).
+  [[nodiscard]] std::optional<int> tableRadioColumn(std::string_view name) const {
+    return getInt(name, "radio_column");
+  }
+  /// Row whose radio is checked in the radio column (-1 = none).
+  [[nodiscard]] std::optional<int> tableRadioCheckedRow(std::string_view name) const {
+    return getInt(name, "radio_checked_row");
+  }
+
+  /// Decoded batch table delta (see WidgetData::appendTableRows et al.).
+  /// Apply only when `seq` differs from the last seq applied to that widget,
+  /// in the order: update_cells, then remove_rows, then append. All indexes
+  /// address the table before the delta; `remove_rows` comes pre-normalized
+  /// (descending, duplicate-free) so it can be applied in vector order.
+  struct TableDeltaView {
+    std::uint64_t seq = 0;
+    std::vector<std::vector<std::string>> append;
+    /// Sort keys for the appended rows: column index -> one entry per appended
+    /// row, in `append` order (same sparse shape as tableColumnValues). A
+    /// column absent here, or a nullopt entry, appends a keyless cell.
+    std::map<int, std::vector<std::optional<NumericValue>>> append_values;
+    struct CellUpdate {
+      int row = 0;
+      int col = 0;
+      std::string text;
+      /// The cell's new sort key; nullopt CLEARS any previous key (an update
+      /// replaces the whole cell, so display and ordering cannot desync).
+      std::optional<NumericValue> value;
+    };
+    std::vector<CellUpdate> update_cells;
+    std::vector<int> remove_rows;
+  };
+
+  /// The delta's seq alone, without decoding the (possibly large) ops — check
+  /// this against the last seq you applied before paying for tableDelta().
+  [[nodiscard]] std::optional<std::uint64_t> tableDeltaSeq(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find("table_delta");
+    if (it == w->end() || !it->is_object()) {
+      return std::nullopt;
+    }
+    auto seq_it = it->find("seq");
+    if (seq_it == it->end() || !seq_it->is_number_unsigned()) {
+      return std::nullopt;
+    }
+    return seq_it->get<std::uint64_t>();
+  }
+
+  [[nodiscard]] std::optional<TableDeltaView> tableDelta(std::string_view name) const {
+    auto seq = tableDeltaSeq(name);
+    if (!seq.has_value()) {
+      return std::nullopt;
+    }
+    const nlohmann::json* w = widget(name);
+    auto it = w->find("table_delta");
+    // Strict decode: one malformed op rejects the whole delta. Partially
+    // applying and then treating the seq as consumed would leave the table
+    // diverged from the plugin's model with no way to repair it.
+    TableDeltaView delta;
+    delta.seq = *seq;
+    if (auto append_it = it->find("append"); append_it != it->end()) {
+      if (!append_it->is_array()) {
+        return std::nullopt;
+      }
+      for (const auto& row : *append_it) {
+        if (!row.is_array()) {
+          return std::nullopt;
+        }
+        std::vector<std::string> cells;
+        cells.reserve(row.size());
+        for (const auto& cell : row) {
+          if (!cell.is_string()) {
+            return std::nullopt;
+          }
+          cells.push_back(cell.get<std::string>());
+        }
+        delta.append.push_back(std::move(cells));
+      }
+    }
+    if (auto values_it = it->find("append_values"); values_it != it->end()) {
+      if (!values_it->is_object()) {
+        return std::nullopt;
+      }
+      for (auto kv = values_it->begin(); kv != values_it->end(); ++kv) {
+        const auto col = parseNumber<int>(kv.key());
+        const nlohmann::json& values = kv.value();
+        if (!col.has_value() || *col < 0 || !values.is_array() || values.size() != delta.append.size()) {
+          return std::nullopt;
+        }
+        std::vector<std::optional<NumericValue>> decoded;
+        decoded.reserve(values.size());
+        for (const auto& v : values) {
+          if (v.is_null()) {
+            decoded.emplace_back(std::nullopt);
+            continue;
+          }
+          auto num = numericFromJson(v);
+          if (!num.has_value()) {
+            return std::nullopt;
+          }
+          decoded.emplace_back(*num);
+        }
+        delta.append_values.emplace(*col, std::move(decoded));
+      }
+    }
+    if (auto cells_it = it->find("update_cells"); cells_it != it->end()) {
+      if (!cells_it->is_array()) {
+        return std::nullopt;
+      }
+      for (const auto& update : *cells_it) {
+        if (!update.is_array() || update.size() < 3 || update.size() > 4 || !update[0].is_number_integer() ||
+            !update[1].is_number_integer() || !update[2].is_string() || update[0].get<int>() < 0 ||
+            update[1].get<int>() < 0) {
+          return std::nullopt;
+        }
+        TableDeltaView::CellUpdate cell{
+            update[0].get<int>(), update[1].get<int>(), update[2].get<std::string>(), std::nullopt};
+        // A null key means keyless (NaN/Inf serialize as null), matching the
+        // column_values convention; any other non-number is malformed.
+        if (update.size() == 4 && !update[3].is_null()) {
+          cell.value = numericFromJson(update[3]);
+          if (!cell.value.has_value()) {
+            return std::nullopt;
+          }
+        }
+        delta.update_cells.push_back(std::move(cell));
+      }
+    }
+    if (auto remove_it = it->find("remove_rows"); remove_it != it->end()) {
+      if (!remove_it->is_array()) {
+        return std::nullopt;
+      }
+      for (const auto& row : *remove_it) {
+        if (!row.is_number_integer() || row.get<int>() < 0) {
+          return std::nullopt;
+        }
+        delta.remove_rows.push_back(row.get<int>());
+      }
+      // Normalized for direct application: descending and duplicate-free, so a
+      // host removing in vector order can never hit index shift.
+      std::sort(delta.remove_rows.begin(), delta.remove_rows.end(), std::greater<>());
+      delta.remove_rows.erase(std::unique(delta.remove_rows.begin(), delta.remove_rows.end()), delta.remove_rows.end());
+    }
+    return delta;
+  }
+
+  [[nodiscard]] std::optional<std::vector<int>> selectedRows(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find("selected_rows");
+    if (it == w->end() || !it->is_array()) {
+      return std::nullopt;
+    }
+    std::vector<int> result;
+    result.reserve(it->size());
+    for (const auto& item : *it) {
+      if (item.is_number_integer()) {
+        result.push_back(item.get<int>());
+      }
+    }
+    return result;
+  }
+
+  [[nodiscard]] std::optional<std::vector<int>> disabledRows(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find("disabled_rows");
+    if (it == w->end() || !it->is_array()) {
+      return std::nullopt;
+    }
+    std::vector<int> result;
+    result.reserve(it->size());
+    for (const auto& item : *it) {
+      if (item.is_number_integer()) {
+        result.push_back(item.get<int>());
+      }
+    }
+    return result;
+  }
+
+  // --- Chart (QFrame used as chart container) ---
+
+  struct ChartSeriesView {
+    std::string label;
+    std::vector<std::pair<double, double>> points;  // {x, y}
+    std::string color;                              // optional hex "#rrggbb"; empty means use chart theme default
+    bool dashed = false;                            // draw with a dashed line
+  };
+
+  [[nodiscard]] std::optional<std::vector<ChartSeriesView>> chartSeries(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find("chart_series");
+    if (it == w->end() || !it->is_array()) {
+      return std::nullopt;
+    }
+    std::vector<ChartSeriesView> result;
+    result.reserve(it->size());
+    for (const auto& s : *it) {
+      if (!s.is_object()) {
+        continue;
+      }
+      ChartSeriesView sv;
+      auto label_it = s.find("label");
+      if (label_it != s.end() && label_it->is_string()) {
+        sv.label = label_it->get<std::string>();
+      }
+      auto pts_it = s.find("points");
+      if (pts_it != s.end() && pts_it->is_array()) {
+        sv.points.reserve(pts_it->size());
+        for (const auto& pt : *pts_it) {
+          if (pt.is_array() && pt.size() == 2 && pt[0].is_number() && pt[1].is_number()) {
+            sv.points.emplace_back(pt[0].get<double>(), pt[1].get<double>());
+          }
+        }
+      }
+      auto color_it = s.find("color");
+      if (color_it != s.end() && color_it->is_string()) {
+        sv.color = color_it->get<std::string>();
+      }
+      auto dashed_it = s.find("dashed");
+      if (dashed_it != s.end() && dashed_it->is_boolean()) {
+        sv.dashed = dashed_it->get<bool>();
+      }
+      result.push_back(std::move(sv));
+    }
+    return result;
+  }
+
+  /// A marker overlaid on the chart (see PJ::ChartMarker / setChartMarkers).
+  /// Interpret by `kind`: "event" (point at x0,y0 if has_value, else vline at x0),
+  /// "region" (x-span [x0,x1]), "value_band" (y-band [y0,y1]; line when y0==y1), "label".
+  struct ChartMarkerView {
+    std::string kind;
+    double x0 = 0.0;
+    double x1 = 0.0;
+    double y0 = 0.0;
+    double y1 = 0.0;
+    bool has_value = false;
+    std::string color;  // optional hex "#rrggbb"; empty means use a default palette
+    std::string label;
+  };
+
+  [[nodiscard]] std::optional<std::vector<ChartMarkerView>> chartMarkers(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find("chart_markers");
+    if (it == w->end() || !it->is_array()) {
+      return std::nullopt;
+    }
+    std::vector<ChartMarkerView> result;
+    result.reserve(it->size());
+    for (const auto& m : *it) {
+      if (!m.is_object()) {
+        continue;
+      }
+      ChartMarkerView mv;
+      mv.kind = m.value("kind", std::string());
+      mv.x0 = m.value("x0", 0.0);
+      mv.x1 = m.value("x1", 0.0);
+      mv.y0 = m.value("y0", 0.0);
+      mv.y1 = m.value("y1", 0.0);
+      mv.has_value = m.value("has_value", false);
+      mv.color = m.value("color", std::string());
+      mv.label = m.value("label", std::string());
+      result.push_back(std::move(mv));
+    }
+    return result;
+  }
+
+  /// Returns whether interactive zoom is enabled on this chart widget.
+  [[nodiscard]] std::optional<bool> chartZoomEnabled(std::string_view name) const {
+    return getBool(name, "chart_zoom_enabled");
+  }
+
+  /// Returns whether the chart should auto-fit on every series update.
+  [[nodiscard]] std::optional<bool> chartAutoZoom(std::string_view name) const {
+    return getBool(name, "chart_auto_zoom");
+  }
+
+  /// Placeholder overlay text for the named chart (see WidgetData::setChartPlaceholder).
+  [[nodiscard]] std::optional<std::string> chartPlaceholder(std::string_view name) const {
+    return getString(name, "chart_placeholder");
+  }
+
+  // --- QPlainTextEdit ---
+  [[nodiscard]] std::optional<std::string> plainText(std::string_view name) const {
+    return getString(name, "plain_text");
+  }
+
+  // --- Code editor ---
+  [[nodiscard]] std::optional<std::string> codeContent(std::string_view name) const {
+    return getString(name, "code_content");
+  }
+  [[nodiscard]] std::optional<std::string> codeLanguage(std::string_view name) const {
+    return getString(name, "code_language");
+  }
+  /// Requested caret offset (bytes) for a code editor; the host moves the caret
+  /// here after applying new code content. Absent ⇒ leave the caret as-is.
+  [[nodiscard]] std::optional<int> codeCursor(std::string_view name) const {
+    return getInt(name, "code_cursor");
+  }
+  /// Whether this code editor opted into caret tracking (setCodeCaretTracking).
+  /// Absent ⇒ not requested; the host wires cursor-move events only when true.
+  [[nodiscard]] std::optional<bool> codeCaretTracking(std::string_view name) const {
+    return getBool(name, "code_caret_tracking");
+  }
+
+  // --- QLabel ---
+  [[nodiscard]] std::optional<std::string> label(std::string_view name) const {
+    return getString(name, "label");
+  }
+
+  // --- QPushButton ---
+  [[nodiscard]] std::optional<std::string> buttonText(std::string_view name) const {
+    return getString(name, "button_text");
+  }
+
+  [[nodiscard]] std::optional<std::string> buttonIconSvg(std::string_view name) const {
+    return getString(name, "button_icon_svg");
+  }
+
+  /// Named icon id the host should resolve from its own themed icon set
+  /// (see WidgetData::setButtonIconNamed). Unknown ids: render no icon.
+  [[nodiscard]] std::optional<std::string> buttonIconName(std::string_view name) const {
+    return getString(name, "button_icon_name");
+  }
+
+  [[nodiscard]] std::optional<std::string> shortcut(std::string_view name) const {
+    return getString(name, "shortcut");
+  }
+
+  // --- File picker ---
+  /// Whether the widget contains the structured `file_picker` channel. Key
+  /// presence claims the channel even when its payload is malformed; call
+  /// filePickerOptions() to validate and decode it atomically.
+  /// @since 0.21.0
+  [[nodiscard]] bool isStructuredFilePicker(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    return w != nullptr && w->contains("file_picker");
+  }
+
+  /// Decode one complete structured picker request. Every field is required
+  /// and strictly typed. Filter IDs must be non-empty and unique, every filter
+  /// must carry at least one non-empty pattern, and a non-empty initially
+  /// selected ID must name one of those filters. Any failure rejects the whole
+  /// object; co-serialized legacy fields remain available to legacy accessors.
+  /// @since 0.21.0
+  [[nodiscard]] std::optional<FilePickerOptions> filePickerOptions(
+      std::string_view name, std::string* validation_error = nullptr) const {
+    if (validation_error != nullptr) {
+      validation_error->clear();
+    }
+    const nlohmann::json* w = widget(name);
+    if (w == nullptr) {
+      return std::nullopt;
+    }
+    auto picker_it = w->find("file_picker");
+    if (picker_it == w->end()) {
+      return std::nullopt;
+    }
+    if (!picker_it->is_object()) {
+      return rejectFilePickerOptions(validation_error, "file_picker must be an object");
+    }
+
+    FilePickerOptions options;
+    auto mode_it = picker_it->find("mode");
+    if (mode_it == picker_it->end() || !mode_it->is_string()) {
+      return rejectFilePickerOptions(validation_error, "file_picker.mode must be a string");
+    }
+    auto mode = filePickerModeFromWireValue(mode_it->get_ref<const std::string&>());
+    if (!mode.has_value()) {
+      return rejectFilePickerOptions(
+          validation_error, "file_picker.mode has invalid value '" + mode_it->get<std::string>() + "'");
+    }
+    options.mode = *mode;
+
+    if (!decodeRequiredString(*picker_it, "title", options.title) ||
+        !decodeRequiredString(*picker_it, "accept_label", options.accept_label) ||
+        !decodeRequiredString(*picker_it, "initial_directory", options.initial_directory) ||
+        !decodeRequiredString(*picker_it, "suggested_name", options.suggested_name) ||
+        !decodeRequiredString(*picker_it, "default_suffix", options.default_suffix) ||
+        !decodeRequiredString(*picker_it, "initially_selected_filter_id", options.initially_selected_filter_id)) {
+      return rejectFilePickerOptions(validation_error, "file_picker string fields must all be present and strings");
+    }
+
+    auto overwrite_it = picker_it->find("confirm_overwrite");
+    if (overwrite_it == picker_it->end() || !overwrite_it->is_boolean()) {
+      return rejectFilePickerOptions(validation_error, "file_picker.confirm_overwrite must be a boolean");
+    }
+    options.confirm_overwrite = overwrite_it->get<bool>();
+
+    auto filters_it = picker_it->find("filters");
+    if (filters_it == picker_it->end() || !filters_it->is_array()) {
+      return rejectFilePickerOptions(validation_error, "file_picker.filters must be an array");
+    }
+    std::unordered_map<std::string, bool> filter_ids;
+    filter_ids.reserve(filters_it->size());
+    options.filters.reserve(filters_it->size());
+    for (std::size_t filter_index = 0; filter_index < filters_it->size(); ++filter_index) {
+      const auto& encoded_filter = (*filters_it)[filter_index];
+      const std::string prefix = "file_picker.filters[" + std::to_string(filter_index) + "]";
+      if (!encoded_filter.is_object()) {
+        return rejectFilePickerOptions(validation_error, prefix + " must be an object");
+      }
+      FilePickerFilter filter;
+      if (!decodeRequiredString(encoded_filter, "id", filter.id) ||
+          !decodeRequiredString(encoded_filter, "label", filter.label)) {
+        return rejectFilePickerOptions(validation_error, prefix + ".id and .label must be strings");
+      }
+      if (filter.id.empty()) {
+        return rejectFilePickerOptions(validation_error, prefix + ".id must not be empty");
+      }
+      if (!filter_ids.emplace(filter.id, true).second) {
+        return rejectFilePickerOptions(
+            validation_error, "file_picker.filters contains duplicate id '" + filter.id + "'");
+      }
+      auto patterns_it = encoded_filter.find("patterns");
+      if (patterns_it == encoded_filter.end() || !patterns_it->is_array() || patterns_it->empty()) {
+        return rejectFilePickerOptions(validation_error, prefix + ".patterns must be a non-empty array");
+      }
+      filter.patterns.reserve(patterns_it->size());
+      for (std::size_t pattern_index = 0; pattern_index < patterns_it->size(); ++pattern_index) {
+        const auto& pattern = (*patterns_it)[pattern_index];
+        if (!pattern.is_string() || pattern.get_ref<const std::string&>().empty()) {
+          return rejectFilePickerOptions(
+              validation_error, prefix + ".patterns[" + std::to_string(pattern_index) + "] must be a non-empty string");
+        }
+        filter.patterns.push_back(pattern.get<std::string>());
+      }
+      options.filters.push_back(std::move(filter));
+    }
+
+    if (!options.initially_selected_filter_id.empty() &&
+        filter_ids.find(options.initially_selected_filter_id) == filter_ids.end()) {
+      return rejectFilePickerOptions(
+          validation_error, "file_picker.initially_selected_filter_id references missing filter '" +
+                                options.initially_selected_filter_id + "'");
+    }
+    return options;
+  }
+
+  [[nodiscard]] bool isFilePicker(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return false;
+    }
+    auto it = w->find("action");
+    return it != w->end() && it->is_string() && it->get<std::string>() == "file_picker";
+  }
+
+  /// A "save-as" file picker (navigate + type a new filename), as opposed to the
+  /// open-existing-file picker above. Shares the same filter/title accessors.
+  [[nodiscard]] bool isSaveFilePicker(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return false;
+    }
+    auto it = w->find("action");
+    return it != w->end() && it->is_string() && it->get<std::string>() == "save_file_picker";
+  }
+
+  /// The extension appended to a save-file picker's typed name when it has none.
+  [[nodiscard]] std::optional<std::string> saveFilePickerDefaultSuffix(std::string_view name) const {
+    return getString(name, "default_suffix");
+  }
+
+  [[nodiscard]] std::optional<std::string> filePickerFilter(std::string_view name) const {
+    return getString(name, "filter");
+  }
+  [[nodiscard]] std::optional<std::string> filePickerTitle(std::string_view name) const {
+    return getString(name, "title");
+  }
+
+  // --- Folder picker ---
+  [[nodiscard]] bool isFolderPicker(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return false;
+    }
+    auto it = w->find("action");
+    return it != w->end() && it->is_string() && it->get<std::string>() == "folder_picker";
+  }
+
+  [[nodiscard]] std::optional<std::string> folderPickerTitle(std::string_view name) const {
+    return getString(name, "title");
+  }
+
+  // --- RangeSlider ---
+  [[nodiscard]] std::optional<int> rangeSliderMin(std::string_view name) const {
+    return getInt(name, "range_min");
+  }
+  [[nodiscard]] std::optional<int> rangeSliderMax(std::string_view name) const {
+    return getInt(name, "range_max");
+  }
+  [[nodiscard]] std::optional<int> rangeSliderLower(std::string_view name) const {
+    return getInt(name, "range_lower");
+  }
+  [[nodiscard]] std::optional<int> rangeSliderUpper(std::string_view name) const {
+    return getInt(name, "range_upper");
+  }
+  /// Returns the [min_ns, max_ns] time window for duration labels, parsed from
+  /// the string-encoded nanosecond fields. nullopt if not set.
+  [[nodiscard]] std::optional<std::pair<std::int64_t, std::int64_t>> rangeSliderTimeSpan(std::string_view name) const {
+    auto mn = getString(name, "range_time_min_ns");
+    auto mx = getString(name, "range_time_max_ns");
+    if (!mn.has_value() || !mx.has_value()) {
+      return std::nullopt;
+    }
+    const auto min_ns = PJ::parseNumber<std::int64_t>(*mn);
+    const auto max_ns = PJ::parseNumber<std::int64_t>(*mx);
+    if (!min_ns || !max_ns) {
+      return std::nullopt;
+    }
+    return std::make_pair(*min_ns, *max_ns);
+  }
+
+  /// Boundary segments for a RangeSlider: (start, end, label) in slider units.
+  /// nullopt when never set; an empty vector when explicitly cleared.
+  struct Marker {
+    int start = 0;
+    int end = 0;
+    std::string label;
+  };
+  [[nodiscard]] std::optional<std::vector<Marker>> rangeSliderMarkers(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find("range_markers");
+    if (it == w->end() || !it->is_array()) {
+      return std::nullopt;
+    }
+    std::vector<Marker> out;
+    out.reserve(it->size());
+    for (const auto& m : *it) {
+      if (!m.is_object()) {
+        continue;
+      }
+      auto s = m.find("start");
+      auto e = m.find("end");
+      auto l = m.find("label");
+      if (s == m.end() || !s->is_number_integer()) {
+        continue;
+      }
+      Marker mk;
+      mk.start = s->get<int>();
+      mk.end = (e != m.end() && e->is_number_integer()) ? e->get<int>() : mk.start;
+      mk.label = (l != m.end() && l->is_string()) ? l->get<std::string>() : std::string{};
+      out.push_back(std::move(mk));
+    }
+    return out;
+  }
+
+  // --- DateRangePicker ---
+  [[nodiscard]] std::optional<std::string> dateRangeEarliest(std::string_view name) const {
+    return getString(name, "date_range_earliest");
+  }
+  [[nodiscard]] std::optional<std::string> dateRangeLatest(std::string_view name) const {
+    return getString(name, "date_range_latest");
+  }
+
+  // --- MarkerTimeline ---
+  [[nodiscard]] std::optional<int> markerTimelineMin(std::string_view name) const {
+    return getInt(name, "marker_timeline_min");
+  }
+  [[nodiscard]] std::optional<int> markerTimelineMax(std::string_view name) const {
+    return getInt(name, "marker_timeline_max");
+  }
+  [[nodiscard]] std::optional<std::vector<TimelineMark>> markerTimelineMarks(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find("marker_timeline_marks");
+    if (it == w->end() || !it->is_array()) {
+      return std::nullopt;
+    }
+    return timelineMarksFromJson(*it);
+  }
+  /// [min_ns, max_ns] time window for hover labels, parsed from string-encoded ns.
+  [[nodiscard]] std::optional<std::pair<std::int64_t, std::int64_t>> markerTimelineTimeSpan(
+      std::string_view name) const {
+    auto mn = getString(name, "marker_timeline_time_min_ns");
+    auto mx = getString(name, "marker_timeline_time_max_ns");
+    if (!mn.has_value() || !mx.has_value()) {
+      return std::nullopt;
+    }
+    const auto min_ns = PJ::parseNumber<std::int64_t>(*mn);
+    const auto max_ns = PJ::parseNumber<std::int64_t>(*mx);
+    if (!min_ns || !max_ns) {
+      return std::nullopt;
+    }
+    return std::make_pair(*min_ns, *max_ns);
+  }
+
+  // --- Field validity indicator (generic) ---
+  [[nodiscard]] std::optional<bool> fieldValid(std::string_view name) const {
+    return getBool(name, "valid");
+  }
+  [[nodiscard]] std::optional<std::string> fieldValidTooltip(std::string_view name) const {
+    return getString(name, "valid_tooltip");
+  }
+
+  // --- QDialogButtonBox ---
+  [[nodiscard]] std::optional<bool> okEnabled(std::string_view name) const {
+    return getBool(name, "ok_enabled");
+  }
+
+  // --- QTabWidget ---
+  [[nodiscard]] std::optional<int> tabIndex(std::string_view name) const {
+    return getInt(name, "tab_index");
+  }
+
+  // --- QStackedWidget ---
+  /// Page objectName requested by WidgetData::setStackedPage. Applying the page
+  /// name instead of stackedIndex() when both are present is the host contract;
+  /// its binding behavior is covered by companion PJ4 host tests.
+  /// @since 0.21.0
+  [[nodiscard]] std::optional<std::string> stackedPage(std::string_view name) const {
+    return getString(name, "stacked_page");
+  }
+
+  /// Numeric page requested by WidgetData::setStackedIndex. Embedding hosts
+  /// must ignore this value when stackedPage() is also present; that application
+  /// priority is covered by companion PJ4 host tests.
+  /// @since 0.21.0
+  [[nodiscard]] std::optional<int> stackedIndex(std::string_view name) const {
+    return getInt(name, "stacked_index");
+  }
+
+  // --- Drop target ---
+  [[nodiscard]] bool isDropTarget(std::string_view name) const {
+    return getBool(name, "drop_target").value_or(false);
+  }
+
+  /// Return all widget names that declare drop_target: true.
+  [[nodiscard]] std::vector<std::string> dropTargets() const {
+    std::vector<std::string> result;
+    if (!data_.is_object()) {
+      return result;
+    }
+    for (const auto& [key, val] : data_.items()) {
+      if (val.is_object()) {
+        auto it = val.find("drop_target");
+        if (it != val.end() && it->is_boolean() && it->get<bool>()) {
+          result.push_back(key);
+        }
+      }
+    }
+    return result;
+  }
+
+  // --- QDateTimeEdit ---
+  [[nodiscard]] std::optional<std::string> dateTime(std::string_view name) const {
+    return getString(name, "datetime");
+  }
+  [[nodiscard]] std::optional<std::pair<std::string, std::string>> dateTimeRange(std::string_view name) const {
+    auto mn = getString(name, "datetime_min");
+    auto mx = getString(name, "datetime_max");
+    if (!mn.has_value() && !mx.has_value()) {
+      return std::nullopt;
+    }
+    return std::make_pair(mn.value_or(std::string()), mx.value_or(std::string()));
+  }
+
+  // --- Generic (any widget) ---
+  [[nodiscard]] std::optional<bool> enabled(std::string_view name) const {
+    return getBool(name, "enabled");
+  }
+  [[nodiscard]] std::optional<bool> visible(std::string_view name) const {
+    return getBool(name, "visible");
+  }
+
+  // --- Dialog-level commands ---
+  [[nodiscard]] bool requestAccept() const {
+    auto it = data_.find("__request_accept");
+    return it != data_.end() && it->is_boolean() && it->get<bool>();
+  }
+
+  /// Returns the sub-dialog UI XML if a sub-dialog was requested, or nullopt.
+  [[nodiscard]] std::optional<std::string> subDialogUi() const {
+    auto it = data_.find("__request_sub_dialog");
+    if (it == data_.end() || !it->is_object()) {
+      return std::nullopt;
+    }
+    auto ui_it = it->find("ui");
+    if (ui_it == it->end() || !ui_it->is_string()) {
+      return std::nullopt;
+    }
+    return ui_it->get<std::string>();
+  }
+
+  /// Returns the interactive sub-panel UI XML if requestSubPanel was called, or
+  /// nullopt. The sub-panel is live (events flow back to the plugin); see
+  /// WidgetData::requestSubPanel. Observed by PanelEngine.
+  [[nodiscard]] std::optional<std::string> subPanelUi() const {
+    auto it = data_.find("__request_sub_panel");
+    if (it == data_.end() || !it->is_object()) {
+      return std::nullopt;
+    }
+    auto ui_it = it->find("ui");
+    if (ui_it == it->end() || !ui_it->is_string()) {
+      return std::nullopt;
+    }
+    return ui_it->get<std::string>();
+  }
+
+  /// True if WidgetData::closeSubPanel was called (dismiss the interactive sub-panel).
+  [[nodiscard]] bool subPanelClose() const {
+    auto it = data_.find("__request_sub_panel_close");
+    return it != data_.end() && it->is_boolean() && it->get<bool>();
+  }
+
+  /// Returns the close-reason string if WidgetData::requestClose was called, or
+  /// nullopt. Observed by PanelEngine; ignored by DialogEngine.
+  [[nodiscard]] std::optional<std::string> requestClose() const {
+    auto it = data_.find("__request_close");
+    if (it == data_.end() || !it->is_string()) {
+      return std::nullopt;
+    }
+    return it->get<std::string>();
+  }
+
+  // --- QTableWidget filtering / styling (Mosaico parity) ---
+
+  /// List of row indexes that should remain visible (rows not listed are
+  /// hidden). Returns nullopt when the field is missing OR JSON null
+  /// (clearVisibleRows): in both cases the host applies no visibility change
+  /// this update. To show every row, send the full index list explicitly.
+  /// NOTE: missing and null are intentionally indistinguishable here; a future
+  /// 3-state contract (unset / show-all / explicit-set) would need a sentinel.
+  [[nodiscard]] std::optional<std::vector<int>> visibleRows(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (w == nullptr) {
+      return std::nullopt;
+    }
+    auto it = w->find("visible_rows");
+    if (it == w->end() || it->is_null()) {
+      return std::nullopt;
+    }
+    if (!it->is_array()) {
+      return std::nullopt;
+    }
+    std::vector<int> result;
+    result.reserve(it->size());
+    for (const auto& item : *it) {
+      if (item.is_number_integer()) {
+        result.push_back(item.get<int>());
+      }
+    }
+    return result;
+  }
+
+  /// row index → "#rrggbb" tint. Empty string clears the override.
+  [[nodiscard]] std::optional<std::vector<std::pair<int, std::string>>> rowColors(std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (w == nullptr) {
+      return std::nullopt;
+    }
+    auto it = w->find("row_colors");
+    if (it == w->end() || !it->is_object()) {
+      return std::nullopt;
+    }
+    std::vector<std::pair<int, std::string>> result;
+    for (auto kv = it->begin(); kv != it->end(); ++kv) {
+      const auto row = parseNumber<int>(kv.key());
+      if (!row.has_value() || !kv.value().is_string()) {
+        continue;
+      }
+      result.emplace_back(*row, kv.value().get<std::string>());
+    }
+    return result;
+  }
+
+  /// (row, col, tooltip) tuples for cell-level tooltips.
+  [[nodiscard]] std::optional<std::vector<std::tuple<int, int, std::string>>> cellTooltips(
+      std::string_view name) const {
+    const nlohmann::json* w = widget(name);
+    if (w == nullptr) {
+      return std::nullopt;
+    }
+    auto it = w->find("cell_tooltips");
+    if (it == w->end() || !it->is_object()) {
+      return std::nullopt;
+    }
+    std::vector<std::tuple<int, int, std::string>> result;
+    for (auto kv = it->begin(); kv != it->end(); ++kv) {
+      const std::string& key = kv.key();
+      const auto comma = key.find(',');
+      if (comma == std::string::npos) {
+        continue;
+      }
+      const auto row = parseNumber<int>(std::string_view{key}.substr(0, comma));
+      const auto col = parseNumber<int>(std::string_view{key}.substr(comma + 1));
+      if (!row.has_value() || !col.has_value() || !kv.value().is_string()) {
+        continue;
+      }
+      result.emplace_back(*row, *col, kv.value().get<std::string>());
+    }
+    return result;
+  }
+
+  // --- Enumeration ---
+  [[nodiscard]] std::vector<std::string> widgetNames() const {
+    std::vector<std::string> names;
+    if (data_.is_object()) {
+      names.reserve(data_.size());
+      for (const auto& [key, _] : data_.items()) {
+        names.push_back(key);
+      }
+    }
+    return names;
+  }
+
+  [[nodiscard]] bool hasWidget(std::string_view name) const {
+    return widget(name) != nullptr;
+  }
+
+  // --- Raw access ---
+  [[nodiscard]] const nlohmann::json& raw() const {
+    return data_;
+  }
+
+ private:
+  nlohmann::json data_;
+
+  /// Decode a JSON number into the widest lossless NumericValue alternative
+  /// (the wire collapses every integer width, so no guessing the original
+  /// type). Non-numbers yield nullopt.
+  static std::optional<NumericValue> numericFromJson(const nlohmann::json& v) {
+    if (v.is_number_unsigned()) {
+      return NumericValue(v.get<uint64_t>());
+    }
+    if (v.is_number_integer()) {
+      return NumericValue(v.get<int64_t>());
+    }
+    if (v.is_number_float()) {
+      return NumericValue(v.get<double>());
+    }
+    return std::nullopt;
+  }
+
+  static bool decodeOptionalBool(const nlohmann::json& object, const char* key, bool& value) {
+    auto it = object.find(key);
+    if (it == object.end()) {
+      return true;
+    }
+    if (!it->is_boolean()) {
+      return false;
+    }
+    value = it->get<bool>();
+    return true;
+  }
+
+  static std::optional<std::vector<TreeItem>> rejectTreeItems(std::string* validation_error, std::string reason) {
+    if (validation_error != nullptr) {
+      *validation_error = std::move(reason);
+    }
+    return std::nullopt;
+  }
+
+  static std::optional<FilePickerOptions> rejectFilePickerOptions(std::string* validation_error, std::string reason) {
+    if (validation_error != nullptr) {
+      *validation_error = std::move(reason);
+    }
+    return std::nullopt;
+  }
+
+  static bool decodeRequiredString(const nlohmann::json& object, const char* key, std::string& value) {
+    auto it = object.find(key);
+    if (it == object.end() || !it->is_string()) {
+      return false;
+    }
+    value = it->get<std::string>();
+    return true;
+  }
+
+  const nlohmann::json* widget(std::string_view name) const {
+    auto it = data_.find(std::string(name));
+    if (it == data_.end() || !it->is_object()) {
+      return nullptr;
+    }
+    return &(*it);
+  }
+
+  std::optional<std::string> getString(std::string_view name, const char* field) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find(field);
+    if (it == w->end() || !it->is_string()) {
+      return std::nullopt;
+    }
+    return it->get<std::string>();
+  }
+
+  std::optional<int> getInt(std::string_view name, const char* field) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find(field);
+    if (it == w->end()) {
+      return std::nullopt;
+    }
+    return decodeInt(*it);
+  }
+
+  static std::optional<int> decodeInt(const nlohmann::json& encoded) {
+    if (encoded.is_number_unsigned()) {
+      const auto value = encoded.get<std::uint64_t>();
+      if (value > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+        return std::nullopt;
+      }
+      return static_cast<int>(value);
+    }
+    if (encoded.is_number_integer()) {
+      const auto value = encoded.get<std::int64_t>();
+      if (value < static_cast<std::int64_t>(std::numeric_limits<int>::min()) ||
+          value > static_cast<std::int64_t>(std::numeric_limits<int>::max())) {
+        return std::nullopt;
+      }
+      return static_cast<int>(value);
+    }
+    return std::nullopt;
+  }
+
+  std::optional<bool> getBool(std::string_view name, const char* field) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find(field);
+    if (it == w->end() || !it->is_boolean()) {
+      return std::nullopt;
+    }
+    return it->get<bool>();
+  }
+
+  std::optional<double> getDouble(std::string_view name, const char* field) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find(field);
+    if (it == w->end() || !it->is_number()) {
+      return std::nullopt;
+    }
+    return it->get<double>();
+  }
+
+  std::optional<std::vector<std::string>> getStringArray(std::string_view name, const char* field) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find(field);
+    if (it == w->end() || !it->is_array()) {
+      return std::nullopt;
+    }
+    std::vector<std::string> result;
+    result.reserve(it->size());
+    for (const auto& item : *it) {
+      if (item.is_string()) {
+        result.push_back(item.get<std::string>());
+      }
+    }
+    return result;
+  }
+
+  static std::optional<std::vector<std::string>> decodeStrictStringArray(const nlohmann::json& encoded) {
+    if (!encoded.is_array()) {
+      return std::nullopt;
+    }
+    std::vector<std::string> result;
+    result.reserve(encoded.size());
+    for (const auto& item : encoded) {
+      if (!item.is_string()) {
+        return std::nullopt;
+      }
+      result.push_back(item.get<std::string>());
+    }
+    return result;
+  }
+
+  std::optional<std::vector<std::string>> getStrictStringArray(std::string_view name, const char* field) const {
+    const nlohmann::json* w = widget(name);
+    if (!w) {
+      return std::nullopt;
+    }
+    auto it = w->find(field);
+    if (it == w->end()) {
+      return std::nullopt;
+    }
+    return decodeStrictStringArray(*it);
+  }
+};
+
+}  // namespace PJ

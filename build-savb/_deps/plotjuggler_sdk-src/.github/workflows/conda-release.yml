@@ -1,0 +1,86 @@
+name: conda-release
+
+# Build + publish the SDK conda package to the prefix.dev "plotjuggler" channel
+# on tag push. Requires repo secret PREFIX_API_KEY = a prefix.dev token with
+# write access to the "plotjuggler" channel.
+on:
+  push:
+    tags:
+      - "v*"
+  # Build-only on PRs that touch the recipe/workflow, so the win-64/osx-64 legs
+  # are validated before a release tag (the upload step is skipped — see below).
+  pull_request:
+    paths:
+      - "VERSION"
+      - "recipe.yaml"
+      - ".github/workflows/conda-release.yml"
+  # Manual dispatch builds the version from VERSION (no tag guard); idempotent
+  # via `rattler-build upload --skip-existing`.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-upload:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # linux-64, osx-64 (macos-15-intel is the Intel runner — macos-13 was
+        # retired by GitHub and jobs targeting it queue forever), win-64.
+        os: [ubuntu-22.04, macos-15-intel, windows-2022]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read SDK version and verify tag
+        id: sdk-version
+        shell: bash
+        run: |
+          sdk_version="$(tr -d '\r\n' < VERSION)"
+          echo "sdk_version=$sdk_version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [[ "$tag" != "$sdk_version" ]]; then
+              echo "::error::Tag v$tag does not match VERSION ($sdk_version)"
+              exit 1
+            fi
+          fi
+
+      - name: Install rattler-build
+        uses: prefix-dev/rattler-build-action@v0.2.38
+        with:
+          setup-only: true
+          rattler-build-version: v0.66.2
+
+      # Relative output dir (not runner.temp) so the bash glob below works
+      # identically under Git Bash on the Windows runner.
+      - name: Build conda package
+        shell: bash
+        env:
+          # Belt-and-braces with the variant config below (see that file's comment).
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+          PJ_SDK_VERSION: ${{ steps.sdk-version.outputs.sdk_version }}
+        run: |
+          extra=()
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            extra+=(--variant-config .github/conda_variants_osx.yaml)
+          fi
+          rattler-build build \
+            --recipe recipe.yaml \
+            --channel conda-forge \
+            "${extra[@]}" \
+            --output-dir conda-output
+
+      # Upload only on a release tag or manual dispatch — never on pull_request
+      # (PRs are build-only validation of the win-64/osx-64 legs).
+      - name: Upload to prefix.dev (plotjuggler)
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          PREFIX_API_KEY: ${{ secrets.PREFIX_API_KEY }}
+        run: |
+          find conda-output -name '*.conda' -print0 \
+            | xargs -0 rattler-build upload prefix --channel plotjuggler --skip-existing

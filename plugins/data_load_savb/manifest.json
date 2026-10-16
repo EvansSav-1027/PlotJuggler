@@ -1,0 +1,20 @@
+{
+  "id": "sav-log-loader",
+  "name": "SAV Log Loader",
+  "version": "0.1.0",
+  "description": "Data loader for SAV Helm OS SensorDataLogger flight-recorder logs (SAVB .bin).",
+  "author": "SAV",
+  "license": "MPL-2.0",
+  "category": "data_loader",
+  "tags": [
+    "sav",
+    "file",
+    "loader",
+    "flight recorder"
+  ],
+  "file_extensions": [
+    ".bin"
+  ],
+  "min_sdk_required": "0.34.0",
+  "min_plotjuggler_version": "4.0.0"
+}
