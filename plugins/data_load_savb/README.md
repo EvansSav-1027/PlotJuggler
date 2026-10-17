@@ -33,7 +33,7 @@ loader gives, so a layout made for the CSV works on the `.bin` unchanged:
   strings, everything else float64; `nan`/`ovf` cells are NaN.
 - Rows are built the way the decoder builds them: `GAIN`, `MODE` and `ORGN`
   values carry forward onto every later row, and the derived columns
-  (`TIME/host_time_utc`, `GPS/time_utc`, `SONAR/age_s`, `IMU/accel_cal/*`,
+  (`TIME/host_time`, `GPS/time` — `*_utc` in older logs — `SONAR/age_s`, `IMU/accel_cal/*`,
   `MAG/cal/*`, `MAG/accel_cal/*`) are recomputed from the logged values and
   `CAL`.
 - Time axis: each row's `TIME/host_epoch_ns`.

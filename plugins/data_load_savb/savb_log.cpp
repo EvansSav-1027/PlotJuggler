@@ -16,7 +16,7 @@ constexpr size_t kZLen = 64;
 
 // 1: original framing. 2: adds the x/X bitfield types (v1 logs read unchanged).
 constexpr uint16_t kMinVersion = 1;
-constexpr uint16_t kMaxVersion = 2;
+constexpr uint16_t kMaxVersion = 3;  // 3: epoch columns are local wall-clock, not UTC
 
 std::vector<std::string> split(const std::string& s, char sep) {
   std::vector<std::string> out;

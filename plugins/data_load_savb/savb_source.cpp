@@ -128,7 +128,8 @@ class SavbSource : public PJ::FileSourceBase {
     columns_.clear();
     formats_.clear();
     derived_ = derivedColumns();
-    text_labels_ = {"TIME/host_time_utc", "GPS/time_utc"};
+    // Older logs carry the *_utc names.
+    text_labels_ = {"TIME/host_time", "GPS/time", "TIME/host_time_utc", "GPS/time_utc"};
     cal_.clear();
     sticky_.clear();
     row_.reset();
