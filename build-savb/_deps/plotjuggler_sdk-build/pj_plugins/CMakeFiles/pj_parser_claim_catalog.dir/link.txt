@@ -1,2 +1,0 @@
-/usr/bin/ar qc libpj_parser_claim_catalog.a CMakeFiles/pj_parser_claim_catalog.dir/src/parser_claim_catalog.cpp.o CMakeFiles/pj_parser_claim_catalog.dir/src/parser_route_resolver.cpp.o
-/usr/bin/ranlib libpj_parser_claim_catalog.a

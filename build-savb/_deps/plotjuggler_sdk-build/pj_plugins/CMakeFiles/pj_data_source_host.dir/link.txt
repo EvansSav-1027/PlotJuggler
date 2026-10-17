@@ -1,2 +1,0 @@
-/usr/bin/ar qc libpj_data_source_host.a CMakeFiles/pj_data_source_host.dir/src/data_source_library.cpp.o
-/usr/bin/ranlib libpj_data_source_host.a

@@ -1,2 +1,0 @@
-/usr/bin/ar qc libpj_dialog_library.a CMakeFiles/pj_dialog_library.dir/src/dialog_library.cpp.o
-/usr/bin/ranlib libpj_dialog_library.a

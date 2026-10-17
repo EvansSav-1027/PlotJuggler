@@ -1,2 +1,0 @@
-/usr/bin/ar qc libpj_message_parser_host.a CMakeFiles/pj_message_parser_host.dir/src/message_parser_library.cpp.o
-/usr/bin/ranlib libpj_message_parser_host.a
