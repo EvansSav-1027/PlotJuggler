@@ -11,8 +11,11 @@
 // forward, CAL kept out of the rows, derived columns recomputed — so a layout
 // made for the CSV works on the .bin unchanged.
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -72,6 +75,39 @@ constexpr CalRule kCalRules[] = {
     {"MAG/raw/", "MAG/cal/", "_mgauss", "mag_hard_iron", "mag_soft_iron_scale", true},
 };
 constexpr double kMagLsbMgauss = 1.5;
+
+// Logs written before the logger shifted its wall-clock epochs hold true UTC
+// (1970-01-01 00:00 UTC based); they name the readable column TIME/host_time_utc.
+// Newer logs already hold local wall-clock time. Same rule as sav_log_to_csv.py.
+constexpr uint16_t kLocalEpochVersion = 3;
+constexpr const char* kUtcEpochMarker = "TIME/host_time_utc";
+constexpr const char* kHostEpoch = "TIME/host_epoch_ns";
+constexpr const char* kGpsEpoch = "GPS/epoch_ns";
+constexpr int64_t kNsPerS = 1'000'000'000;
+
+// Seconds since 1970 of a broken-down time read as if it were UTC.
+int64_t civilSeconds(const std::tm& t) {
+  const std::chrono::year_month_day day{
+      std::chrono::year{t.tm_year + 1900}, std::chrono::month{static_cast<unsigned>(t.tm_mon + 1)},
+      std::chrono::day{static_cast<unsigned>(t.tm_mday)}};
+  const int64_t days = static_cast<int64_t>(std::chrono::sys_days{day}.time_since_epoch().count());
+  return (days * 86400) + (int64_t{t.tm_hour} * 3600) + (int64_t{t.tm_min} * 60) + int64_t{t.tm_sec};
+}
+
+// This machine's offset from UTC at `epoch_ns`, in ns (+19800 s in IST).
+int64_t localUtcOffsetNs(int64_t epoch_ns) {
+  const std::time_t secs = static_cast<std::time_t>(epoch_ns / kNsPerS);
+  std::tm utc{};
+  std::tm local{};
+#ifdef _WIN32
+  gmtime_s(&utc, &secs);
+  localtime_s(&local, &secs);
+#else
+  gmtime_r(&secs, &utc);
+  localtime_r(&secs, &local);
+#endif
+  return (civilSeconds(local) - civilSeconds(utc)) * kNsPerS;
+}
 
 // How a derived column is computed.
 struct Derived {
@@ -135,6 +171,8 @@ class SavbSource : public PJ::FileSourceBase {
     row_.reset();
     fields_.clear();
     rows_ = 0;
+    epoch_is_utc_ = false;
+    local_offset_ns_.reset();
     PJ::Status status = PJ::okStatus();
     uint64_t since_progress = 0;
 
@@ -143,6 +181,8 @@ class SavbSource : public PJ::FileSourceBase {
         buf,
         [&](const savb::Format& fmt, const uint8_t* payload) {
           if (columns_.empty()) {
+            epoch_is_utc_ = stats.version < kLocalEpochVersion &&
+                            std::find(stats.columns.begin(), stats.columns.end(), kUtcEpochMarker) != stats.columns.end();
             // The header and every FMT are read before the first message, so
             // the text columns are known here: leave them out.
             for (const auto& col : stats.columns) {
@@ -242,6 +282,20 @@ class SavbSource : public PJ::FileSourceBase {
     }
   }
 
+  // A wall-clock epoch as local time. A true-UTC (older) log gets this machine's
+  // offset, taken once from the first stamp and kept for the whole log, as the
+  // logger does, so a DST change cannot make the axis jump; non-positive stamps
+  // (no value) and newer logs pass through.
+  int64_t localWallClock(int64_t epoch_ns) {
+    if (!epoch_is_utc_ || epoch_ns <= 0) {
+      return epoch_ns;
+    }
+    if (!local_offset_ns_) {
+      local_offset_ns_ = localUtcOffsetNs(epoch_ns);
+    }
+    return epoch_ns + *local_offset_ns_;
+  }
+
   // One topic named like the CSV loader's (the file's base name), and every
   // plotted CSV column registered in CSV order as float64, as the CSV loader
   // registers numeric columns.
@@ -288,8 +342,8 @@ class SavbSource : public PJ::FileSourceBase {
     };
 
     int64_t ts = 0;
-    if (auto host = raw_int("TIME/host_epoch_ns")) {
-      ts = *host;
+    if (auto host = raw_int(kHostEpoch)) {
+      ts = localWallClock(*host);
     }
 
     record_.clear();
@@ -298,6 +352,10 @@ class SavbSource : public PJ::FileSourceBase {
       if (const RawCell* c = cell(col)) {
         if (c->bit >= 0) {
           record_.push_back({.field = fields_[i], .value = *asNumber(*c)});
+        } else if (col == kHostEpoch || col == kGpsEpoch) {
+          record_.push_back(
+              {.field = fields_[i],
+               .value = static_cast<double>(localWallClock(savb::rawInteger(*c->field, c->payload)))});
         } else {
           record_.push_back({.field = fields_[i], .value = savb::numericValue(*c->field, c->payload)});
         }
@@ -352,6 +410,8 @@ class SavbSource : public PJ::FileSourceBase {
   std::vector<PJ::sdk::FieldHandle> fields_;  // parallel to columns_
   std::vector<PJ::sdk::BoundFieldValue> record_;
   uint64_t rows_ = 0;
+  bool epoch_is_utc_ = false;                // see localWallClock()
+  std::optional<int64_t> local_offset_ns_;
 };
 
 }  // namespace

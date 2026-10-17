@@ -36,7 +36,11 @@ loader gives, so a layout made for the CSV works on the `.bin` unchanged:
   (`TIME/host_time`, `GPS/time` — `*_utc` in older logs — `SONAR/age_s`, `IMU/accel_cal/*`,
   `MAG/cal/*`, `MAG/accel_cal/*`) are recomputed from the logged values and
   `CAL`.
-- Time axis: each row's `TIME/host_epoch_ns`.
+- Time axis: each row's `TIME/host_epoch_ns`, as local wall-clock time. Newer logs
+  hold it that way already (the logger adds the host's UTC offset). Older logs (header
+  column `TIME/host_time_utc`) hold true UTC, so the plugin adds this machine's offset,
+  fixed once per log — the same shift `sav_log_to_csv.py` applies — and
+  `GPS/epoch_ns` gets the same treatment.
 
 A truncated tail (power cut) or corrupt stretch is skipped with a warning;
 everything readable is kept.

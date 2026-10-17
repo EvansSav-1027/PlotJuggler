@@ -9,7 +9,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -87,11 +89,11 @@ class LogBuilder {
 constexpr uint8_t kTick = 1, kImu = 2, kCtrl = 3, kMode = 4, kCal = 5, kSonar = 6;
 
 // The CSV column order the logger stores — a subset of the real one, with
-// derived (TIME/host_time_utc, IMU/accel_cal/x_mps2, SONAR/age_s) and
+// derived (TIME/host_time, IMU/accel_cal/x_mps2, SONAR/age_s) and
 // never-logged (BAT/bat1/voltage) columns. TICK/mono_ns is logged but is not a
 // CSV column.
 const std::vector<std::string> kColumns = {
-    "seq", "TIME/host_time_utc", "TIME/host_epoch_ns", "IMU/gyro/x_degs", "IMU/accel/x_mps2",
+    "seq", "TIME/host_time", "TIME/host_epoch_ns", "IMU/gyro/x_degs", "IMU/accel/x_mps2",
     "IMU/accel_cal/x_mps2", "IMU/temp_c", "EKF/status/position_quality", "PWM/left_us", "RCIN/estop",
     "STATUS/operator_mode", "STATUS/active_behavior", "SONAR/last_update_ns", "SONAR/age_s", "BAT/bat1/voltage"};
 
@@ -101,17 +103,19 @@ const std::vector<std::string> kPlottedColumns = {
     "EKF/status/position_quality", "PWM/left_us", "RCIN/estop", "STATUS/operator_mode", "SONAR/last_update_ns",
     "SONAR/age_s", "BAT/bat1/voltage"};
 
-std::string joined() {
+// `legacy_utc` names the readable time column the way older logs (true-UTC
+// epochs) do: TIME/host_time_utc.
+std::string joined(bool legacy_utc) {
   std::string out;
   for (const auto& c : kColumns) {
-    out += (out.empty() ? "" : ",") + c;
+    out += (out.empty() ? "" : ",") + ((legacy_utc && c == "TIME/host_time") ? std::string("TIME/host_time_utc") : c);
   }
   return out;
 }
 
 // Header + FMTs + CAL, as SensorDataLogger::open() writes them.
-LogBuilder makePreamble() {
-  LogBuilder b(joined());
+LogBuilder makePreamble(bool legacy_utc = false) {
+  LogBuilder b(joined(legacy_utc));
   b.fmt(kTick, "TICK", "Iqq", "000", "seq,TIME/host_epoch_ns,TICK/mono_ns");
   b.fmt(kImu, "IMU_", "iib", "440", "IMU/gyro/x_degs,IMU/accel/x_mps2,IMU/temp_c");
   b.fmt(kCtrl, "CTRL", "Hx", "00", "PWM/left_us,RCIN/estop:1|EKF/status/position_quality:2");
@@ -300,7 +304,7 @@ TEST_F(SavbSourceTest, OneTopicWithExactlyTheCsvColumns) {
   // Named like the CSV loader names a CSV: the file's base name.
   ASSERT_EQ(write_.topics, std::vector<std::string>{"log_test"});
   // Every plottable CSV column, in CSV order — no text columns
-  // (TIME/host_time_utc, STATUS/active_behavior), no TICK/mono_ns, no CAL/*,
+  // (TIME/host_time, STATUS/active_behavior), no TICK/mono_ns, no CAL/*,
   // nothing renamed — all float64, as the CSV loader registers numbers.
   EXPECT_EQ(write_.field_order, kPlottedColumns);
   for (const auto& [name, type] : write_.types) {
@@ -370,6 +374,60 @@ TEST_F(SavbSourceTest, BitfieldSlotsAndSonarAge) {
   EXPECT_DOUBLE_EQ(num(0, "EKF/status/position_quality"), 2.0);
   EXPECT_DOUBLE_EQ(num(0, "SONAR/age_s"), 0.25);  // TICK/mono_ns - SONAR/last_update_ns
 }
+
+#ifndef _WIN32
+// Holds the process timezone at UTC+5:30 (a POSIX TZ string, so no tzdata is
+// needed) for one test.
+class ScopedIst {
+ public:
+  ScopedIst() {
+    const char* old = std::getenv("TZ");
+    had_ = old != nullptr;
+    saved_ = had_ ? old : "";
+    setenv("TZ", "IST-5:30", 1);
+    tzset();
+  }
+  ~ScopedIst() {
+    if (had_) {
+      setenv("TZ", saved_.c_str(), 1);
+    } else {
+      unsetenv("TZ");
+    }
+    tzset();
+  }
+
+ private:
+  bool had_ = false;
+  std::string saved_;
+};
+constexpr int64_t kIstOffsetNs = (5 * 3600 + 30 * 60) * 1'000'000'000LL;
+
+// The epoch counts from 1970-01-01 00:00 UTC. An older log holds it as true
+// UTC, so the time axis gets this machine's offset to read as local time —
+// the same shift sav_log_to_csv.py applies — fixed once for the whole log.
+TEST_F(SavbSourceTest, OlderUtcLogsAreShownInLocalTime) {
+  const ScopedIst ist;
+  auto b = makePreamble(/*legacy_utc=*/true);
+  tick(b, 0, kEpoch, 0);
+  tick(b, 1, kEpoch + 20'000'000, 20'000'000);
+  ASSERT_TRUE(import(b.bytes()));
+  ASSERT_EQ(write_.records.size(), 2u);
+  EXPECT_EQ(write_.records[0].ts, kEpoch + kIstOffsetNs);
+  EXPECT_EQ(write_.records[1].ts, kEpoch + 20'000'000 + kIstOffsetNs);
+  EXPECT_DOUBLE_EQ(num(0, "TIME/host_epoch_ns"), static_cast<double>(kEpoch + kIstOffsetNs));
+}
+
+// Newer logs already hold local wall-clock time: not shifted a second time.
+TEST_F(SavbSourceTest, NewerLogsAreNotShiftedAgain) {
+  const ScopedIst ist;
+  auto b = makePreamble();
+  tick(b, 0, kEpoch, 0);
+  ASSERT_TRUE(import(b.bytes()));
+  ASSERT_EQ(write_.records.size(), 1u);
+  EXPECT_EQ(write_.records[0].ts, kEpoch);
+  EXPECT_DOUBLE_EQ(num(0, "TIME/host_epoch_ns"), static_cast<double>(kEpoch));
+}
+#endif
 
 TEST_F(SavbSourceTest, ResyncsOverGarbageAndKeepsDataBeforeATruncatedTail) {
   auto b = makePreamble();

@@ -58,6 +58,7 @@ struct Format {
 };
 
 struct ScanStats {
+  uint16_t version = 0;              ///< the file header's format version
   std::vector<std::string> columns;  ///< the file header's CSV column order (sav_log_to_csv.py's header row)
   uint64_t messages = 0;             ///< data messages delivered (FMT records excluded)
   uint64_t skipped_bytes = 0;        ///< bytes dropped while resyncing, plus a truncated tail

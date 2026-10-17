@@ -191,6 +191,7 @@ std::string scanLog(
   if (8 + ncols > buf.size()) {
     return "truncated SAVB file header";
   }
+  stats.version = version;
   stats.columns = split(std::string(reinterpret_cast<const char*>(buf.data() + 8), ncols), ',');
   size_t pos = 8 + ncols;
 
