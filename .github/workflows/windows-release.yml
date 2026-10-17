@@ -379,8 +379,10 @@ jobs:
         # located rather than assumed.
         shell: pwsh
         run: |
+          # Absolute: CMake resolves a relative toolchain path against the build and
+          # source dirs, and neither of this project's contains build/.
           cmake -S plugins/data_load_savb -B build-savb -G "Ninja Multi-Config" `
-            -DCMAKE_TOOLCHAIN_FILE="build/conan_toolchain.cmake" `
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/build/conan_toolchain.cmake" `
             -DCMAKE_POLICY_DEFAULT_CMP0141=NEW `
             -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded `
             -DSAVB_BUILD_TESTS=OFF
@@ -427,11 +429,15 @@ jobs:
             @updateArgs
 
       - name: Upload installer artifact
+        # always(): keep whatever was produced even when a later or earlier step
+        # fails, since the runner (and its workspace) is discarded after the job.
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: PlotJuggler-${{ env.PJ_VERSION }}-Windows-x64
           path: dist/*.exe
-          if-no-files-found: error
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Upload the update repository (rehearsal)
         # A later rehearsal's update-check installs this run's installer

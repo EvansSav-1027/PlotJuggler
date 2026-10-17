@@ -392,11 +392,15 @@ jobs:
           echo "glibc floor OK: no bundled ELF requires > GLIBC_2.35"
 
       - name: Upload AppImage artifact
+        # always(): keep whatever was produced even when another step fails,
+        # since the container (and its workspace) is discarded after the job.
+        if: always() && env.APPIMAGE != ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.APPIMAGE_NAME }}
           path: ${{ env.APPIMAGE }}
-          if-no-files-found: error
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Attach AppImage to the GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -452,6 +456,7 @@ jobs:
           name: ${{ steps.package_deb.outputs.deb_name }}
           path: ${{ env.DEB }}
           if-no-files-found: error
+          retention-days: 90
 
   smoke:
     # Install the .deb on bare distro images and RUN it, then run the AppImage
