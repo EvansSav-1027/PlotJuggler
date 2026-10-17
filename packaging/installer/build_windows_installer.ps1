@@ -430,8 +430,8 @@ function Stage-LocalPlugins([string]$sourceDir) {
     if ([string]$manifest.id -ne $id) {
       Die "local plugin '$id' manifest declares id '$($manifest.id)'"
     }
-    $version = [string]$manifest.version
-    if (-not $version) { Die "local plugin '$id' manifest has no version" }
+    $pluginVersion = [string]$manifest.version
+    if (-not $pluginVersion) { Die "local plugin '$id' manifest has no version" }
     $minimumHostVersion = [string]$manifest.min_plotjuggler_version
     if ($minimumHostVersion) {
       $minimumParsed = Convert-Semver $minimumHostVersion "plugin '$id' minimum PlotJuggler version"
@@ -445,9 +445,9 @@ function Stage-LocalPlugins([string]$sourceDir) {
     Get-ChildItem -LiteralPath $dir.FullName -Force | Copy-Item -Destination $destination -Recurse -Force
     $dlls = @(Get-ChildItem -LiteralPath $destination -Recurse -Filter "*_plugin.dll")
     if ($dlls.Count -eq 0) { Die "local plugin '$id' contains no *_plugin.dll" }
-    $script:resolvedPluginVersions[$id] = $version
+    $script:resolvedPluginVersions[$id] = $pluginVersion
     $script:localPluginIds += $id
-    Info "staged local plugin: $id $version ($($dlls.Count) DLL(s))"
+    Info "staged local plugin: $id $pluginVersion ($($dlls.Count) DLL(s))"
   }
 }
 

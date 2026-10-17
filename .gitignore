@@ -61,3 +61,6 @@ build_local/
 # wasm-reboot local build dirs
 build-desktop/
 build-wasm*/
+
+# Generic CMake build dirs (build-savb/, build-release/, ...).
+build-*/
