@@ -55,7 +55,7 @@ concurrency:
 
 jobs:
   appimage:
-    runs-on: depot-ubuntu-22.04-4
+    runs-on: ubuntu-22.04
     timeout-minutes: 240
     outputs:
       deb_name: ${{ steps.package_deb.outputs.deb_name }}

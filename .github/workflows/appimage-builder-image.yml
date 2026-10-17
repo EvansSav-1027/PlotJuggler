@@ -23,15 +23,17 @@ concurrency:
   group: appimage-builder-image-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  IMAGE: ghcr.io/plotjuggler/pj4-appimage-builder
-
 jobs:
   build-push:
-    runs-on: depot-ubuntu-22.04-4
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+
+      - name: Resolve image name
+        # GHCR names must be lowercase; the owner is the fork or org running this.
+        shell: bash
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/pj4-appimage-builder" >> "${GITHUB_ENV}"
 
       - name: Read versions.env
         shell: bash
