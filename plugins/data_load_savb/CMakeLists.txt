@@ -21,26 +21,34 @@ if(POLICY CMP0135)
 endif()
 
 # Dependencies of the SDK (and of this plugin): use an installed package when
-# there is one, otherwise fetch it. FIND_PACKAGE_ARGS makes FetchContent try
-# find_package() first.
-FetchContent_Declare(nlohmann_json
-  URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
-  FIND_PACKAGE_ARGS 3.11)
-FetchContent_Declare(fmt
-  URL https://github.com/fmtlib/fmt/archive/refs/tags/12.0.0.tar.gz
-  FIND_PACKAGE_ARGS)
-FetchContent_Declare(FastFloat
-  URL https://github.com/fastfloat/fast_float/archive/refs/tags/v8.0.2.tar.gz
-  FIND_PACKAGE_ARGS)
-set(_savb_deps nlohmann_json fmt FastFloat)
-if(SAVB_BUILD_TESTS)
-  FetchContent_Declare(GTest
-    URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.tar.gz
-    FIND_PACKAGE_ARGS)
-  set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
-  list(APPEND _savb_deps GTest)
+# there is one, otherwise fetch it. find_package() is tried explicitly rather
+# than via FetchContent's FIND_PACKAGE_ARGS, which needs CMake 3.24 (the release
+# builder has 3.22, where the dependencies come from the app's Conan graph).
+# OVERRIDE_FIND_PACKAGE (3.24+) lets the SDK's own find_package() calls resolve
+# to the fetched copies; older CMake can only build with the packages installed.
+set(_savb_fetch)
+set(_savb_override)
+if(NOT CMAKE_VERSION VERSION_LESS 3.24)
+  set(_savb_override OVERRIDE_FIND_PACKAGE)
 endif()
-FetchContent_MakeAvailable(${_savb_deps})
+macro(savb_dependency name url)
+  find_package(${name} ${ARGN} QUIET)
+  if(NOT ${name}_FOUND)
+    FetchContent_Declare(${name} URL ${url} ${_savb_override})
+    list(APPEND _savb_fetch ${name})
+  endif()
+endmacro()
+
+savb_dependency(nlohmann_json https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz 3.11)
+savb_dependency(fmt https://github.com/fmtlib/fmt/archive/refs/tags/12.0.0.tar.gz)
+savb_dependency(FastFloat https://github.com/fastfloat/fast_float/archive/refs/tags/v8.0.2.tar.gz)
+if(SAVB_BUILD_TESTS)
+  set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+  savb_dependency(GTest https://github.com/google/googletest/archive/refs/tags/v1.17.0.tar.gz)
+endif()
+if(_savb_fetch)
+  FetchContent_MakeAvailable(${_savb_fetch})
+endif()
 if(NOT TARGET FastFloat::fast_float AND TARGET fast_float)
   add_library(FastFloat::fast_float ALIAS fast_float)
 endif()
