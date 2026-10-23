@@ -245,7 +245,27 @@ jobs:
           echo "${PJ_RETRO_WAD_SHA256}  ${wad}" | sha256sum -c -
           echo "PJ_RETRO_WAD=${wad}" >> "$GITHUB_ENV"
 
-      - name: Build app and package the AppImage (registry plugins)
+      - name: Build the SAV log loader plugin
+        # In-repo plugin (plugins/data_load_savb) that no registry publishes. Built
+        # against the exact plotjuggler_sdk the app resolved (Conan toolchain) and
+        # laid out as <id>/{manifest.json,lib*_plugin.so} for --plugins-dir.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S plugins/data_load_savb -B build-savb \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/build/conan_toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DSAVB_BUILD_TESTS=OFF
+          cmake --build build-savb -j"$(nproc)"
+          so="$(find build-savb -name 'libsavb_source_plugin.so' | head -n 1)"
+          [[ -n "$so" ]] || { echo "::error::libsavb_source_plugin.so was not produced" >&2; exit 1; }
+          dest="dist-plugins/sav-log-loader"
+          mkdir -p "$dest"
+          cp "$so" "$dest/"
+          cp plugins/data_load_savb/manifest.json "$dest/"
+          ls -l "$dest"
+
+      - name: Build app and package the AppImage (registry + SAV plugins)
         # The app compiles in the jammy container (glibc 2.35 floor); the
         # curated plugin set is downloaded from pj-plugin-registry and
         # checksum-verified by build_appimage.sh --plugins-registry.
@@ -269,9 +289,9 @@ jobs:
           # installer's -CleanReleaseName; dispatch builds need the hash so
           # otherwise-identical-looking artifacts stay distinguishable.
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
-            bash packaging/appimage/build_appimage.sh --plugins-registry --retro-wad "${PJ_RETRO_WAD}"
+            bash packaging/appimage/build_appimage.sh --plugins-registry --plugins-dir dist-plugins --retro-wad "${PJ_RETRO_WAD}"
           else
-            bash packaging/appimage/build_appimage.sh --plugins-registry --retro-wad "${PJ_RETRO_WAD}" \
+            bash packaging/appimage/build_appimage.sh --plugins-registry --plugins-dir dist-plugins --retro-wad "${PJ_RETRO_WAD}" \
                                             --commit-hash "${GITHUB_SHA:0:8}"
           fi
           appimage_path="$(ls -1 packaging/appimage/PlotJuggler-*.AppImage | head -n 1)"

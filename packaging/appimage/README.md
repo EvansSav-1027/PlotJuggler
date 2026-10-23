@@ -55,6 +55,9 @@ There are two ways to bundle them (and a no-plugin default):
   and unpack into `usr/lib/plotjuggler/plugins/<id>/`. Defaults to the registry's
   `development` branch (its default branch — the same ref the Windows installer
   uses); pass a URL to pin a specific ref. This is what the release CI uses.
+- **Both flags together** — the registry set is bundled first, then the
+  `--plugins-dir` folder is copied over it. Release CI uses this to add the
+  in-repo SAV log loader (`plugins/data_load_savb`), which no registry publishes.
 - **(no flag)** — app-only AppImage. Users add plugins later via the in-app
   marketplace or `--plugin-dir`.
 

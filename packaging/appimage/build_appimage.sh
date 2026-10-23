@@ -32,6 +32,10 @@
 #                                                    #   from the plugin registry,
 #                                                    #   verify checksums, unpack
 #
+# The two sources combine: with both flags the registry set is bundled first and
+# the --plugins-dir folder is copied over it (use it for in-repo plugins such as
+# plugins/data_load_savb that no registry publishes).
+#
 # --commit-hash <hash> appends .<hash> to the output filename (PlotJuggler-
 # <version>-<arch>.<hash>.AppImage) — used by release CI on workflow_dispatch
 # (non-tag) builds, where <version> alone would collide across builds. Tag
@@ -130,7 +134,7 @@ BUNDLE_IDS=(
   ros2-topic-subscriber
 )
 
-PLUGINS_MODE="none"        # none | local | registry
+PLUGINS_FROM_REGISTRY=0
 PLUGINS_LOCAL_DIR=""
 COMMIT_HASH=""
 RETRO_WAD=""
@@ -142,14 +146,13 @@ usage() { awk 'NR>1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --plugins-dir)
-      PLUGINS_MODE="local"
       # Canonicalize to an absolute path against the invocation CWD *now*: step 1
       # below cd's into SCRIPT_DIR (packaging/appimage/) before collect_plugins_local reads
       # this, so a relative value would otherwise resolve against packaging/appimage/ rather
       # than where the user ran the command, and silently miss.
       PLUGINS_LOCAL_DIR="$(realpath -m -- "${2:?--plugins-dir needs a path}")"; shift 2 ;;
     --plugins-registry)
-      PLUGINS_MODE="registry"
+      PLUGINS_FROM_REGISTRY=1
       # Optional URL argument (anything not starting with '-').
       if [[ -n "${2:-}" && "${2}" != -* ]]; then REGISTRY_URL="$2"; shift; fi
       shift ;;
@@ -414,11 +417,13 @@ fi
 install -Dm644 "${ROOT}/resources/svg/plotjuggler.svg" \
   "${APPDIR}/usr/share/icons/hicolor/scalable/apps/plotjuggler4.svg"
 
-case "${PLUGINS_MODE}" in
-  local)    collect_plugins_local ;;
-  registry) collect_plugins_registry ;;
-  none)     echo "Plugins: none (app-only AppImage; pass --plugins-dir or --plugins-registry to bundle)" ;;
-esac
+# Registry first, local folder second, so a local plugin overrides a registry
+# one with the same id.
+if [[ "${PLUGINS_FROM_REGISTRY}" == 1 ]]; then collect_plugins_registry; fi
+if [[ -n "${PLUGINS_LOCAL_DIR}" ]]; then collect_plugins_local; fi
+if [[ "${PLUGINS_FROM_REGISTRY}" == 0 && -z "${PLUGINS_LOCAL_DIR}" ]]; then
+  echo "Plugins: none (app-only AppImage; pass --plugins-dir or --plugins-registry to bundle)"
+fi
 
 # ---------------------------------------------------------------------------
 # 5a-bis. Plugin-admission helper.
