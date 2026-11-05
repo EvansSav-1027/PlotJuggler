@@ -72,6 +72,14 @@ QPointF PointSeriesXY::sample(std::size_t index) const {
   return readPoint(pairs_[index]);
 }
 
+Timestamp PointSeriesXY::timestamp(std::size_t index) const {
+  ensureAlignmentIndex();
+  if (index >= pairs_.size() || pairs_[index].y_chunk == nullptr) {
+    return 0;
+  }
+  return pairs_[index].y_chunk->readTimestamp(pairs_[index].y_row);
+}
+
 std::optional<QPointF> PointSeriesXY::sampleFromTime(double display_time_sec) const {
   ensureAlignmentIndex();
   if (pairs_.empty() || session_ == nullptr) {

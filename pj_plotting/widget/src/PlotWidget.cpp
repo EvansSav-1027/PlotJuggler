@@ -19,6 +19,7 @@
 #include <QGuiApplication>
 #include <QIODevice>
 #include <QIcon>
+#include <QInputDialog>
 #include <QMenu>
 #include <QMimeData>
 #include <QMouseEvent>
@@ -30,6 +31,8 @@
 #include <QUuid>
 #include <QVector>
 #include <algorithm>
+#include <memory>
+#include <numeric>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -45,6 +48,8 @@
 #ifndef PJ_TARGET_WASM
 #include "pj_plotting/MapTileItem.h"
 #include "pj_plotting/MapTileProvider.h"
+#include "pj_plotting/TrackColorItem.h"
+#include "pj_plotting/TrackValueSeries.h"
 #endif
 #include "pj_plotting/PlotXml.h"
 #include "pj_plotting/PointSeriesXY.h"
@@ -204,6 +209,20 @@ PlotWidget::PlotWidget(SessionManager* session, CatalogModel* catalog, QWidget* 
   map_replot_debounce_.setSingleShot(true);
   map_replot_debounce_.setInterval(40);
   connect(&map_replot_debounce_, &QTimer::timeout, this, [this]() { replot(); });
+
+  // Track colouring by a third field; hidden until a field is chosen.
+  track_color_item_ = new TrackColorItem();
+  track_color_item_->setVisible(false);
+  track_color_item_->setTracksProvider([this]() {
+    std::vector<const PointSeriesXY*> tracks;
+    for (const CurveInfo& info : curveList()) {
+      if (const auto* series = info.curve != nullptr ? dynamic_cast<const PointSeriesXY*>(info.curve->data()) : nullptr) {
+        tracks.push_back(series);
+      }
+    }
+    return tracks;
+  });
+  track_color_item_->attach(qwtPlot());
   connect(&MapTileProvider::instance(), &MapTileProvider::tileReady, this, [this]() {
     if (map_item_ != nullptr && map_item_->isVisible()) {
       map_replot_debounce_.start();
@@ -240,6 +259,7 @@ PlotWidget::PlotWidget(SessionManager* session, CatalogModel* catalog, QWidget* 
     pruneHiddenMarkerScopes();
     (void)refreshMarkerScopeRowSet();  // curveListChanged itself is the rebuild trigger
     refreshMapBackground();
+    refreshTrackColor();
   });
   connect(this, &PlotWidgetBase::dragEnterSignal, this, &PlotWidget::onDragEnterEvent);
   connect(this, &PlotWidgetBase::dragLeaveSignal, this, &PlotWidget::onDragLeaveEvent);
@@ -257,6 +277,10 @@ PlotWidget::~PlotWidget() {
   if (map_item_ != nullptr) {
     map_item_->detach();
     delete map_item_;
+  }
+  if (track_color_item_ != nullptr) {
+    track_color_item_->detach();
+    delete track_color_item_;
   }
 #endif
   delete tracker_;
@@ -731,6 +755,11 @@ QDomElement PlotWidget::xmlSaveState(QDomDocument& doc) const {
   if (map_background_enabled_) {
     plot_element.setAttribute(u"map_background"_s, u"satellite"_s);
   }
+  if (!track_color_topic_.isEmpty()) {
+    plot_element.setAttribute(u"track_color_topic"_s, track_color_topic_);
+    plot_element.setAttribute(u"track_color_field"_s, track_color_field_);
+    plot_element.setAttribute(u"track_color_map"_s, static_cast<int>(track_color_map_));
+  }
 
   // Skip the <range> element when the canvas has not yet computed a real
   // viewport (e.g. drop happened immediately before save) -- a degenerate
@@ -925,6 +954,11 @@ bool PlotWidget::xmlLoadState(const QDomElement& plot_element, bool autozoom) {
   setDefaultStyle(curveStyleFromString(style_attr));
   setTrackerEnabled(plot_element.attribute(u"tracker_enabled"_s, u"true"_s) == "true"_L1);
   setMapBackgroundEnabled(plot_element.attribute(u"map_background"_s) == "satellite"_L1);
+  {
+    const int map_id = plot_element.attribute(u"track_color_map"_s).toInt();
+    setTrackColormap(map_id >= 0 && map_id < kColormapCount ? static_cast<Colormap>(map_id) : Colormap::kTurbo);
+    setTrackColorField(plot_element.attribute(u"track_color_topic"_s), plot_element.attribute(u"track_color_field"_s));
+  }
   qwtPlot()->setTitle(plot_element.attribute(u"title"_s));
 
   const bool was_loading_state = loading_state_;
@@ -1954,6 +1988,24 @@ void PlotWidget::canvasContextMenuTriggered(const QPoint& pos) {
       setMapBackgroundEnabled(checked);
       emit undoableChange();
     });
+    QMenu* color_menu = menu.addMenu(tr("Color Track By"));
+    color_menu->addAction(tr("Field..."), this, [this]() { chooseTrackColorField(); });
+    QAction* clear_color = color_menu->addAction(tr("Clear"), this, [this]() {
+      setTrackColorField(QString(), QString());
+      emit undoableChange();
+    });
+    clear_color->setEnabled(trackColorRequested());
+    color_menu->addSeparator();
+    for (int i = 0; i < kColormapCount; ++i) {
+      const auto colormap = static_cast<Colormap>(i);
+      QAction* action = color_menu->addAction(tr(colormapName(colormap)), this, [this, colormap]() {
+        setTrackColormap(colormap);
+        emit undoableChange();
+      });
+      action->setCheckable(true);
+      action->setChecked(colormap == track_color_map_);
+      action->setEnabled(trackColorRequested());
+    }
     addActionCategorySeparator(menu);
   }
 #endif
@@ -1973,6 +2025,7 @@ void PlotWidget::canvasContextMenuTriggered(const QPoint& pos) {
 void PlotWidget::setModeXY(bool enable) {
   PlotWidgetBase::setModeXY(enable);
   refreshMapBackground();
+  refreshTrackColor();
 }
 
 void PlotWidget::setMapBackgroundEnabled(bool enabled) {
@@ -2006,6 +2059,137 @@ bool PlotWidget::isGeographicPlot() const {
     }
   }
   return true;
+#endif
+}
+
+void PlotWidget::setTrackColorField(const QString& topic_name, const QString& field_path) {
+#ifdef PJ_TARGET_WASM
+  (void)topic_name;
+  (void)field_path;
+#else
+  track_color_topic_ = topic_name;
+  track_color_field_ = topic_name.isEmpty() ? QString() : field_path;
+  refreshTrackColor();
+#endif
+}
+
+void PlotWidget::setTrackColormap(Colormap colormap) {
+#ifdef PJ_TARGET_WASM
+  (void)colormap;
+#else
+  track_color_map_ = colormap;
+  if (track_color_item_ != nullptr && track_color_item_->colormap() != colormap) {
+    track_color_item_->setColormap(colormap);
+    if (track_color_item_->isVisible()) {
+      replot();
+    }
+  }
+#endif
+}
+
+void PlotWidget::refreshTrackColor() {
+#ifndef PJ_TARGET_WASM
+  if (track_color_item_ == nullptr) {
+    return;
+  }
+  std::optional<CurveDescriptor> field;
+  if (!track_color_topic_.isEmpty() && catalog_ != nullptr && session_ != nullptr && isGeographicPlot()) {
+    // The colour field must share the track's dataset: the two are matched by raw timestamp.
+    std::optional<DatasetId> dataset;
+    for (const CurveInfo& info : curveList()) {
+      if (const auto* series = info.curve != nullptr ? dynamic_cast<const PointSeriesXY*>(info.curve->data()) : nullptr) {
+        dataset = series->ySource().dataset_id;
+        break;
+      }
+    }
+    if (dataset.has_value()) {
+      for (const CurveDescriptor& candidate : catalog_->curves()) {
+        if (candidate.dataset_id == *dataset && candidate.topic_name == track_color_topic_ &&
+            candidate.field_path == track_color_field_) {
+          field = candidate;
+          break;
+        }
+      }
+    }
+  }
+
+  const TrackValueSeries* current = track_color_item_->valueSeries();
+  bool changed = false;
+  if (!field.has_value()) {
+    changed = current != nullptr || track_color_item_->isVisible();
+    track_color_item_->setValueSeries(nullptr);
+    track_color_item_->setVisible(false);
+  } else {
+    if (current == nullptr || current->source().name != field->name) {
+      track_color_item_->setValueSeries(std::make_unique<TrackValueSeries>(session_, *field));
+      changed = true;
+    }
+    track_color_item_->setColormap(track_color_map_);
+    if (!track_color_item_->isVisible()) {
+      track_color_item_->setVisible(true);
+      changed = true;
+    }
+  }
+  if (changed) {
+    replot();
+  }
+#endif
+}
+
+void PlotWidget::chooseTrackColorField() {
+#ifndef PJ_TARGET_WASM
+  if (catalog_ == nullptr) {
+    return;
+  }
+  std::optional<DatasetId> dataset;
+  std::set<QString> excluded;
+  for (const CurveInfo& info : curveList()) {
+    if (const auto* series = info.curve != nullptr ? dynamic_cast<const PointSeriesXY*>(info.curve->data()) : nullptr) {
+      dataset = series->ySource().dataset_id;
+      excluded.insert(series->xSource().name);
+      excluded.insert(series->ySource().name);
+    }
+  }
+  if (!dataset.has_value()) {
+    return;
+  }
+  QStringList labels;
+  std::vector<CurveDescriptor> fields;
+  for (const CurveDescriptor& candidate : catalog_->curves()) {
+    if (candidate.dataset_id != *dataset || excluded.contains(candidate.name)) {
+      continue;
+    }
+    labels << (candidate.field_path == "value"_L1 ? candidate.topic_name
+                                                  : candidate.topic_name + u"/"_s + candidate.field_path);
+    fields.push_back(candidate);
+  }
+  if (fields.empty()) {
+    return;
+  }
+  // Sorted by label so the editable combo's type-ahead is predictable.
+  std::vector<std::size_t> order(fields.size());
+  std::iota(order.begin(), order.end(), std::size_t{0});
+  std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return labels[a] < labels[b]; });
+  QStringList sorted_labels;
+  int current = 0;
+  for (std::size_t rank = 0; rank < order.size(); ++rank) {
+    const CurveDescriptor& field = fields[order[rank]];
+    sorted_labels << labels[order[rank]];
+    if (field.topic_name == track_color_topic_ && field.field_path == track_color_field_) {
+      current = static_cast<int>(rank);
+    }
+  }
+  bool accepted = false;
+  const QString chosen = QInputDialog::getItem(
+      qwtPlot(), tr("Color Track By"), tr("Field (type to filter, e.g. sonar depth):"), sorted_labels, current,
+      /*editable=*/true, &accepted);
+  const int index = sorted_labels.indexOf(chosen);
+  if (!accepted || index < 0) {
+    return;
+  }
+  const CurveDescriptor& picked = fields[order[static_cast<std::size_t>(index)]];
+  setTrackColorField(picked.topic_name, picked.field_path);
+  emit undoableChange();
 #endif
 }
 
@@ -2242,6 +2426,13 @@ void PlotWidget::reconnectDataSignals() {
   samples_ingested_connection_ =
       connect(session_, &SessionManager::samplesIngested, this, [this](const QVector<TopicId>& ids, bool live) {
         bool changed = false;
+#ifndef PJ_TARGET_WASM
+        if (track_color_item_ != nullptr && track_color_item_->valueSeries() != nullptr &&
+            std::find(ids.begin(), ids.end(), track_color_item_->valueSeries()->source().topic_id) != ids.end()) {
+          track_color_item_->valueSeries()->onTopicCommitted();
+          changed = true;
+        }
+#endif
         for (auto& info : curveList()) {
           auto* adapter = dynamic_cast<DatastoreCurveAdapter*>(info.curve->data());
           if (adapter != nullptr) {
@@ -2286,6 +2477,12 @@ void PlotWidget::reconnectDataSignals() {
   dataset_replace_connection_ = connect(
       session_, &SessionManager::datasetAboutToBeReplaced, this,
       [this](DatasetId dataset_id) {
+#ifndef PJ_TARGET_WASM
+        if (track_color_item_ != nullptr && track_color_item_->valueSeries() != nullptr &&
+            track_color_item_->valueSeries()->source().dataset_id == dataset_id) {
+          track_color_item_->valueSeries()->onDataCleared();
+        }
+#endif
         for (auto& info : curveList()) {
           if (auto* adapter = dynamic_cast<DatastoreCurveAdapter*>(info.curve->data())) {
             if (adapter->source().dataset_id == dataset_id) {

@@ -25,6 +25,7 @@
 #include "pj_runtime/CurveDescriptor.h"
 #include "pj_runtime/MarkerTopics.h"
 #include "pj_runtime/Time.h"
+#include "pj_widgets/Colormap.h"
 
 class QDragEnterEvent;
 class QDragLeaveEvent;
@@ -37,6 +38,7 @@ class CatalogModel;
 class SessionManager;
 class PlotMarkersItem;
 class MapTileItem;
+class TrackColorItem;
 struct MarkerTarget;  // pj_plotting/PlotMarkersItem.h
 
 // Identifies one dataset's marker scope — the CurveEditor pseudo-row unit and
@@ -114,6 +116,18 @@ class PlotWidget : public PlotWidgetBase {
   /// on Y (geoAxisRoleOf on the field names). Time series, local metric XY, and
   /// lat-on-X plots are not.
   [[nodiscard]] bool isGeographicPlot() const;
+
+  /// Colours a lat/lon position track by a third scalar field of the same dataset
+  /// (e.g. sonar depth), identified by its (topic, field path) so the choice
+  /// survives reloads; empty `topic_name` clears it. Shown only while the plot is
+  /// geographic (see isGeographicPlot()) and the field resolves in the track's
+  /// dataset; the request is kept meanwhile and persisted in the plot XML. No-op
+  /// on WebAssembly.
+  void setTrackColorField(const QString& topic_name, const QString& field_path);
+  [[nodiscard]] bool trackColorRequested() const noexcept {
+    return !track_color_topic_.isEmpty();
+  }
+  void setTrackColormap(Colormap colormap);
 
   void setModeXY(bool enable) override;
 
@@ -379,6 +393,15 @@ class PlotWidget : public PlotWidgetBase {
   PlotMarkersItem* markers_item_ = nullptr;
   MapTileItem* map_item_ = nullptr;  // null on WebAssembly
   bool map_background_enabled_ = false;
+  TrackColorItem* track_color_item_ = nullptr;  // null on WebAssembly
+  QString track_color_topic_;
+  QString track_color_field_;
+  Colormap track_color_map_ = Colormap::kTurbo;
+  /// Resolves the requested colour field in the track's dataset and shows/hides
+  /// the item accordingly; replots only on change.
+  void refreshTrackColor();
+  /// Picker over the scalar fields of the track's dataset; applies the choice.
+  void chooseTrackColorField();
   /// Shows the underlay iff requested and isGeographicPlot(); replots only on change.
   void refreshMapBackground();
   // Coalesces the burst of MapTileProvider::tileReady() signals into one replot.

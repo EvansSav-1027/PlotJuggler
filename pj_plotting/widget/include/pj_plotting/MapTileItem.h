@@ -55,7 +55,7 @@ class MapTileItem : public QwtPlotItem {
       QPainter* painter, const QwtScaleMap& xMap, const QwtScaleMap& yMap, const QImage& image, const QRectF& source,
       int z, int x, int y) const;
 
-  /// Paint the provider's attribution in the canvas' bottom-right corner (CPU-rasterized; see RasterTextEngine).
+  /// Paint the provider's attribution in the canvas' bottom-right corner.
   static void drawAttribution(QPainter* painter, const QRectF& canvasRect);
 };
 

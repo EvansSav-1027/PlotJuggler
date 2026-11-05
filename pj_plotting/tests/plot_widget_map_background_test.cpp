@@ -10,10 +10,12 @@
 
 #include <QDomDocument>
 #include <string_view>
+#include <vector>
 
 #include "pj_datastore/writer.hpp"
 #include "pj_plotting/MapTileItem.h"
 #include "pj_plotting/PlotWidget.h"
+#include "pj_plotting/TrackValueSeries.h"
 #include "pj_runtime/CatalogModel.h"
 #include "pj_runtime/SessionManager.h"
 using namespace Qt::StringLiterals;
@@ -21,14 +23,17 @@ using namespace Qt::StringLiterals;
 namespace {
 
 QString addScalarTopic(
-    PJ::SessionManager& session, PJ::CatalogModel& catalog, PJ::DatasetId dataset_id, std::string_view topic_name) {
+    PJ::SessionManager& session, PJ::CatalogModel& catalog, PJ::DatasetId dataset_id, std::string_view topic_name,
+    const std::vector<double>& values = {1.0}) {
   PJ::DataWriter writer = session.dataEngine().createWriter();
   auto handle_or = writer.registerScalarSeries(dataset_id, topic_name, PJ::NumericType::kFloat64);
   EXPECT_TRUE(handle_or.has_value()) << handle_or.error();
   if (!handle_or.has_value()) {
     return {};
   }
-  writer.appendScalar(*handle_or, 1'000'000'000, 1.0);
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    writer.appendScalar(*handle_or, static_cast<PJ::Timestamp>(i + 1) * 1'000'000'000, values[i]);
+  }
   EXPECT_FALSE(session.commitChunks(writer.flushAll()).empty());
   for (const auto& curve : catalog.curves()) {
     if (const auto descriptor = catalog.curveDescriptor(curve.name);
@@ -49,8 +54,8 @@ struct Fixture {
     EXPECT_TRUE(created.has_value());
     dataset = created.has_value() ? *created : 0;
   }
-  QString key(std::string_view topic) {
-    return addScalarTopic(session, catalog, dataset, topic);
+  QString key(std::string_view topic, const std::vector<double>& values = {1.0}) {
+    return addScalarTopic(session, catalog, dataset, topic, values);
   }
 };
 
@@ -122,4 +127,51 @@ TEST(PlotWidgetMapBackground, OffByDefaultAndRoundTripsThroughPlotXml) {
   // Loading a snapshot without the attribute (e.g. undo past the toggle) turns it off.
   ASSERT_TRUE(restored.xmlLoadState(off, /*autozoom=*/false));
   EXPECT_FALSE(restored.mapBackgroundEnabled());
+}
+
+// The colour field is read as a step function of raw time: a sample holds until the next.
+TEST(TrackValueSeries, ValueHoldsUntilNextSampleAndReportsRange) {
+  Fixture f;
+  const QString depth = f.key("/sonar/depth", {5.0, 10.0, 20.0});
+  const auto descriptor = f.catalog.curveDescriptor(depth);
+  ASSERT_TRUE(descriptor.has_value());
+
+  PJ::TrackValueSeries series(&f.session, *descriptor);
+  EXPECT_FALSE(series.valueAtOrBefore(500'000'000).has_value());  // before the first sample
+  EXPECT_EQ(series.valueAtOrBefore(1'000'000'000), 5.0);
+  EXPECT_EQ(series.valueAtOrBefore(2'500'000'000), 10.0);
+  EXPECT_EQ(series.valueAtOrBefore(9'000'000'000), 20.0);
+  ASSERT_TRUE(series.valueRange().has_value());
+  EXPECT_DOUBLE_EQ(series.valueRange()->min, 5.0);
+  EXPECT_DOUBLE_EQ(series.valueRange()->max, 20.0);
+}
+
+TEST(PlotWidgetMapBackground, TrackColorFieldRoundTripsThroughPlotXml) {
+  Fixture f;
+  const QString lon = f.key("/gps/lon");
+  const QString lat = f.key("/gps/lat");
+  f.key("/sonar/depth", {5.0, 10.0, 20.0});
+
+  PJ::PlotWidget source(&f.session, &f.catalog);
+  source.setModeXY(true);
+  ASSERT_NE(source.addCurveXY(lon, lat, u"track"_s), nullptr);
+  EXPECT_FALSE(source.trackColorRequested());
+
+  source.setTrackColorField(u"/sonar/depth"_s, u"value"_s);
+  source.setTrackColormap(PJ::Colormap::kViridis);
+  QDomDocument doc;
+  const QDomElement on = source.xmlSaveState(doc);
+  EXPECT_EQ(on.attribute(u"track_color_topic"_s), u"/sonar/depth"_s);
+  EXPECT_EQ(on.attribute(u"track_color_field"_s), u"value"_s);
+  EXPECT_EQ(on.attribute(u"track_color_map"_s).toInt(), static_cast<int>(PJ::Colormap::kViridis));
+
+  PJ::PlotWidget restored(&f.session, &f.catalog);
+  ASSERT_TRUE(restored.xmlLoadState(on, /*autozoom=*/false));
+  EXPECT_TRUE(restored.trackColorRequested());
+
+  source.setTrackColorField(QString(), QString());
+  QDomDocument cleared_doc;
+  EXPECT_FALSE(source.xmlSaveState(cleared_doc).hasAttribute(u"track_color_topic"_s));
+  ASSERT_TRUE(restored.xmlLoadState(source.xmlSaveState(cleared_doc), /*autozoom=*/false));
+  EXPECT_FALSE(restored.trackColorRequested());
 }

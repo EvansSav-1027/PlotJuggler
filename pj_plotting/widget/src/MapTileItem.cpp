@@ -4,9 +4,7 @@
 
 #include <qwt_scale_map.h>
 
-#include <QFontMetricsF>
 #include <QImage>
-#include <QPaintDevice>
 #include <QPainter>
 #include <QRegularExpression>
 #include <QTransform>
@@ -15,6 +13,7 @@
 #include <numbers>
 
 #include "pj_plotting/MapTileProvider.h"
+#include "pj_plotting/RasterLabel.h"
 
 namespace PJ {
 namespace {
@@ -168,31 +167,8 @@ void MapTileItem::drawTile(
 
 void MapTileItem::drawAttribution(QPainter* painter, const QRectF& canvasRect) {
   const QString text = MapTileProvider::instance().attribution();
-  if (text.isEmpty()) {
-    return;
-  }
-  QFont font = painter->font();
-  font.setPointSizeF(7.5);
-  const QFontMetricsF metrics(font);
-  const QSizeF size(metrics.horizontalAdvance(text) + 8.0, metrics.height() + 2.0);
-
-  // Rasterized on the CPU each paint and never cached: GL glyph atlases and
-  // resident textures do not survive a GPU reset (see RasterTextEngine.h).
-  const double device_ratio = painter->device() != nullptr ? painter->device()->devicePixelRatioF() : 1.0;
-  const double dpr = std::max(1.0, device_ratio * std::abs(painter->worldTransform().m11()));
-  QImage label(
-      static_cast<int>(std::ceil(size.width() * dpr)), static_cast<int>(std::ceil(size.height() * dpr)),
-      QImage::Format_ARGB32_Premultiplied);
-  label.setDevicePixelRatio(dpr);
-  label.fill(QColor(0, 0, 0, 140));
-  {
-    QPainter text_painter(&label);
-    text_painter.setRenderHint(QPainter::TextAntialiasing, true);
-    text_painter.setFont(font);
-    text_painter.setPen(QColor(235, 235, 235));
-    text_painter.drawText(QRectF(QPointF(0, 0), size), Qt::AlignCenter, text);
-  }
-  painter->drawImage(QPointF(canvasRect.right() - size.width(), canvasRect.bottom() - size.height()), label);
+  const QSizeF size = rasterLabelSize(painter, text);
+  drawRasterLabel(painter, QPointF(canvasRect.right() - size.width(), canvasRect.bottom() - size.height()), text);
 }
 
 }  // namespace PJ

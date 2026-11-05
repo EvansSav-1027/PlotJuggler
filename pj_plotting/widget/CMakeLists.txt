@@ -112,6 +112,10 @@ else()
   target_sources(pj_plotting PRIVATE
     src/MapTileItem.cpp
     src/MapTileProvider.cpp
+    src/RasterLabel.cpp
+    src/TrackColorItem.cpp
+    include/pj_plotting/RasterLabel.h
+    include/pj_plotting/TrackColorItem.h
     include/pj_plotting/MapTileItem.h
     include/pj_plotting/MapTileProvider.h
   )
