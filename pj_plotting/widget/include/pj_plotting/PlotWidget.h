@@ -36,6 +36,7 @@ namespace PJ {
 class CatalogModel;
 class SessionManager;
 class PlotMarkersItem;
+class MapTileItem;
 struct MarkerTarget;  // pj_plotting/PlotMarkersItem.h
 
 // Identifies one dataset's marker scope — the CurveEditor pseudo-row unit and
@@ -98,6 +99,23 @@ class PlotWidget : public PlotWidgetBase {
   // or Y source is gone), keeps the rest. One replot; returns whether anything
   // changed. Symmetric with IObjectViewer::revalidateObjects.
   bool revalidate();
+
+  /// User request for the satellite imagery underlay (MapTileItem). It is drawn
+  /// only while the plot is geographic (see isGeographicPlot()), so the
+  /// request survives curve/mode changes that temporarily disqualify the plot.
+  /// Persisted in the plot XML. No-op on WebAssembly, whose QRhi canvas cannot
+  /// render the underlay.
+  void setMapBackgroundEnabled(bool enabled);
+  [[nodiscard]] bool mapBackgroundEnabled() const noexcept {
+    return map_background_enabled_;
+  }
+  /// Whether this is a lat/lon position plot — the only kind the map applies to:
+  /// an XY plot whose every curve has a longitude field on X and a latitude field
+  /// on Y (geoAxisRoleOf on the field names). Time series, local metric XY, and
+  /// lat-on-X plots are not.
+  [[nodiscard]] bool isGeographicPlot() const;
+
+  void setModeXY(bool enable) override;
 
   void setZoomRectangle(QRectF rect, bool emit_signal);
   // Applies [x0, x1] as the visible X window, leaving Y exactly as it was, and
@@ -359,6 +377,12 @@ class PlotWidget : public PlotWidgetBase {
   Timestamp last_global_time_reference_ = 0;
   DragInfo dragging_;
   PlotMarkersItem* markers_item_ = nullptr;
+  MapTileItem* map_item_ = nullptr;  // null on WebAssembly
+  bool map_background_enabled_ = false;
+  /// Shows the underlay iff requested and isGeographicPlot(); replots only on change.
+  void refreshMapBackground();
+  // Coalesces the burst of MapTileProvider::tileReady() signals into one replot.
+  QTimer map_replot_debounce_;
   CurveTracker* tracker_ = nullptr;
   CurveTracker* reference_tracker_ = nullptr;
   bool tracker_enabled_ = true;

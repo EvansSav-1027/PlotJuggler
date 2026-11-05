@@ -1,7 +1,7 @@
 if(EMSCRIPTEN)
     find_package(Qt6 REQUIRED COMPONENTS Core Gui GuiPrivate Widgets Xml ShaderTools)
 else()
-    find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets OpenGLWidgets Xml)
+    find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets OpenGLWidgets Xml Network)
 endif()
 
 add_library(pj_plotting STATIC
@@ -107,5 +107,13 @@ if(EMSCRIPTEN)
       shaders/plot_text.frag
   )
 else()
-  target_link_libraries(pj_plotting PUBLIC Qt6::OpenGLWidgets)
+  # Satellite map underlay for XY plots: desktop-only, since PlotRhiCanvas
+  # renders only the Qwt item types it knows and browsers need CORS tile servers.
+  target_sources(pj_plotting PRIVATE
+    src/MapTileItem.cpp
+    src/MapTileProvider.cpp
+    include/pj_plotting/MapTileItem.h
+    include/pj_plotting/MapTileProvider.h
+  )
+  target_link_libraries(pj_plotting PUBLIC Qt6::OpenGLWidgets PRIVATE Qt6::Network)
 endif()

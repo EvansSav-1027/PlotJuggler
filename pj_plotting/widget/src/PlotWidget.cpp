@@ -42,6 +42,10 @@
 #include "pj_plotting/DatastoreCurveAdapter.h"
 #include "pj_plotting/PlotLegend.h"
 #include "pj_plotting/PlotMarkersItem.h"
+#ifndef PJ_TARGET_WASM
+#include "pj_plotting/MapTileItem.h"
+#include "pj_plotting/MapTileProvider.h"
+#endif
 #include "pj_plotting/PlotXml.h"
 #include "pj_plotting/PointSeriesXY.h"
 #include "pj_plotting/XYCurveDialog.h"
@@ -191,6 +195,22 @@ PlotWidget::PlotWidget(SessionManager* session, CatalogModel* catalog, QWidget* 
   markers_item_->setTargetsProvider([this]() { return markerTargets(); });
   markers_item_->attach(qwtPlot());
 
+#ifndef PJ_TARGET_WASM
+  // Satellite underlay, off until the user asks for it on an XY plot. Tiles
+  // arrive asynchronously; each arrival only needs one coalesced replot.
+  map_item_ = new MapTileItem();
+  map_item_->setVisible(false);
+  map_item_->attach(qwtPlot());
+  map_replot_debounce_.setSingleShot(true);
+  map_replot_debounce_.setInterval(40);
+  connect(&map_replot_debounce_, &QTimer::timeout, this, [this]() { replot(); });
+  connect(&MapTileProvider::instance(), &MapTileProvider::tileReady, this, [this]() {
+    if (map_item_ != nullptr && map_item_->isVisible()) {
+      map_replot_debounce_.start();
+    }
+  });
+#endif
+
   // Mouse-hover inspector. Shows a snap-to-curve dot + value tooltip wherever
   // the mouse points, gated by show_points_. Independent from the playback
   // tracker (tracker_): the playback line always shows the current
@@ -219,6 +239,7 @@ PlotWidget::PlotWidget(SessionManager* session, CatalogModel* catalog, QWidget* 
     autoZoomPlotVertically();
     pruneHiddenMarkerScopes();
     (void)refreshMarkerScopeRowSet();  // curveListChanged itself is the rebuild trigger
+    refreshMapBackground();
   });
   connect(this, &PlotWidgetBase::dragEnterSignal, this, &PlotWidget::onDragEnterEvent);
   connect(this, &PlotWidgetBase::dragLeaveSignal, this, &PlotWidget::onDragLeaveEvent);
@@ -232,6 +253,12 @@ PlotWidget::~PlotWidget() {
     markers_item_->detach();
     delete markers_item_;
   }
+#ifndef PJ_TARGET_WASM
+  if (map_item_ != nullptr) {
+    map_item_->detach();
+    delete map_item_;
+  }
+#endif
   delete tracker_;
   delete reference_tracker_;
   if (show_point_marker_ != nullptr) {
@@ -701,6 +728,9 @@ QDomElement PlotWidget::xmlSaveState(QDomDocument& doc) const {
   plot_element.setAttribute(u"style"_s, curveStyleToString(curveStyle()));
   plot_element.setAttribute(u"title"_s, qwtPlot()->title().text());
   plot_element.setAttribute(u"tracker_enabled"_s, tracker_enabled_ ? u"true"_s : u"false"_s);
+  if (map_background_enabled_) {
+    plot_element.setAttribute(u"map_background"_s, u"satellite"_s);
+  }
 
   // Skip the <range> element when the canvas has not yet computed a real
   // viewport (e.g. drop happened immediately before save) -- a degenerate
@@ -894,6 +924,7 @@ bool PlotWidget::xmlLoadState(const QDomElement& plot_element, bool autozoom) {
   }
   setDefaultStyle(curveStyleFromString(style_attr));
   setTrackerEnabled(plot_element.attribute(u"tracker_enabled"_s, u"true"_s) == "true"_L1);
+  setMapBackgroundEnabled(plot_element.attribute(u"map_background"_s) == "satellite"_L1);
   qwtPlot()->setTitle(plot_element.attribute(u"title"_s));
 
   const bool was_loading_state = loading_state_;
@@ -1914,6 +1945,18 @@ void PlotWidget::canvasContextMenuTriggered(const QPoint& pos) {
   menu.addAction(action_split_horizontal_);
   menu.addAction(action_split_vertical_);
   addActionCategorySeparator(menu);
+#ifndef PJ_TARGET_WASM
+  if (isGeographicPlot()) {
+    QAction* show_map = menu.addAction(tr("Satellite Map Background"));
+    show_map->setCheckable(true);
+    show_map->setChecked(map_background_enabled_);
+    connect(show_map, &QAction::toggled, this, [this](bool checked) {
+      setMapBackgroundEnabled(checked);
+      emit undoableChange();
+    });
+    addActionCategorySeparator(menu);
+  }
+#endif
   menu.addAction(action_zoom_out_);
   menu.addAction(action_zoom_out_horizontal_);
   menu.addAction(action_zoom_out_vertical_);
@@ -1924,6 +1967,58 @@ void PlotWidget::canvasContextMenuTriggered(const QPoint& pos) {
   menu.popup(qwtPlot()->canvas()->mapToGlobal(pos));
 #else
   menu.exec(qwtPlot()->canvas()->mapToGlobal(pos));
+#endif
+}
+
+void PlotWidget::setModeXY(bool enable) {
+  PlotWidgetBase::setModeXY(enable);
+  refreshMapBackground();
+}
+
+void PlotWidget::setMapBackgroundEnabled(bool enabled) {
+#ifdef PJ_TARGET_WASM
+  (void)enabled;
+#else
+  map_background_enabled_ = enabled;
+  refreshMapBackground();
+#endif
+}
+
+bool PlotWidget::isGeographicPlot() const {
+#ifdef PJ_TARGET_WASM
+  return false;
+#else
+  if (!isXYPlot() || curveList().empty()) {
+    return false;
+  }
+  // The field inside its topic names the series ("GPS/Lat" in a log topic); a
+  // bare scalar series carries its name on the topic instead ("/gps/lat" with
+  // a generic "value" field).
+  const auto role = [](const CurveDescriptor& source) {
+    const GeoAxisRole by_field = geoAxisRoleOf(source.field_path);
+    return by_field != GeoAxisRole::kNone ? by_field : geoAxisRoleOf(source.topic_name);
+  };
+  for (const CurveInfo& info : curveList()) {
+    const auto* series = info.curve != nullptr ? dynamic_cast<const PointSeriesXY*>(info.curve->data()) : nullptr;
+    if (series == nullptr || role(series->xSource()) != GeoAxisRole::kLongitude ||
+        role(series->ySource()) != GeoAxisRole::kLatitude) {
+      return false;
+    }
+  }
+  return true;
+#endif
+}
+
+void PlotWidget::refreshMapBackground() {
+#ifndef PJ_TARGET_WASM
+  if (map_item_ == nullptr) {
+    return;
+  }
+  const bool visible = map_background_enabled_ && isGeographicPlot();
+  if (map_item_->isVisible() != visible) {
+    map_item_->setVisible(visible);
+    replot();
+  }
 #endif
 }
 
