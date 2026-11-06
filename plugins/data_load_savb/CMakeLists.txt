@@ -67,8 +67,8 @@ if(NOT plotjuggler_sdk_FOUND)
   # consumed as-is, so only this plugin's own code is built with -Werror.
   set(PJ_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(plotjuggler_sdk
-    URL https://github.com/PlotJuggler/plotjuggler_sdk/archive/refs/tags/v0.34.1.tar.gz
-    URL_HASH SHA256=b42b3d53f13cd495c3e8a73e5728503b1cc6949c9dd820e164ba449f22349c32)
+    URL https://github.com/PlotJuggler/plotjuggler_sdk/archive/refs/tags/v0.39.0.tar.gz
+    URL_HASH SHA256=42aef7e2229b68e198ab97212ab4df05dcacfdaed5c26aecabef045238890f1e)
   FetchContent_MakeAvailable(plotjuggler_sdk)
 endif()
 
