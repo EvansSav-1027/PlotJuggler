@@ -45,8 +45,6 @@ struct Field {
 
 /// A message type, from its FMT record.
 struct Format {
-  static constexpr uint8_t kFlagSticky = 0x01;  ///< logged on change only; values hold until the next one
-
   uint8_t id = 0;
   uint8_t length = 0;  ///< payload bytes, excluding the 3-byte message header
   uint8_t flags = 0;

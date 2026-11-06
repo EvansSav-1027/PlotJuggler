@@ -334,7 +334,7 @@ TEST_F(SavbSourceTest, OneRecordPerTickWithTheRowsCells) {
   EXPECT_DOUBLE_EQ(num(1, "seq"), 1.0);
 }
 
-TEST_F(SavbSourceTest, StickyValuesAreCarriedOntoEveryLaterRow) {
+TEST_F(SavbSourceTest, StickyValuesAppearOnlyOnTheRowTheyWereLoggedOn) {
   auto b = makePreamble();
   tick(b, 0, kEpoch, 0);
   b.header(kMode);
@@ -344,8 +344,10 @@ TEST_F(SavbSourceTest, StickyValuesAreCarriedOntoEveryLaterRow) {
   tick(b, 2, kEpoch + 2, 2);
   ASSERT_TRUE(import(b.bytes()));
   ASSERT_EQ(write_.records.size(), 3u);
+  EXPECT_DOUBLE_EQ(num(0, "STATUS/operator_mode"), 2.0);
+  EXPECT_FALSE(has(1, "STATUS/operator_mode"));  // not carried forward
+  EXPECT_FALSE(has(2, "STATUS/operator_mode"));
   for (size_t r = 0; r < 3; ++r) {
-    EXPECT_DOUBLE_EQ(num(r, "STATUS/operator_mode"), 2.0) << r;
     EXPECT_FALSE(has(r, "STATUS/active_behavior")) << r;  // text: not plotted
   }
 }

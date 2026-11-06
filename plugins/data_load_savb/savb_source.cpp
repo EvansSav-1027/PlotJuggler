@@ -7,9 +7,9 @@
 // one topic named after the file, one float64 field per numeric CSV column
 // (the column order stored in the log's header, names verbatim), one record
 // per CSV row (one per logged TICK) holding that row's non-blank cells. The
-// row is built the way the decoder builds it — sticky messages carried
-// forward, CAL kept out of the rows, derived columns recomputed — so a layout
-// made for the CSV works on the .bin unchanged.
+// row is built the way the decoder builds it — only what was logged on that
+// tick (nothing carried forward), CAL kept out of the rows, derived columns
+// recomputed — so a layout made for the CSV works on the .bin unchanged.
 
 #include <algorithm>
 #include <chrono>
@@ -167,7 +167,6 @@ class SavbSource : public PJ::FileSourceBase {
     // Older logs carry the *_utc names.
     text_labels_ = {"TIME/host_time", "GPS/time", "TIME/host_time_utc", "GPS/time_utc"};
     cal_.clear();
-    sticky_.clear();
     row_.reset();
     fields_.clear();
     rows_ = 0;
@@ -195,7 +194,7 @@ class SavbSource : public PJ::FileSourceBase {
             if (row_ && !(status = emitRow())) {
               return false;
             }
-            row_ = sticky_;
+            row_.emplace();
           }
           if (fmt.name == "CAL_") {
             for (const auto& f : fmt.fields) {
@@ -258,18 +257,13 @@ class SavbSource : public PJ::FileSourceBase {
 
  private:
   // Unpacks one message into label -> cell, the decoder's Format.cells():
-  // a bitfield becomes one cell per slot. Sticky messages also update the
-  // carry-forward set. Before the first TICK only sticky values are kept.
+  // a bitfield becomes one cell per slot. Anything before the first TICK is
+  // dropped.
   void putCells(const savb::Format& fmt, const uint8_t* payload) {
-    const bool sticky = (fmt.flags & savb::Format::kFlagSticky) != 0;
     for (const auto& f : fmt.fields) {
       auto put = [&](const std::string& label, int bit) {
-        const RawCell cell{&f, payload, bit};
-        if (sticky) {
-          sticky_[label] = cell;
-        }
         if (row_) {
-          (*row_)[label] = cell;
+          (*row_)[label] = RawCell{&f, payload, bit};
         }
       };
       if (f.bits.empty()) {
@@ -321,7 +315,7 @@ class SavbSource : public PJ::FileSourceBase {
   }
 
   // Writes the current row as one record: each CSV column that has a value
-  // (logged, carried, or derived), stamped with the row's host clock.
+  // (logged or derived), stamped with the row's host clock.
   PJ::Status emitRow() {
     if (fields_.empty()) {
       if (auto s = registerFields(); !s) {
@@ -404,7 +398,6 @@ class SavbSource : public PJ::FileSourceBase {
   std::set<std::string> text_labels_;  // text columns, which are not plotted
   std::map<std::string, Derived> derived_;
   std::map<std::string, double> cal_;  // CAL/<key> -> value
-  std::unordered_map<std::string, RawCell> sticky_;
   std::optional<std::unordered_map<std::string, RawCell>> row_;  // the row being built; none before the first TICK
   PJ::sdk::TopicHandle topic_{};
   std::vector<PJ::sdk::FieldHandle> fields_;  // parallel to columns_

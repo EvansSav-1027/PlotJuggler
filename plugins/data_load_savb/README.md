@@ -31,8 +31,9 @@ loader gives, so a layout made for the CSV works on the `.bin` unchanged:
   cells; a blank CSV cell is simply absent, as with the CSV loader. Text
   columns (`STATUS/active_behavior`, `BUILD/git_ref`, the UTC text columns) are
   strings, everything else float64; `nan`/`ovf` cells are NaN.
-- Rows are built the way the decoder builds them: `GAIN`, `MODE` and `ORGN`
-  values carry forward onto every later row, and the derived columns
+- Rows are built the way the decoder builds them: a record holds only what
+  was logged on that tick. On-change messages (`GAIN`, `MODE`, `ORGN`, ...)
+  appear only on the tick they changed; nothing is carried forward. The derived columns
   (`TIME/host_time`, `GPS/time` — `*_utc` in older logs — `SONAR/age_s`, `IMU/accel_cal/*`,
   `MAG/cal/*`, `MAG/accel_cal/*`) are recomputed from the logged values and
   `CAL`.
