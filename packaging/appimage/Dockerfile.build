@@ -41,9 +41,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         patchelf unzip zstd \
     && rm -rf /var/lib/apt/lists/*
 
-# 2) Python tooling: aqt (Qt installer) + conan. Installing aqt up front means
-#    scripts/install_qt6.sh finds it (command -v aqt) and SKIPS its own bare `pip install`.
-RUN python3 -m pip install --no-cache-dir 'aqtinstall>=3.3' 'conan>=2,<3'
+# 2) Python tooling: aqt (Qt installer) + conan + a CMake new enough for Qt 6.12
+#    (its QtPublicCMakeVersionHelpers requires >= 3.25; Ubuntu 22.04's apt cmake is
+#    3.22.1). pip installs to /usr/local/bin, which precedes /usr/bin on PATH.
+#    Installing aqt up front means scripts/install_qt6.sh finds it (command -v aqt)
+#    and SKIPS its own bare `pip install`.
+RUN python3 -m pip install --no-cache-dir 'aqtinstall>=3.3' 'conan>=2,<3' 'cmake>=3.25' \
+    && cmake --version | head -1
 
 ARG PJ_APPIMAGE_ARCH
 RUN test -n "$PJ_APPIMAGE_ARCH"
