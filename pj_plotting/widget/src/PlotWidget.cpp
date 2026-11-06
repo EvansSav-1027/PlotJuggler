@@ -2170,12 +2170,19 @@ void PlotWidget::chooseTrackColorField() {
   std::vector<std::size_t> order(fields.size());
   std::iota(order.begin(), order.end(), std::size_t{0});
   std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return labels[a] < labels[b]; });
+  // Preselect the current choice; with none yet, the configurable default field
+  // (the SAV logs' high-beam sonar depth unless overridden in QSettings).
+  const QString default_field =
+      QSettings().value(u"Plot/track_color_default_field"_s, u"SONAR/depth_hi_m"_s).toString();
   QStringList sorted_labels;
   int current = 0;
   for (std::size_t rank = 0; rank < order.size(); ++rank) {
     const CurveDescriptor& field = fields[order[rank]];
     sorted_labels << labels[order[rank]];
-    if (field.topic_name == track_color_topic_ && field.field_path == track_color_field_) {
+    const bool is_current = field.topic_name == track_color_topic_ && field.field_path == track_color_field_;
+    const bool is_default =
+        track_color_topic_.isEmpty() && field.field_path.compare(default_field, Qt::CaseInsensitive) == 0;
+    if (is_current || is_default) {
       current = static_cast<int>(rank);
     }
   }
