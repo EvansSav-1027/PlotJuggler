@@ -86,22 +86,24 @@ class LogBuilder {
   std::string bytes_;
 };
 
-constexpr uint8_t kTick = 1, kImu = 2, kCtrl = 3, kMode = 4, kCal = 5, kSonar = 6;
+constexpr uint8_t kTick = 1, kImu = 2, kCtrl = 3, kMode = 4, kCal = 5, kSonar = 6, kEkf1 = 7;
 
 // The CSV column order the logger stores — a subset of the real one, with
-// derived (TIME/host_time, IMU/accel_cal/x_mps2, SONAR/age_s) and
-// never-logged (BAT/bat1/voltage) columns. TICK/mono_ns is logged but is not a
-// CSV column.
+// derived (TIME/host_time, IMU/accel_cal/x_mps2, SONAR/age_s,
+// EKF/vel/speed_kn, EKF/vel/cog_deg) and never-logged (BAT/bat1/voltage)
+// columns. TICK/mono_ns is logged but is not a CSV column.
 const std::vector<std::string> kColumns = {
     "seq", "TIME/host_time", "TIME/host_epoch_ns", "IMU/gyro/x_degs", "IMU/accel/x_mps2",
     "IMU/accel_cal/x_mps2", "IMU/temp_c", "EKF/status/position_quality", "PWM/left_us", "RCIN/estop",
-    "STATUS/operator_mode", "STATUS/active_behavior", "SONAR/last_update_ns", "SONAR/age_s", "BAT/bat1/voltage"};
+    "STATUS/operator_mode", "STATUS/active_behavior", "SONAR/last_update_ns", "SONAR/age_s", "BAT/bat1/voltage",
+    "EKF/att/heading_deg", "EKF/vel/speed_kn", "EKF/vel/cog_deg", "EKF/vel/surge_kn", "EKF/vel/sway_kn"};
 
 // kColumns minus its text columns, which are not plotted.
 const std::vector<std::string> kPlottedColumns = {
     "seq", "TIME/host_epoch_ns", "IMU/gyro/x_degs", "IMU/accel/x_mps2", "IMU/accel_cal/x_mps2", "IMU/temp_c",
     "EKF/status/position_quality", "PWM/left_us", "RCIN/estop", "STATUS/operator_mode", "SONAR/last_update_ns",
-    "SONAR/age_s", "BAT/bat1/voltage"};
+    "SONAR/age_s", "BAT/bat1/voltage", "EKF/att/heading_deg", "EKF/vel/speed_kn", "EKF/vel/cog_deg",
+    "EKF/vel/surge_kn", "EKF/vel/sway_kn"};
 
 // `legacy_utc` names the readable time column the way older logs (true-UTC
 // epochs) do: TIME/host_time_utc.
@@ -122,6 +124,7 @@ LogBuilder makePreamble(bool legacy_utc = false) {
   b.fmt(kMode, "MODE", "BZ", "00", "STATUS/operator_mode,STATUS/active_behavior", 0x01);
   b.fmt(kCal, "CAL_", "dd", "00", "CAL/imu_accel_offset_x,CAL/imu_accel_scale_x");
   b.fmt(kSonar, "SONR", "q", "0", "SONAR/last_update_ns");
+  b.fmt(kEkf1, "EKF1", "iii", "233", "EKF/att/heading_deg,EKF/vel/surge_kn,EKF/vel/sway_kn");
   b.header(kCal);
   b.put(0.5);
   b.put(2.0);
@@ -375,6 +378,28 @@ TEST_F(SavbSourceTest, BitfieldSlotsAndSonarAge) {
   EXPECT_DOUBLE_EQ(num(0, "RCIN/estop"), 1.0);
   EXPECT_DOUBLE_EQ(num(0, "EKF/status/position_quality"), 2.0);
   EXPECT_DOUBLE_EQ(num(0, "SONAR/age_s"), 0.25);  // TICK/mono_ns - SONAR/last_update_ns
+}
+
+TEST_F(SavbSourceTest, EkfSpeedAndCourseAreDerivedFromSurgeSwayAndHeading) {
+  auto b = makePreamble();
+  auto ekf1 = [&b](int32_t heading_cdeg, int32_t surge_mkn, int32_t sway_mkn) {
+    b.header(kEkf1);
+    b.put(heading_cdeg);
+    b.put(surge_mkn);
+    b.put(sway_mkn);
+  };
+  tick(b, 0, kEpoch, 1'000'000'000);
+  ekf1(9000, 3000, 4000);  // heading 90, surge 3 kn, sway 4 kn
+  tick(b, 1, kEpoch + 20'000'000, 1'020'000'000);
+  ekf1(1000, 50, 0);  // 0.05 kn: below the 0.05 m/s course floor
+  tick(b, 2, kEpoch + 40'000'000, 1'040'000'000);  // no EKF1 on this row
+  ASSERT_TRUE(import(b.bytes()));
+  EXPECT_NEAR(num(0, "EKF/vel/speed_kn"), 5.0, 1e-9);
+  EXPECT_NEAR(num(0, "EKF/vel/cog_deg"), 90.0 + 53.13010235415598, 1e-9);
+  EXPECT_NEAR(num(1, "EKF/vel/speed_kn"), 0.05, 1e-9);
+  EXPECT_NEAR(num(1, "EKF/vel/cog_deg"), 10.0, 1e-9);  // heading
+  EXPECT_FALSE(has(2, "EKF/vel/speed_kn"));
+  EXPECT_FALSE(has(2, "EKF/vel/cog_deg"));
 }
 
 #ifndef _WIN32

@@ -111,7 +111,7 @@ int64_t localUtcOffsetNs(int64_t epoch_ns) {
 
 // How a derived column is computed.
 struct Derived {
-  enum class Kind { kSonarAge, kCal } kind;
+  enum class Kind { kSonarAge, kCal, kEkfSpeed, kEkfCog } kind;
   std::string src;  // kCal: source column
   std::string offset_key, scale_key;
   bool mag = false;
@@ -120,6 +120,10 @@ struct Derived {
 std::map<std::string, Derived> derivedColumns() {
   std::map<std::string, Derived> out;
   out["SONAR/age_s"] = {Derived::Kind::kSonarAge, {}, {}, {}, false};
+  // The logger drops EKF speed and course over ground: both follow exactly
+  // from EKF1's surge/sway and heading, as the estimators compute them.
+  out["EKF/vel/speed_kn"] = {Derived::Kind::kEkfSpeed, {}, {}, {}, false};
+  out["EKF/vel/cog_deg"] = {Derived::Kind::kEkfCog, {}, {}, {}, false};
   for (const auto& r : kCalRules) {
     for (const char axis : {'x', 'y', 'z'}) {
       out[std::string(r.dst_prefix) + axis + r.suffix] = {
@@ -380,6 +384,36 @@ class SavbSource : public PJ::FileSourceBase {
             num = d->second.mag ? (*a / kMagLsbMgauss - off->second) * scale->second * kMagLsbMgauss
                                 : (*a - off->second) / scale->second;
           }
+          break;
+        }
+        case Derived::Kind::kEkfSpeed:
+        case Derived::Kind::kEkfCog: {
+          const RawCell* surge_c = cell("EKF/vel/surge_kn");
+          const RawCell* sway_c = cell("EKF/vel/sway_kn");
+          if (surge_c == nullptr || sway_c == nullptr) {
+            break;
+          }
+          const auto surge = asNumber(*surge_c);
+          const auto sway = asNumber(*sway_c);
+          if (!surge || !sway) {
+            break;
+          }
+          const double speed_kn = std::hypot(*surge, *sway);
+          if (d->second.kind == Derived::Kind::kEkfSpeed) {
+            num = speed_kn;
+            break;
+          }
+          const RawCell* heading_c = cell("EKF/att/heading_deg");
+          const auto heading = (heading_c != nullptr) ? asNumber(*heading_c) : std::nullopt;
+          if (!heading) {
+            break;
+          }
+          // Below 0.05 m/s the estimators report heading as the course.
+          constexpr double kCourseSpeedFloorKn = 0.05 * 1.9438444924406047;
+          constexpr double kRadToDeg = 180.0 / 3.14159265358979323846;
+          num = (speed_kn <= kCourseSpeedFloorKn)
+                    ? *heading
+                    : std::fmod(*heading + (std::atan2(*sway, *surge) * kRadToDeg) + 360.0, 360.0);
           break;
         }
       }
