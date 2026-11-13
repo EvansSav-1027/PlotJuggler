@@ -217,6 +217,7 @@
 #include "pj_widgets/FileDialog.h"
 #include "pj_widgets/FlowLayout.h"
 #include "pj_widgets/FrameworkTokens.h"
+#include "pj_widgets/GraphicsApi.h"
 #include "pj_widgets/IngestProgressWidget.h"
 #include "pj_widgets/MessageBox.h"
 #ifndef PJ_TARGET_WASM
@@ -711,6 +712,14 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   setMouseTracking(custom_frame_);
 
   ui_->setupUi(this);
+
+#ifndef PJ_TARGET_WASM
+  // The first GPU plot would otherwise re-create the shown window (a flash, and
+  // on Wayland the dock icon drops as if a second instance had opened).
+  if (PlotWidgetBase::gpuCanvasEnabled()) {
+    PJ::prepareRhiComposition(*this);
+  }
+#endif
 
   // Hard-zero contents margins on the central widget and every
   // intermediate container down to the chrome rows. Qt's main-window

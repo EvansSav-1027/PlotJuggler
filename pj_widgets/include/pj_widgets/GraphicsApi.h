@@ -84,6 +84,14 @@ enum class GraphicsPlatform { Linux, Windows, MacOS, Wasm };
 /// makes it right after constructing `QApplication`).
 [[nodiscard]] QRhiWidget::Api preferredGraphicsApi();
 
+/// Makes `window` GPU-composited from its first show by giving it a hidden
+/// `QRhiWidget` child on preferredGraphicsApi(). Without it, the first GPU widget
+/// shown in an already visible raster window makes Qt destroy and re-create its
+/// native window to switch compositing: the window flashes and, on Wayland, the
+/// dock loses its icon as if a new instance had opened. Call it before `window`
+/// is first shown; afterwards the switch has already happened or will happen anyway.
+void prepareRhiComposition(QWidget& window);
+
 /// Logs (category `pj.graphics`) the backend and adapter `widget` actually got,
 /// once per QRhi: a software rasterizer or an unexpected fallback is otherwise
 /// invisible. The widget passes `rhi()` (protected) from its initialize(); see

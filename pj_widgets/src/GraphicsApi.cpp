@@ -130,6 +130,15 @@ QRhiWidget::Api preferredGraphicsApi() {
   return api;
 }
 
+void prepareRhiComposition(QWidget& window) {
+  // Qt picks a window's compositing when it creates the native window, from the
+  // render-to-texture widgets in its tree; a hidden one counts and never renders.
+  auto* marker = new QRhiWidget(&window);
+  marker->setObjectName(QStringLiteral("pjRhiCompositionMarker"));
+  marker->setApi(preferredGraphicsApi());
+  marker->hide();
+}
+
 void logGraphicsBackend(QWidget& widget, QRhi* rhi) {
   // ponytail: keyed by address, so a new QRhi allocated where the widget's last
   // one lived is not logged again; key on something else if that ever matters.
