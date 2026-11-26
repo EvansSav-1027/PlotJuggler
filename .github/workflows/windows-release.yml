@@ -377,7 +377,7 @@ jobs:
             -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded `
             -DSAVB_BUILD_TESTS=OFF
           if ($LASTEXITCODE -ne 0) { throw "SAV plugin configure failed" }
-          cmake --build build-savb --config RelWithDebInfo
+          cmake --build build-savb --config Release
           if ($LASTEXITCODE -ne 0) { throw "SAV plugin build failed" }
           $dll = Get-ChildItem build-savb -Recurse -Filter "savb_source_plugin.dll" | Select-Object -First 1
           if (-not $dll) { throw "savb_source_plugin.dll was not produced" }

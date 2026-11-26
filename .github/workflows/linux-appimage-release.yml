@@ -257,7 +257,7 @@ jobs:
           set -euo pipefail
           cmake -S plugins/data_load_savb -B build-savb \
             -DCMAKE_TOOLCHAIN_FILE="$PWD/build/conan_toolchain.cmake" \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_BUILD_TYPE=Release \
             -DSAVB_BUILD_TESTS=OFF
           cmake --build build-savb -j"$(nproc)"
           so="$(find build-savb -name 'libsavb_source_plugin.so' | head -n 1)"
