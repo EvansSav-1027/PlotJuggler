@@ -9,13 +9,16 @@
 namespace PJ {
 
 namespace {
-// ~30 Hz. Nothing the cursor drives needs 60 Hz: video tops out ~30 Hz, ROS
-// messages 10-20 Hz, the curve-list Value column is capped at 10 Hz, and a 30 Hz
-// tracker line is already smooth (film is 24). Halving the tick halves the
-// downstream replot/decode/composite work for every consumer at once — capping
-// once at the origin instead of throttling each widget separately. Playback speed
-// is unaffected: onTick derives the cursor from elapsed wall-clock, not tick count.
-constexpr int kTickIntervalMs = 33;  // ~30 Hz
+// Tick period, ~30 Hz. Nothing the cursor drives needs 60 Hz (video tops out ~30 Hz, ROS messages 10-20 Hz, the
+// curve-list Value column is capped at 10 Hz); halving the tick halves the downstream replot/decode/composite work for
+// every consumer at once, capped at the origin rather than throttled per widget. Playback speed is unaffected: onTick
+// derives the cursor from elapsed wall-clock, not tick count.
+constexpr int kTickIntervalMs = 33;    // ~30 Hz
+constexpr int kCoarseTickDivisor = 2;  // coarseTimeChanged at ~15 Hz while playing
+
+bool isFinite(DisplayRange range) {
+  return std::isfinite(range.min.value) && std::isfinite(range.max.value);
+}
 }  // namespace
 
 PlaybackEngine::PlaybackEngine(QObject* parent) : QObject(parent) {
@@ -26,16 +29,22 @@ PlaybackEngine::PlaybackEngine(QObject* parent) : QObject(parent) {
 PlaybackEngine::~PlaybackEngine() = default;
 
 void PlaybackEngine::setRange(DisplayRange range) {
+  if (!isFinite(range)) {
+    return;
+  }
   applyRange(range);
 
   const double clamped = clampedTime(current_time_);
   if (clamped != current_time_) {
     current_time_ = clamped;
-    emit currentTimeChanged(current_time_);
+    notifyTimeChanged(/*playback_tick=*/false);
   }
 }
 
 void PlaybackEngine::setRangeAndCurrentTime(DisplayRange range, DisplaySeconds t) {
+  if (!isFinite(range) || !std::isfinite(t.value)) {
+    return;
+  }
   double min = range.min.value;
   double max = range.max.value;
   if (max < min) {
@@ -52,7 +61,7 @@ void PlaybackEngine::setRangeAndCurrentTime(DisplayRange range, DisplaySeconds t
     emit rangeChanged(range_min_, range_max_);
   }
   if (time_changed) {
-    emit currentTimeChanged(current_time_);
+    notifyTimeChanged(/*playback_tick=*/false);
   }
 }
 
@@ -71,19 +80,25 @@ void PlaybackEngine::applyRange(DisplayRange range) {
 }
 
 void PlaybackEngine::setCurrentTime(DisplaySeconds t) {
+  if (!std::isfinite(t.value)) {
+    return;
+  }
   const double clamped = clampedTime(t.value);
   if (clamped == current_time_) {
     return;
   }
   current_time_ = clamped;
-  emit currentTimeChanged(current_time_);
+  notifyTimeChanged(/*playback_tick=*/false);
 }
 
 void PlaybackEngine::setPlaybackRate(double rate) {
+  if (!std::isfinite(rate)) {
+    return;
+  }
   if (rate_ == rate) {
     return;
   }
-  rate_ = rate;
+  rate_ = snapPlaybackRate(rate);
   emit playbackRateChanged(rate_);
 }
 
@@ -108,17 +123,16 @@ double PlaybackEngine::clampTickTime(
   if (reached_end != nullptr) {
     *reached_end = false;
   }
-  // Live streaming: the cursor is pinned to the live tip (range_max), period — it does
-  // NOT free-run forward by wall-clock between ingests. Advancing only to clamp back is
-  // exactly what let the handle/needle overshoot the data and snap back (the jitter);
-  // and it IGNORES the loop toggle so a stream never wraps to the start.
+  // Live streaming: the cursor is pinned to the live tip (range_max); it does NOT free-run forward by wall-clock
+  // between ingests, since advancing only to clamp back made the needle overshoot the data and snap back. The loop
+  // toggle is IGNORED so a stream never wraps to the start.
   if (hold_at_max) {
     return range_max;
   }
   if (next > range_max) {
     if (looping) {
       const double span = range_max - range_min;
-      return span > 0.0 ? range_min + std::fmod(next - range_min, span) : range_min;
+      return span > 0.0 && std::isfinite(next) ? range_min + std::fmod(next - range_min, span) : range_min;
     }
     if (reached_end != nullptr) {
       *reached_end = true;  // hit the end with no repeat: the caller pauses
@@ -135,17 +149,16 @@ void PlaybackEngine::play() {
   if (playing_) {
     return;
   }
-  // Rewind-on-play: pressing Play while the cursor already sits at (or past) the end
-  // of a finite range would otherwise do nothing — the first onTick computes
-  // next > range_max, clampTickTime reports reached_end, and onTick pauses again
-  // before the cursor moves (the button just flickers). Snap back to the start so
-  // Play replays from the beginning, like any media player. Skipped while holding at
-  // the live tip (streaming) and when looping (which wraps on its own).
+  // Rewind-on-play: pressing Play with the cursor at (or past) the end of a finite range would otherwise do nothing:
+  // the first onTick computes next > range_max, clampTickTime reports reached_end and onTick pauses again before the
+  // cursor moves. Snap back to the start so Play replays from the beginning. Skipped while holding at the live tip
+  // (streaming) and when looping (which wraps on its own).
   if (!hold_at_range_max_ && !looping_ && range_max_ > range_min_ && current_time_ >= range_max_) {
     current_time_ = range_min_;
-    emit currentTimeChanged(current_time_);
+    notifyTimeChanged(/*playback_tick=*/false);
   }
   playing_ = true;
+  ticks_since_coarse_ = kCoarseTickDivisor;  // the first tick is a coarse one
   elapsed_.restart();
   timer_.start();
   emit playingChanged(playing_);
@@ -157,6 +170,9 @@ void PlaybackEngine::pause() {
   }
   playing_ = false;
   timer_.stop();
+  if (ticks_since_coarse_ > 0 && ticks_since_coarse_ < kCoarseTickDivisor) {
+    emit coarseTimeChanged(current_time_);  // the last ticks went out as currentTimeChanged only
+  }
   emit playingChanged(playing_);
 }
 
@@ -181,8 +197,17 @@ void PlaybackEngine::onTick() {
 
   if (next != current_time_) {
     current_time_ = next;
-    emit currentTimeChanged(current_time_);
+    notifyTimeChanged(/*playback_tick=*/true);
   }
+}
+
+void PlaybackEngine::notifyTimeChanged(bool playback_tick) {
+  emit currentTimeChanged(current_time_);
+  if (playback_tick && playing_ && ++ticks_since_coarse_ < kCoarseTickDivisor) {
+    return;
+  }
+  ticks_since_coarse_ = 0;
+  emit coarseTimeChanged(current_time_);
 }
 
 double PlaybackEngine::clampedTime(double t) const {

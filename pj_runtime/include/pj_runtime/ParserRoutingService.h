@@ -47,14 +47,19 @@ struct ParserRouteWinner {
 // claims the object route) decides the topic's builtin object identity and
 // serves as its lazy decoder.
 struct ParserRouteSelection {
-  // True when the SDK claim catalog resolved the routes. False when the
-  // encoding is outside the SDK registry (or the type name cannot be
-  // normalized): both winners then come from the first provider registered
-  // for the encoding, which is the same parser the pre-routing host selected.
+  // True when the SDK claim catalog resolved the routes. False when the encoding is outside the SDK registry (or the
+  // type name cannot be normalized): both winners then come from the first provider registered for the encoding (the
+  // legacy single-provider selection).
   bool route_dispatch = false;
   std::optional<ParserRouteWinner> scalar;
   std::optional<ParserRouteWinner> object;
   std::string scalar_failure;
+  // True when the scalar winner's own route claims say the bound schema has an
+  // object route and NO scalar route. Its parse() then has nothing to write,
+  // and an SDK-based parser reports the absent route as an error on every
+  // message. Only the route-claims extension can say this; a parser without it
+  // leaves this false.
+  bool scalar_winner_object_only = false;
 };
 
 // Route-aware parser selection over the SDK claim catalog + route resolver.
@@ -130,6 +135,9 @@ class ParserRoutingService {
   };
 
   [[nodiscard]] static RouteClassification classifyPreparedInstance(
+      const MessageParserHandle& handle, std::string_view type_name, Span<const uint8_t> schema);
+  // See ParserRouteSelection::scalar_winner_object_only.
+  [[nodiscard]] static bool declaresObjectOnly(
       const MessageParserHandle& handle, std::string_view type_name, Span<const uint8_t> schema);
   [[nodiscard]] static std::string sha256Digest(const void* data, size_t size);
   [[nodiscard]] static std::vector<std::string> registeredEncodings(const ParserProviderInfo& provider);

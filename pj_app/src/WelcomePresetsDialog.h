@@ -27,7 +27,8 @@ namespace PJ {
  * A pure view: it loads nothing. Picking an entry (or selectPreset()) emits `presetSelected` and
  * shows that load in progress, with Cancel (and how much of its data has downloaded, through
  * layoutLoadProgress()), until the shell reports its end through layoutLoadFinished(): success closes the dialog, a
- * failure shows the reason with Retry, a cancel gives the list back. Thumbnails download one at a time through the
+ * failure shows the reason with Retry, a cancel gives the list back. A load opened by openDeepLink() shows alone,
+ * without the list, until it fails or is cancelled. Thumbnails download one at a time through the
  * dialog's own capped PresetController; one that fails or does not decode keeps its placeholder and never blocks the
  * entry. GUI thread only; never runs a nested event loop (the shell shows it with show()).
  */
@@ -39,8 +40,13 @@ class WelcomePresetsDialog : public Dialog {
   ~WelcomePresetsDialog() override;
 
   /// Selects `id` as a click on its entry would: emits presetSelected and shows the load. Ignored
-  /// for an id the dialog does not list, or while a load is shown.
+  /// for an id the index does not have, or while a load is shown.
   void selectPreset(const QString& id);
+
+  /// Opens `id` as a ?preset= link does: selectPreset() with only the load on screen (status, bar, Cancel), so the
+  /// list never shows while the linked recording downloads. A failed or cancelled load gives the list back. Ignored,
+  /// leaving the list, for an id the index does not have. An entry the index marks unlisted opens like any other.
+  void openDeepLink(const QString& id);
 
   /// Shows `message` as an error with no Retry (a deep link that cannot be honoured).
   void showError(const QString& message);
@@ -83,11 +89,13 @@ class WelcomePresetsDialog : public Dialog {
   void updateControls();
 
   Ui::WelcomePresetsDialog* ui_;
-  QList<PresetEntry> entries_;
-  std::vector<EntryWidgets> entry_widgets_;  ///< In `entries_` order.
+  QList<PresetEntry> entries_;               ///< Every entry: what selectPreset() and openDeepLink() look up.
+  QList<PresetEntry> listed_;                ///< The entries with a card, in index order.
+  std::vector<EntryWidgets> entry_widgets_;  ///< In `listed_` order.
   PresetController thumbnails_;
-  QString loading_id_;  ///< The preset whose load is shown; empty when idle.
-  QString retry_id_;    ///< The preset Retry repeats; empty when Retry is hidden.
+  QString loading_id_;      ///< The preset whose load is shown; empty when idle.
+  QString retry_id_;        ///< The preset Retry repeats; empty when Retry is hidden.
+  bool load_only_ = false;  ///< openDeepLink()'s load is on screen without the list.
 };
 
 }  // namespace PJ

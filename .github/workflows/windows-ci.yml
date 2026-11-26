@@ -2,7 +2,7 @@ name: Windows CI
 
 on:
   pull_request:
-    branches: [main, main-4.x, development, 'release-*']
+    branches: [main, development, 'release-*']
     types: [opened, synchronize, reopened, ready_for_review]
     # Nothing here builds or tests these.
     paths-ignore:
@@ -10,13 +10,13 @@ on:
       - '**/*.md'
       - 'packaging/**'
   push:
-    branches: [main, main-4.x, development, 'release-*']
+    branches: [main, development, 'release-*']
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Cancel superseded runs on PRs only. Push-to-main runs publish any Conan
-  # binaries built from source to Artifactory for subsequent jobs.
+  # Cancel superseded runs on PRs only. Push-to-main runs save the Conan cache
+  # (binaries built from source included) for subsequent jobs.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -32,11 +32,10 @@ jobs:
     # 14.5x, while both release pipelines deliberately use VS2022/MSVC 14.44.
     # Pinning this also lets CI and the installer share the same sccache objects
     # and Conan package IDs instead of maintaining two Windows toolchain graphs.
-    runs-on: depot-windows-2022-4
+    runs-on: windows-2022
     # Windows is a required shipped target (CLAUDE.md). The job blocks on its
-    # compile and its D3D11 display runners (the Windows gate of the QRhi
-    # renderer, pj_scene3D/docs/TECHNICAL_NOTES.md, CI lanes); its unit-suite step stays
-    # non-blocking while Windows runtime packaging is productionized.
+    # compile, its unit suite and its D3D11 display runners (the Windows gate of
+    # the QRhi renderer, pj_scene3D/docs/TECHNICAL_NOTES.md, CI lanes).
     # Backstop against hangs (a deadlocked build otherwise holds the runner for
     # GitHub's 6-hour default). A first run can still rebuild a missing Conan
     # closure from source before the cache save persists it, then compile the
@@ -45,6 +44,11 @@ jobs:
     timeout-minutes: 150
     permissions:
       contents: read
+
+    env:
+      # sccache's GitHub Actions cache backend (the action exports the cache
+      # token). Every object is one cache entry in the repo's shared 10 GB.
+      SCCACHE_GHA_ENABLED: "true"
 
     steps:
       - name: Use HTTPS for github.com submodules
@@ -70,14 +74,14 @@ jobs:
 
       - uses: conan-io/setup-conan@v1
         with:
-          # Binaries come from the Depot-backed Actions cache below, with
+          # Binaries come from the Actions cache below, with
           # ConanCenter source builds as the fallback. Do not also archive
           # ~/.conan2 through setup-conan itself.
           cache_packages: false
 
       - name: Setup MSVC environment
         # Conan's package ID includes the detected compiler settings, so activate
-        # MSVC before detecting the profile or resolving Artifactory binaries.
+        # MSVC before detecting the profile or resolving prebuilt Conan binaries.
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -87,25 +91,24 @@ jobs:
         shell: pwsh
         run: |
           # The runner is pinned to windows-2022 above, so this identity maps to
-          # one stable MSVC/RelWithDebInfo graph. The Depot-backed Actions cache
-          # is the binary store; ConanCenter is the source-build fallback.
+          # one stable MSVC/Release graph. The Actions cache is the
+          # binary store; ConanCenter is the source-build fallback.
           $cacheVersion = "v6"
           $combined = (Get-FileHash conanfile.txt -Algorithm SHA256).Hash + (Get-FileHash conan.lock -Algorithm SHA256).Hash
           $stream = [System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($combined))
           $fileHash = (Get-FileHash -InputStream $stream -Algorithm SHA256).Hash.Substring(0, 16).ToLower()
           $hash = "$cacheVersion-$fileHash"
           "hash=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "restore_prefix=conan-windows-msvc-relwithdebinfo-$cacheVersion-" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "restore_prefix=conan-windows-msvc-release-$cacheVersion-" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Restore Conan cache
-        # On Depot runners actions/cache is backed by Depot Cache storage.
         # Prefix fallback: an older closure for the same toolchain still seeds
         # most packages, so only changed deps rebuild.
         id: conan-gha-cache
         uses: actions/cache/restore@v5
         with:
           path: ~/.conan2
-          key: conan-windows-msvc-relwithdebinfo-${{ steps.public_conan_cache.outputs.hash }}
+          key: conan-windows-msvc-release-${{ steps.public_conan_cache.outputs.hash }}
           restore-keys: |
             ${{ steps.public_conan_cache.outputs.restore_prefix }}
 
@@ -162,10 +165,9 @@ jobs:
           key: qt-sdk-${{ steps.versions.outputs.qt_version }}-windows-msvc2022_64-v1
 
       - name: Restore canonical main Qt cache
-        # Migration fallback for PR refs: the feature-branch qt-sdk cache is
-        # intentionally not visible to refs/pull/*, while the proven cache
-        # published by current main is. Restoring its original path/key avoids
-        # a 380 MB aqt download now. The next push-to-main will save the same
+        # Fallback for PR refs: the feature-branch qt-sdk cache is not visible to
+        # refs/pull/*, while the cache published by main is. Restoring its original
+        # path/key avoids a 380 MB aqt download. Push-to-main saves the same
         # verified SDK under qt-sdk-* for sharing with windows-release.yml.
         if: steps.qt-sdk-cache.outputs.cache-hit != 'true'
         uses: actions/cache/restore@v5
@@ -221,14 +223,8 @@ jobs:
           key: qt-sdk-${{ steps.versions.outputs.qt_version }}-windows-msvc2022_64-v1
 
       - name: Install sccache
-        # sccache is a compile-cache speedup, NOT load-bearing: the build is
-        # correct without it, just slower. So this step must never fail the run.
-        # The action only installs the binary; the backend is Depot Cache via
-        # the SCCACHE_WEBDAV_* env vars the Depot runner pre-sets — an org-wide
-        # object store shared with windows-release.yml and the Pixi win-64 leg.
-        # The outcome gate in Build keeps this optional if installation flakes.
-        id: setup_sccache
-        continue-on-error: true
+        # The backend is the Actions cache (SCCACHE_GHA_ENABLED on the job),
+        # shared with windows-release.yml and the Pixi win-64 leg.
         uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: "v0.16.0"
@@ -248,17 +244,12 @@ jobs:
           #   Generator Ninja Multi-Config does not support platform specification,
           #   but platform x64 was specified.
           # CPython's Conan recipe disables the STATIC MSVC build (>=3.10), so the
-          # embedded Python backend (pj_scripting) must link it shared here. CPython's
-          # MSVC build (PCbuild.sln) also has no "RelWithDebInfo" configuration — only
-          # Debug/Release — so build just that dependency as Release. Release is
-          # CRT-compatible with the rest of the RelWithDebInfo graph (both use the
-          # release /MD runtime). Both overrides are scoped to cpython only and
-          # Windows-CI-only; Linux links CPython statically.
+          # embedded Python backend (pj_scripting) must link it shared here.
           conan_log="${RUNNER_TEMP}/pj4-conan-install.log"
           conan install . --output-folder=build --build=missing -r=plotjuggler-conan -r=conancenter \
             --lockfile=conan.lock --lockfile-partial \
-            -s build_type=RelWithDebInfo -s compiler.cppstd=20 \
-            -o "cpython/*:shared=True" -s "cpython/*:build_type=Release" \
+            -s build_type=Release -s compiler.cppstd=20 \
+            -o "cpython/*:shared=True" \
             -c tools.cmake.cmaketoolchain:generator="Ninja Multi-Config" \
             2>&1 | tee "$conan_log"
           if grep -q "Building from source" "$conan_log"; then
@@ -277,9 +268,9 @@ jobs:
         # third-party closure. Immutable keys make a re-save a no-op, so skip
         # only on an exact-key hit.
         #
-        # Not from pull requests: Depot Cache is repo-wide with no branch
-        # isolation, so only trusted refs (push, dispatch) write a namespace
-        # that release builds restore. PR runs still RESTORE via the prefix.
+        # Not from pull requests: every entry counts against the repo's shared
+        # 10 GB Actions cache, and a PR-scoped one is readable only by that PR.
+        # PR runs still RESTORE via the prefix.
         # conan_install must also have succeeded — an install that died partway
         # would pin an incomplete closure under an immutable key.
         if: >-
@@ -289,15 +280,10 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ~/.conan2
-          key: conan-windows-msvc-relwithdebinfo-${{ steps.public_conan_cache.outputs.hash }}
+          key: conan-windows-msvc-release-${{ steps.public_conan_cache.outputs.hash }}
 
       - name: Build
         shell: bash
-        env:
-          # "true" only if the install step actually succeeded; gates the
-          # compiler-launcher wiring below so a flaked sccache install degrades
-          # to an uncached (but correct) build instead of failing.
-          SCCACHE_AVAILABLE: ${{ steps.setup_sccache.outcome == 'success' }}
         run: |
           QT_DIR="$(pwd)/.qt/${PJ_QT_VERSION}/msvc2022_64"
           if [[ ! -d "$QT_DIR" ]]; then
@@ -308,48 +294,40 @@ jobs:
           # Use Ninja Multi-Config so sccache is actually invoked: CMake's
           # CMAKE_<LANG>_COMPILER_LAUNCHER is honored by the Ninja and
           # Makefile generators only — the Visual Studio (MSBuild) generator
-          # silently ignores it, which is why prior runs showed "Compile
-          # requests: 0" in sccache --show-stats.
+          # silently ignores it ("Compile requests: 0" in sccache --show-stats).
           #
-          # CMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded forces /Z7 instead
-          # of /Zi for RelWithDebInfo. /Zi writes to a shared PDB via
-          # mspdbsrv.exe which sccache cannot cache; /Z7 embeds debug info
-          # in each .obj and is fully cacheable.
+          # CMAKE_MSVC_DEBUG_INFORMATION_FORMAT compiles Release, the
+          # configuration built here, without debug information. MSVC has no
+          # line-tables-only level, and full debug info writes the types of
+          # every included header into every .obj, which costs compile time,
+          # sccache storage and link time. The linker's /DEBUG (added to Release
+          # links by cmake/PjDebugInfo.cmake) still writes a PDB of public
+          # symbols, so a crash backtrace names its functions.
+          # Debug gets /Z7, never /Zi: /Zi writes a shared PDB through
+          # mspdbsrv.exe, which sccache cannot cache and parallel cl.exe
+          # workers race on (fatal C1041 on pj_base.pdb).
           #
           # CMAKE_POLICY_DEFAULT_CMP0141=NEW is required for CMake to honor
           # CMAKE_MSVC_DEBUG_INFORMATION_FORMAT at all. The variable was added
           # in CMake 3.25 behind policy CMP0141; without NEW, CMake silently
-          # falls back to the legacy /Zi flag — which is what causes parallel
-          # cl.exe workers to race on pj_base.pdb (fatal C1041). We can't bump
+          # falls back to the legacy /Zi flag. We can't bump
           # cmake_minimum_required past 3.22 because Ubuntu 22.04 LTS ships
           # CMake 3.22.1, so the opt-in lives here in the CI invocation.
-          # Only route the compiler through sccache if its install succeeded.
-          # /Z7 (Embedded debug info) below stays on regardless: it also avoids
-          # the parallel-cl.exe pj_base.pdb race, so it's correct with or
-          # without the cache.
-          launcher_args=()
-          if [[ "$SCCACHE_AVAILABLE" == "true" ]]; then
-            launcher_args=(-DCMAKE_C_COMPILER_LAUNCHER=sccache \
-                           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache)
-          else
-            echo "::warning::sccache unavailable; building without a compiler cache"
-          fi
+          launcher_args=(-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache)
 
           cmake -S . -B build -G "Ninja Multi-Config" \
             -DCMAKE_TOOLCHAIN_FILE="build/conan_toolchain.cmake" \
             -DCMAKE_PREFIX_PATH="$QT_DIR" \
             -DCMAKE_POLICY_DEFAULT_CMP0141=NEW \
-            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded \
+            '-DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=$<$<CONFIG:Debug>:Embedded>' \
             "${launcher_args[@]}"
 
           # -k 0: one run lists every compile error.
-          cmake --build build --config RelWithDebInfo --parallel -- -k 0
+          cmake --build build --config Release --parallel -- -k 0
 
           # Surface sccache stats before the post-action does, so they
           # appear in the Build step's log next to the compile output.
-          if [[ "$SCCACHE_AVAILABLE" == "true" ]]; then
-            sccache --show-stats
-          fi
+          sccache --show-stats
 
       - name: Put the runtime DLLs on PATH
         # Prepend Qt's and FFmpeg's bin/ dirs to PATH so the OS loader can resolve
@@ -375,14 +353,12 @@ jobs:
           done
 
       - name: Test
-        # Non-blocking (see the job comment above); the D3D11 step below is the gate.
-        continue-on-error: true
         shell: bash
         run: |
           # --timeout kills any single test after 2 min so a deadlocked test
           # fails loudly with its name in the log instead of stalling the job.
           # The QRhi display runners (label qrhi) run in the D3D11 step below.
-          ctest --test-dir build --build-config RelWithDebInfo --output-on-failure --timeout 120 -LE qrhi \
+          ctest --test-dir build --build-config Release --output-on-failure --timeout 120 -LE qrhi \
             -j "${NUMBER_OF_PROCESSORS}"
 
       - name: Test the QRhi display runners on D3D11 (WARP)
@@ -403,7 +379,7 @@ jobs:
           export QT_FORCE_STDERR_LOGGING=1
           mkdir -p "$PJ_POINTCLOUD_GOLDEN_OUT"
           log="${RUNNER_TEMP}/qrhi-d3d11-ctest.log"
-          ctest --test-dir build --build-config RelWithDebInfo -V --timeout 120 --no-tests=error -L qrhi-d3d11 2>&1 | tee "$log" ||
+          ctest --test-dir build --build-config Release -V --timeout 120 --no-tests=error -L qrhi-d3d11 2>&1 | tee "$log" ||
             status=$?
           # Every view must report D3D11 on a software (Cpu) adapter, i.e. WARP,
           # and at least one plot canvas must have run on D3D11.

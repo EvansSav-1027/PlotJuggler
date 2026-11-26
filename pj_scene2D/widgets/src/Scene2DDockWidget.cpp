@@ -10,6 +10,7 @@
 #include <QPointer>
 #include <QSizePolicy>
 #include <QStackedWidget>
+#include <QStringList>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -24,6 +25,7 @@
 #include "pj_runtime/CatalogModel.h"
 #include "pj_runtime/DerivedTopics.h"
 #include "pj_runtime/SessionManager.h"
+#include "pj_runtime/XmlStateOptions.h"
 #include "pj_scene2d_core/borrowed_media_source.h"
 #include "pj_scene2d_core/composite_media_source.h"
 #include "pj_scene2d_core/image_resolve.h"
@@ -36,6 +38,7 @@
 #include "pj_scene2d_widgets/layers/video_layer.h"
 #endif
 #include "pj_scene2d_widgets/media_viewer_widget.h"
+#include "pj_scene_common/saved_layer_header.h"
 #include "pj_widgets/FrameworkTokens.h"
 #include "pj_widgets/RenderingWarningLabel.h"
 #include "pj_widgets/SvgUtil.h"
@@ -54,145 +57,62 @@ constexpr auto kLayerKind = "layer_kind";
 constexpr auto kImageKind = "image";
 constexpr auto kDepthKind = "depth";
 
+const QStringList& rotationTokens() {
+  static const QStringList tokens = [] {
+    QStringList list;
+    for (const int degrees : kViewRotations) {
+      list.append(QString::number(degrees));
+    }
+    return list;
+  }();
+  return tokens;
+}
+
+// The one reader of a <view>, for xmlLoadState and xmlValidateState. A state without one (a layout written before
+// viewport persistence) takes the defaults; under a recorder an empty <view> is read instead, so the options are
+// reported.
 [[nodiscard]] std::optional<MediaViewState> parseViewState(const QDomElement& root) {
-  const QDomElement view = root.firstChildElement(QString::fromLatin1(kViewTag));
+  QDomDocument absent;
+  QDomElement view = root.firstChildElement(QString::fromLatin1(kViewTag));
   if (view.isNull()) {
-    return MediaViewState{};  // layout written before viewport persistence
+    if (!XmlOptionsRecorder::active()) {
+      return MediaViewState{};
+    }
+    view = absent.createElement(QString::fromLatin1(kViewTag));
   }
 
+  constexpr float kLowest = std::numeric_limits<float>::lowest();
+  constexpr float kMax = std::numeric_limits<float>::max();
   MediaViewState state;
-  const auto read = [&view](const char* name, float fallback, bool& valid) {
-    const QString key = QString::fromLatin1(name);
-    if (!view.hasAttribute(key)) {
-      return fallback;
+  bool valid = readXmlFloat(view, QString::fromLatin1(kViewZoom), state.zoom, kMinViewZoom, kMaxViewZoom, state.zoom);
+  valid = readXmlFloat(view, QString::fromLatin1(kViewPanX), state.pan_x, kLowest, kMax, state.pan_x) && valid;
+  valid = readXmlFloat(view, QString::fromLatin1(kViewPanY), state.pan_y, kLowest, kMax, state.pan_y) && valid;
+
+  // An empty rotation reads as absent, and any integer spelling of an accepted angle ("+90") is accepted.
+  const XmlOption rotation{
+      .attribute = QString::fromLatin1(kViewRotation),
+      .type = u"enum"_s,
+      .values = rotationTokens(),
+      .fallback = QString::number(state.rotation_deg)};
+  XmlOptionsRecorder::noteOption(view, rotation);
+  if (const QString text = view.attribute(rotation.attribute); !text.isEmpty()) {
+    bool ok = false;
+    const int degrees = text.toInt(&ok);
+    if (ok && std::ranges::find(kViewRotations, degrees) != kViewRotations.end()) {
+      state.rotation_deg = degrees;
+    } else {
+      XmlOptionsRecorder::noteRejection(view, rotation.attribute, xmlValueProblem(rotation, text));
+      valid = false;
     }
-    bool ok = false;
-    const float value = view.attribute(key).toFloat(&ok);
-    valid = valid && ok;
-    return value;
-  };
-  bool valid = true;
-  state.zoom = read(kViewZoom, state.zoom, valid);
-  state.pan_x = read(kViewPanX, state.pan_x, valid);
-  state.pan_y = read(kViewPanY, state.pan_y, valid);
-  if (const QString rotation = view.attribute(QString::fromLatin1(kViewRotation)); !rotation.isEmpty()) {
-    bool ok = false;
-    state.rotation_deg = rotation.toInt(&ok);
-    valid = valid && ok;
   }
-  if (!valid || !MediaViewerWidget::isViewStateValid(state)) {
+  if (!valid) {
+    return std::nullopt;
+  }
+  if (!MediaViewerWidget::isViewStateValid(state)) {
+    XmlOptionsRecorder::noteRejection(view, {}, u"pan_x and pan_y must be 0 at zoom 1"_s);
     return std::nullopt;
   }
   return state;
-}
-
-[[nodiscard]] bool validateLayerPayloads(const QDomElement& root) {
-  for (QDomElement layer = root.firstChildElement(u"layer"_s); !layer.isNull();
-       layer = layer.nextSiblingElement(u"layer"_s)) {
-    const auto object_type = sdk::parseBuiltinObjectType(layer.attribute(u"object_type"_s).toStdString());
-    if (!object_type.has_value()) {
-      return false;
-    }
-    const QString kind = layer.attribute(QString::fromLatin1(kLayerKind));
-    if (!kind.isEmpty() && kind != QString::fromLatin1(kImageKind) && kind != QString::fromLatin1(kDepthKind)) {
-      return false;
-    }
-
-    const bool image_type = *object_type == sdk::BuiltinObjectType::kImage;
-    const bool depth_type = *object_type == sdk::BuiltinObjectType::kDepthImage;
-    if ((!kind.isEmpty() && !image_type && !depth_type) || (kind == QString::fromLatin1(kImageKind) && !image_type)) {
-      return false;
-    }
-
-    const QDomElement payload = layer.firstChildElement();
-    if (payload.isNull()) {
-      continue;
-    }
-    if (!payload.nextSiblingElement().isNull() || payload.tagName() != u"scene2d_layer"_s) {
-      return false;
-    }
-
-    // Legacy kImage XML has no layer_kind. Depth settings are unambiguous, so
-    // validate with the same concrete class that first-sample dispatch selects.
-    const bool has_depth_options = payload.hasAttribute(u"colormap"_s) || payload.hasAttribute(u"invert"_s) ||
-                                   payload.hasAttribute(u"near_m"_s) || payload.hasAttribute(u"far_m"_s) ||
-                                   payload.hasAttribute(u"opacity"_s);
-    const bool validate_as_depth =
-        depth_type || kind == QString::fromLatin1(kDepthKind) || (image_type && kind.isEmpty() && has_depth_options);
-    if (validate_as_depth) {
-      DepthImageLayer candidate(ObjectTopicId{}, *object_type, QString());
-      if (!candidate.xmlLoadState(payload)) {
-        return false;
-      }
-    } else if (image_type) {
-      ImageLayer candidate(ObjectTopicId{}, *object_type, QString());
-      if (!candidate.xmlLoadState(payload)) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
-// Resolves only genuinely unqualified (generic-layout) layer identities. A
-// non-zero id or a source name remains authoritative and is left to the shared
-// exact/source resolver used by undo and source-bound layouts.
-[[nodiscard]] bool resolveGenericLayerIdentities(QDomElement root, SessionManager* session) {
-  for (QDomElement layer = root.firstChildElement(u"layer"_s); !layer.isNull();
-       layer = layer.nextSiblingElement(u"layer"_s)) {
-    const QString dataset_id_key = u"dataset_id"_s;
-    const bool has_dataset_id = layer.hasAttribute(dataset_id_key);
-    bool dataset_ok = false;
-    const qulonglong dataset_value = layer.attribute(dataset_id_key).toULongLong(&dataset_ok);
-    if (has_dataset_id && (!dataset_ok || dataset_value > std::numeric_limits<uint32_t>::max())) {
-      return false;
-    }
-
-    const QString dataset_source = layer.attribute(u"dataset_source"_s);
-    const QString dataset_path = layer.attribute(u"dataset_path"_s);
-    if ((has_dataset_id && dataset_value != 0) || !dataset_source.isEmpty() || !dataset_path.isEmpty()) {
-      // A source-qualified layer with no numeric hint is still source-bound.
-      // Give the base parser its neutral id so it can perform the existing
-      // unique-source fallback without degrading to generic topic matching.
-      if (!has_dataset_id) {
-        layer.setAttribute(dataset_id_key, u"0"_s);
-      }
-      continue;
-    }
-
-    if (session == nullptr) {
-      return false;
-    }
-    const QString topic_name = layer.attribute(u"topic_name"_s);
-    const auto saved_type = sdk::parseBuiltinObjectType(layer.attribute(u"object_type"_s).toStdString());
-    if (topic_name.isEmpty() || !saved_type.has_value() || !Scene2DDockWidget::handlesObjectType(*saved_type)) {
-      return false;
-    }
-
-    const std::string topic_name_utf8 = topic_name.toStdString();
-    std::optional<DatasetId> unique_dataset;
-    for (const ObjectTopicId candidate : session->objectStore().listTopics()) {
-      const ObjectTopicDescriptor descriptor = session->objectStore().descriptor(candidate);
-      if (descriptor.topic_name != topic_name_utf8 || objectTypeFromMetadata(descriptor.metadata_json) != *saved_type) {
-        continue;
-      }
-      if (unique_dataset.has_value()) {
-        return false;  // same compatible topic in multiple loaded datasets
-      }
-      unique_dataset = descriptor.dataset_id;
-    }
-    if (!unique_dataset.has_value()) {
-      return false;
-    }
-
-    const DatasetInfo* dataset = session->dataEngine().getDataset(*unique_dataset);
-    if (dataset == nullptr) {
-      return false;  // ObjectStore/DataEngine identity is not a loaded dataset
-    }
-    layer.setAttribute(dataset_id_key, QString::number(*unique_dataset));
-    layer.setAttribute(u"dataset_source"_s, QString::fromStdString(dataset->source_name));
-  }
-  return true;
 }
 
 using LayerCreator = std::unique_ptr<ISceneLayer> (*)(
@@ -201,6 +121,7 @@ using LayerCreator = std::unique_ptr<ISceneLayer> (*)(
 struct LayerRegistration {
   sdk::BuiltinObjectType object_type;
   LayerCreator creator;
+  bool (*validator)(const QDomElement& payload);
 };
 
 std::unique_ptr<ISceneLayer> createImageLayer(
@@ -218,6 +139,23 @@ std::unique_ptr<ISceneLayer> createVideoLayer(
 std::unique_ptr<ISceneLayer> createDepthImageLayer(
     ObjectTopicId topic_id, sdk::BuiltinObjectType object_type, const QString& display_name) {
   return std::make_unique<DepthImageLayer>(topic_id, object_type, display_name);
+}
+
+[[nodiscard]] bool validateDepthImagePayload(const QDomElement& payload) {
+  return DepthImageLayer::parseOptions(payload, DepthImageLayer::Options{}).has_value();
+}
+
+// The layer the kImage creator builds for a restore: its <layer>'s layer_kind (primeRestoreLayerKind) or, without
+// one, depth settings in the payload identify a depth layer, as first-sample dispatch would.
+[[nodiscard]] bool validateImagePayload(const QDomElement& payload) {
+  const QString kind = payload.parentNode().toElement().attribute(QString::fromLatin1(kLayerKind));
+  const bool has_depth_options = payload.hasAttribute(u"colormap"_s) || payload.hasAttribute(u"invert"_s) ||
+                                 payload.hasAttribute(u"near_m"_s) || payload.hasAttribute(u"far_m"_s) ||
+                                 payload.hasAttribute(u"opacity"_s);
+  if (kind == QString::fromLatin1(kDepthKind) || (kind.isEmpty() && has_depth_options)) {
+    return validateDepthImagePayload(payload);
+  }
+  return ImageLayer::parseOptions(payload, ImageLayer::kDefaultRectify).has_value();
 }
 
 // Full-frame pixel sources: a dock shows at most one, beneath the overlays.
@@ -269,15 +207,108 @@ constexpr std::array<LayerRegistration, 5> kLayerRegistrations {
 #else
 constexpr std::array<LayerRegistration, 4> kLayerRegistrations{{
 #endif
-    {sdk::BuiltinObjectType::kImage, &createImageLayer},
+    {sdk::BuiltinObjectType::kImage, &createImageLayer, &validateImagePayload},
 #ifdef PJ_HAS_FFMPEG
-        {sdk::BuiltinObjectType::kVideoFrame, &createVideoLayer},
+        {sdk::BuiltinObjectType::kVideoFrame, &createVideoLayer, &LayerFactory::acceptPayloadWithoutOptions},
 #endif
-        {sdk::BuiltinObjectType::kDepthImage, &createDepthImageLayer},
-        {sdk::BuiltinObjectType::kImageAnnotations, &createImageAnnotationsLayer},
-        {sdk::BuiltinObjectType::kSceneEntities, &createSceneEntitiesLayer},
+        {sdk::BuiltinObjectType::kDepthImage, &createDepthImageLayer, &validateDepthImagePayload},
+        {sdk::BuiltinObjectType::kImageAnnotations, &createImageAnnotationsLayer,
+         &LayerFactory::acceptPayloadWithoutOptions},
+        {sdk::BuiltinObjectType::kSceneEntities, &createSceneEntitiesLayer, &LayerFactory::acceptPayloadWithoutOptions},
   }
 };
+
+// The layer_kind a <layer> accepts.
+const XmlOption& layerKindOption() {
+  static const XmlOption option{
+      .attribute = QString::fromLatin1(kLayerKind),
+      .type = u"enum"_s,
+      .values = {QString::fromLatin1(kImageKind), QString::fromLatin1(kDepthKind)}};
+  return option;
+}
+
+// A non-zero id or a non-empty source or path; otherwise the layer is generic and binds by topic and type.
+[[nodiscard]] bool namesDataset(const QDomElement& layer) {
+  return layer.attribute(u"dataset_id"_s).toULongLong() != 0 || !layer.attribute(u"dataset_source"_s).isEmpty() ||
+         !layer.attribute(u"dataset_path"_s).isEmpty();
+}
+
+// The header is the base dock's (it saves it and restores it from the same element); layer_kind and the payload are
+// this family's.
+[[nodiscard]] bool validateLayer(const QDomElement& layer, const LayerFactory& factory) {
+  XmlOptionsRecorder::noteOption(layer, layerKindOption());
+  const std::optional<SavedLayerHeader> header = parseSavedLayerHeader(layer, SavedTopicRef::kOptional, factory);
+  if (!header.has_value()) {
+    return false;
+  }
+  bool valid = true;
+  const auto reject = [&layer, &valid](const QString& attribute, const QString& reason) {
+    XmlOptionsRecorder::noteRejection(layer, attribute, reason);
+    valid = false;
+  };
+  const QString image_kind = QString::fromLatin1(kImageKind);
+  const QString depth_kind = QString::fromLatin1(kDepthKind);
+  const bool names_dataset = namesDataset(layer);
+  const std::optional<sdk::BuiltinObjectType>& object_type = header->object_type;
+  const bool handled = object_type.has_value() && factory.supports(*object_type);
+
+  // An unparsable type is refused; a parsable one the dock does not handle is refused only for a generic layer: one
+  // that names its dataset is accepted, and refused when it is restored.
+  if (!handled) {
+    XmlOptionsRecorder::noteRejection(layer, u"object_type"_s, u"not a 2D layer type"_s);
+    valid = object_type.has_value() && names_dataset;
+  }
+  const bool image_type = object_type == sdk::BuiltinObjectType::kImage;
+  const bool depth_type = object_type == sdk::BuiltinObjectType::kDepthImage;
+  const QString kind = layer.attribute(layerKindOption().attribute);
+  if (!kind.isEmpty() && kind != image_kind && kind != depth_kind) {
+    reject(layerKindOption().attribute, xmlValueProblem(layerKindOption(), kind));
+  } else if ((!kind.isEmpty() && !image_type && !depth_type) || (kind == image_kind && !image_type)) {
+    reject(layerKindOption().attribute, u"does not fit the object_type"_s);
+  }
+
+  if (const QDomElement payload = layer.firstChildElement(); !payload.isNull()) {
+    if (!payload.nextSiblingElement().isNull() || payload.tagName() != u"scene2d_layer"_s) {
+      reject({}, u"expected a single <scene2d_layer> child"_s);
+    } else if (handled) {
+      valid = factory.validatePayload(*object_type, payload) && valid;
+    }
+  }
+
+  if (!names_dataset && header->topic_name.isEmpty()) {
+    reject(u"topic_name"_s, u"expected a topic name: the layer names no dataset"_s);
+  }
+  return valid;
+}
+
+// Reports what a layer and each registered payload accept even when the state has none of them (a saved state holds
+// only the layers it shows). Only under a recorder: it parses nothing a load uses.
+void reportLayerSchema(const LayerFactory& factory) {
+  if (!XmlOptionsRecorder::active()) {
+    return;
+  }
+  QDomDocument schema;
+  QDomElement layer = schema.createElement(u"layer"_s);
+  XmlOptionsRecorder::noteOption(layer, layerKindOption());
+  (void)parseSavedLayerHeader(layer, SavedTopicRef::kOptional, factory);
+  const QDomElement payload = layer.appendChild(schema.createElement(u"scene2d_layer"_s)).toElement();
+  for (const sdk::BuiltinObjectType type : factory.types()) {
+    (void)factory.validatePayload(type, payload);
+  }
+}
+
+// A zero id and empty qualifiers name no dataset: dropped from the (cloned) state, so the base treats the layer as
+// unqualified.
+void dropEmptyDatasetQualifiers(QDomElement root) {
+  for (QDomElement layer = root.firstChildElement(u"layer"_s); !layer.isNull();
+       layer = layer.nextSiblingElement(u"layer"_s)) {
+    if (!namesDataset(layer)) {
+      layer.removeAttribute(u"dataset_id"_s);
+      layer.removeAttribute(u"dataset_source"_s);
+      layer.removeAttribute(u"dataset_path"_s);
+    }
+  }
+}
 
 }  // namespace
 
@@ -288,7 +319,7 @@ Scene2DDockWidget::Scene2DDockWidget(QWidget* parent) : SceneDockWidget(parent) 
     if (registration.object_type == sdk::BuiltinObjectType::kImage) {
       continue;  // kImage is registered below with an encoding-aware dispatcher.
     }
-    layerFactory().registerType(registration.object_type, registration.creator);
+    layerFactory().registerType(registration.object_type, registration.creator, registration.validator);
   }
   // kImage covers BOTH color and depth (they share the type). Route depth-encoded
   // images to the colormap DepthImageLayer and everything else to ImageLayer, by
@@ -305,7 +336,8 @@ Scene2DDockWidget::Scene2DDockWidget(QWidget* parent) : SceneDockWidget(parent) 
         return firstSampleIsDepthEncoded(sessionManager(), topic_id)
                    ? createDepthImageLayer(topic_id, object_type, display_name)
                    : createImageLayer(topic_id, object_type, display_name);
-      });
+      },
+      &validateImagePayload);
 }
 
 Scene2DDockWidget::~Scene2DDockWidget() {
@@ -344,39 +376,49 @@ QDomElement Scene2DDockWidget::xmlSaveState(QDomDocument& doc) const {
   return root;
 }
 
-bool Scene2DDockWidget::xmlLoadState(const QDomElement& element) {
+bool Scene2DDockWidget::xmlValidateState(const QDomElement& element) const {
+  return validatedViewState(element).has_value();
+}
+
+std::optional<MediaViewState> Scene2DDockWidget::validatedViewState(const QDomElement& element) const {
   if (element.isNull() || element.tagName() != xmlTag()) {
-    return false;
+    XmlOptionsRecorder::noteRejection(element, {}, u"expected a <"_s + xmlTag() + u"> element"_s);
+    return std::nullopt;
   }
-  if (!validateLayerPayloads(element)) {
-    return false;
-  }
+  readXmlText(element, u"version"_s, u"1"_s);
+  bool valid = true;
   int view_elements = 0;
   for (QDomElement child = element.firstChildElement(); !child.isNull(); child = child.nextSiblingElement()) {
-    if (!acceptsStateChildTag(child.tagName()) ||
-        (child.tagName() == QString::fromLatin1(kViewTag) && ++view_elements > 1)) {
-      return false;
+    if (!acceptsStateChildTag(child.tagName())) {
+      XmlOptionsRecorder::noteRejection(child, {}, u"unexpected element"_s);
+      valid = false;
+    } else if (child.tagName() == QString::fromLatin1(kViewTag) && ++view_elements > 1) {
+      XmlOptionsRecorder::noteRejection(child, {}, u"expected at most one <view>"_s);
+      valid = false;
+    } else if (child.tagName() == u"layer"_s) {
+      valid = validateLayer(child, layerFactory()) && valid;
     }
   }
-  const auto view_state = parseViewState(element);
+  reportLayerSchema(layerFactory());
+  std::optional<MediaViewState> view_state = parseViewState(element);
+  return valid ? view_state : std::nullopt;
+}
+
+bool Scene2DDockWidget::xmlLoadState(const QDomElement& element) {
+  const std::optional<MediaViewState> view_state = validatedViewState(element);
   if (!view_state.has_value()) {
     return false;  // reject before the base destructively replaces the layer stack
   }
 
-  // The base fills legacy order attributes while restoring, and generic layouts
-  // need concrete dataset identities before that destructive pass. Work on a
-  // private clone so neither normalization mutates the caller's XML document.
+  // The generic-identity normalization and the base's order-attribute fill rewrite the XML: work on a clone, not the
+  // caller's document.
   QDomDocument restore_doc;
   QDomElement restore_element = restore_doc.importNode(element, /*deep=*/true).toElement();
   restore_doc.appendChild(restore_element);
-  if (!resolveGenericLayerIdentities(restore_element, sessionManager())) {
-    return false;
-  }
+  dropEmptyDatasetQualifiers(restore_element);
 
-  // The base restore clears the live layer stack before replay. Preserve a
-  // private snapshot so a late duplicate/attach/payload failure can put this
-  // same widget back exactly; direct clipboard paste has no MainWindow-level
-  // transaction wrapper.
+  // The base restore clears the layer stack before replay: this snapshot puts the widget back on a late failure.
+  // A clipboard paste has no MainWindow-level transaction around it.
   QDomDocument previous_doc;
   QDomElement previous_element = xmlSaveState(previous_doc);
   previous_doc.appendChild(previous_element);
@@ -397,7 +439,7 @@ bool Scene2DDockWidget::xmlLoadState(const QDomElement& element) {
 
   auto restore_guard = beginWorkspaceRestore();
   primeRestoreLayerKinds(restore_element);
-  const bool loaded = loadSavedState(restore_element, element);
+  const bool loaded = SceneDockWidget::xmlLoadState(restore_element);
   restore_image_layer_kinds_.clear();
   if (!loaded) {
     if (!rollback()) {
@@ -519,9 +561,7 @@ QWidget* Scene2DDockWidget::createSceneView() {
       PJ::theme::space(PJ::theme::Space::None), PJ::theme::space(PJ::theme::Space::None));
   layout->setSpacing(PJ::theme::space(PJ::theme::Space::None));
 
-  // Page 0 = empty-state placeholder, page 1 = GPU viewer. A stack (rather than
-  // an overlay) keeps the raster placeholder off the QRhiWidget's surface, where
-  // it would not composite reliably.
+  // A stack, not an overlay: a raster widget over the QRhiWidget's surface does not composite reliably.
   view_stack_ = new QStackedWidget(container);
   layout->addWidget(view_stack_, /*stretch=*/1);
   view_stack_->addWidget(makeEmptyPlaceholder(view_stack_));
@@ -538,8 +578,7 @@ QWidget* Scene2DDockWidget::createSceneView() {
   connect(viewer_, &MediaViewerWidget::rotationChanged, this, &Scene2DDockWidget::viewRotationChanged);
   view_stack_->addWidget(viewer_);
 
-  // Below the viewer, not over it: a raster label does not composite reliably on
-  // the QRhiWidget's surface. Shown while the viewer cannot render.
+  // Below the viewer, not over it, for the same compositing reason. Shown while the viewer cannot render.
   QLabel* rendering_warning = PJ::createRenderingWarningLabel(container, u"scene2dRenderingWarning"_s);
   layout->addWidget(rendering_warning);
   connect(
@@ -568,7 +607,6 @@ QWidget* Scene2DDockWidget::makeEmptyPlaceholder(QWidget* parent) {
   empty_placeholder_icon_ = new QLabel(page);
   empty_placeholder_icon_->setObjectName(u"scene2dEmptyPlaceholderIcon"_s);
   empty_placeholder_icon_->setAlignment(Qt::AlignCenter);
-  // Dim the icon so it reads as a "drop a topic here" watermark, not chrome.
   auto* opacity = new QGraphicsOpacityEffect(empty_placeholder_icon_);
   opacity->setOpacity(0.35);
   empty_placeholder_icon_->setGraphicsEffect(opacity);
@@ -695,9 +733,7 @@ void Scene2DDockWidget::syncViewLayers(const std::vector<ISceneLayer*>& ordered_
     if (scene2d_layer == nullptr) {
       continue;
     }
-    // Tag the layer with its underlying source pointer so the rebuilt composite
-    // can inherit this layer's last frame from the outgoing one (carry-over
-    // below), instead of starting blank and forcing a re-decode.
+    // Tagged with the underlying source, so adoptContributions() below can carry its last frame over.
     MediaSource* underlying = scene2d_layer->mediaSource();
     if (!info.visible || underlying == nullptr) {
       postAnnotationWarning(QPointer<Scene2DLayer>(scene2d_layer), QString());  // left out, it hides nothing
@@ -710,24 +746,18 @@ void Scene2DDockWidget::syncViewLayers(const std::vector<ISceneLayer*>& ordered_
     composite_topic_order_.push_back(info.topic_id);
   }
 
-  // Carry the persisting layers' current frame into the rebuilt composite so the
-  // viewer keeps showing them across the swap instead of going black until each
-  // source re-decodes (the "black until play" symptom on add/remove/hide).
+  // Without the carry-over the viewer shows black after an add, remove or hide until each source re-decodes.
   if (composite_ != nullptr) {
     next->adoptContributions(*composite_);
   }
 
-  // Repoint the viewer at the new composite BEFORE the previous one is freed,
-  // so the viewer never holds a dangling MediaSource — not even transiently
-  // between the swap and the setMediaSource call.
+  // Repoint the viewer before the previous composite is freed: it must never hold a dangling MediaSource.
   auto previous = std::move(composite_);
   composite_ = std::move(next);
   if (viewer_ != nullptr) {
     viewer_->setMediaSource(composite_.get());
   }
-  // `previous` is destroyed here, after the viewer no longer references it.
   syncCompositeTimestamp(ordered_layers);
-  // Show the placeholder iff no visible layer feeds the viewer.
   empty_placeholder_active_ = composite_topic_order_.empty();
   applyEmptyPlaceholderState();
   refreshView();
@@ -753,38 +783,48 @@ void Scene2DDockWidget::primeRestoreLayerKind(const QDomElement& layer_element) 
   }
   const QString saved_kind = layer_element.attribute(QString::fromLatin1(kLayerKind));
   if (saved_kind != QString::fromLatin1(kImageKind) && saved_kind != QString::fromLatin1(kDepthKind)) {
-    return;  // legacy layout: retain first-sample encoding dispatch
+    return;  // no saved kind: first-sample encoding dispatch decides
   }
 
-  bool dataset_ok = false;
-  const qulonglong dataset_value = layer_element.attribute(u"dataset_id"_s).toULongLong(&dataset_ok);
-  if (!dataset_ok || dataset_value > std::numeric_limits<uint32_t>::max()) {
+  const ImageLayerKind kind =
+      saved_kind == QString::fromLatin1(kDepthKind) ? ImageLayerKind::kDepth : ImageLayerKind::kImage;
+  const std::optional<SavedLayerHeader> header =
+      parseSavedLayerHeader(layer_element, SavedTopicRef::kOptional, layerFactory());
+  if (!header.has_value()) {
+    return;  // the base restore refuses it
+  }
+  const std::string topic_name = header->topic_name.toStdString();
+  const ObjectStore& store = sessionManager()->objectStore();
+  if (!header->qualified) {
+    // Primed before the restore picks the dock's dataset, so every candidate the base restore could bind
+    // (uniqueObjectTopic) gets the kind; only the bound one reads it.
+    if (header->object_type.has_value()) {
+      for (const ObjectTopicId candidate : objectTopicsMatching(store, topic_name, *header->object_type)) {
+        restore_image_layer_kinds_.insert_or_assign(topicKey(candidate), kind);
+      }
+    }
     return;
   }
-  const QString topic_name = layer_element.attribute(u"topic_name"_s);
   const auto dataset_id = sessionManager()
                               ->resolveObjectDatasetIdentity(
-                                  static_cast<DatasetId>(dataset_value), layer_element.attribute(u"dataset_source"_s),
-                                  layer_element.attribute(u"dataset_path"_s), topic_name)
+                                  header->dataset_id, header->dataset_source, header->dataset_path, header->topic_name)
                               .id;
   if (!dataset_id.has_value()) {
     return;
   }
-  const auto topic_id = sessionManager()->objectStore().findTopic(*dataset_id, topic_name.toStdString());
-  if (!topic_id.has_value()) {
-    return;
+  const auto topic_id = store.findTopic(*dataset_id, topic_name);
+  if (topic_id.has_value()) {
+    restore_image_layer_kinds_.insert_or_assign(topicKey(*topic_id), kind);
   }
-  restore_image_layer_kinds_.insert_or_assign(
-      topicKey(*topic_id),
-      saved_kind == QString::fromLatin1(kDepthKind) ? ImageLayerKind::kDepth : ImageLayerKind::kImage);
 }
 
 bool Scene2DDockWidget::restoreOnePending(const QDomElement& element) {
   // A deferred drop (advertised topic, no data yet) gets tryAcceptObjectTopic's
   // one-background policy; saved layout layers keep appending.
-  const auto object_type = sdk::parseBuiltinObjectType(element.attribute(u"object_type"_s).toStdString());
-  const bool dropped_background =
-      element.attribute(u"pending_intent"_s) == u"true"_s && object_type.has_value() && isBackgroundType(*object_type);
+  const std::optional<SavedLayerHeader> header =
+      parseSavedLayerHeader(element, SavedTopicRef::kOptional, layerFactory());
+  const bool dropped_background = header.has_value() && header->pending_intent && header->object_type.has_value() &&
+                                  isBackgroundType(*header->object_type);
   const std::vector<ObjectTopicId> previous_backgrounds =
       dropped_background ? backgroundTopics() : std::vector<ObjectTopicId>{};
 
@@ -852,10 +892,8 @@ void Scene2DDockWidget::syncCompositeTimestamp(const std::vector<ISceneLayer*>& 
   if (composite_ == nullptr) {
     return;
   }
-  // A rebuild rewraps the same underlying sources, which still hold their
-  // per-timestamp dedup; invalidate first so the re-seed below re-decodes at the
-  // (usually unchanged) current time instead of leaving a stale/empty frame
-  // until the tracker next moves (the "black until play" symptom).
+  // The rewrapped sources still dedup on the timestamp: without invalidate() the re-seed at an unchanged time
+  // decodes nothing and the frame stays stale until the tracker moves.
   composite_->invalidate();
   const auto seed = seedTimestampNs(ordered_layers);
   if (seed.has_value()) {

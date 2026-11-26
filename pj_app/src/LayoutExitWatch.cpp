@@ -16,18 +16,18 @@ LayoutExitWatch::LayoutExitWatch(
     : QObject(parent), report_exit_code_(std::move(report_exit_code)) {
   timeout_timer_.setSingleShot(true);
   connect(&timeout_timer_, &QTimer::timeout, this, [this]() { decide(kExitCodeTimeout); });
-  connect(&window, &MainWindow::layoutRestoreSettled, this, [this](bool success) {
-    decide(success ? kExitCodeSuccess : kExitCodeLoadFailed);
-  });
-  // QTimer intervals are int milliseconds: clamp instead of silently
-  // wrapping (the header documents the semantics; the CLI also guards).
+  connect(
+      &window, &MainWindow::layoutRestoreSettled, this,
+      [this, load = window.nextLayoutLoad()](bool success, quint64 settled) {
+        if (settled == load) {
+          decide(success ? kExitCodeSuccess : kExitCodeLoadFailed);
+        }
+      });
   const auto clamped_ms = std::min<std::chrono::milliseconds::rep>(timeout.count(), std::numeric_limits<int>::max());
   timeout_timer_.start(static_cast<int>(clamped_ms));
 }
 
 void LayoutExitWatch::decide(int code) {
-  // The first decision is final — stop the deadline so a late timer tick
-  // cannot follow a settlement (and a late settlement is ignored likewise).
   if (decided_) {
     return;
   }

@@ -8,8 +8,10 @@
 
 namespace PJ {
 
-// Floating-point variant of the Blender-style scrubber. Public API mirrors
-// QDoubleSpinBox so .ui files can be migrated by promoting the widget.
+// Floating-point variant of the Blender-style scrubber; the API mirrors QDoubleSpinBox, so a .ui migrates by promoting
+// the widget. The value is always finite: setValue() ignores NaN and infinity (and a non-finite bound that would clamp
+// to one), and typed "nan" / "inf" is refused like any unparsable text (value kept, no editingFinished), because the
+// value drives consumers that cannot take them.
 class DoubleScrubber : public ScrubberBase {
   Q_OBJECT
   Q_PROPERTY(double value READ value WRITE setValue NOTIFY valueChanged USER true)

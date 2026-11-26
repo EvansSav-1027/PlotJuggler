@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { test, expect } = require('@playwright/test');
-const { waitForQtApp } = require('./support/app');
+const { waitForQtApp, wasmHeap } = require('./support/app');
 const { nativePickerType } = require('./support/browser');
 const { clickActiveDialogButton } = require('./support/dialogs');
 const { base64Fixture } = require('./support/fixtures');
+const { writeSparseRos2Float64Mcap } = require('./support/large_mcap');
+const { loadOutcomes, firstLoadOutcome, loadOutcomeCount } = require('./support/load_outcomes');
 const { openFileChooser } = require('./support/pickers');
 
 async function csvDialogControlGeometry(page, consoleMessages) {
@@ -62,10 +67,8 @@ async function ingestControlGeometry(page, consoleMessages, required) {
   throw new Error(`ingest ${required} control did not become visible`);
 }
 
-// Stops the in-flight import from the loading row's own affordances. The two
-// glyphs ARE the choice — ✕ ('keep') keeps what arrived, the bin ('remove')
-// discards it — so this is one click and no confirmation dialog: the host acts
-// on which glyph was hit rather than asking afterwards.
+// Stops the in-flight import from the loading row's own affordances. The two glyphs are the choice (✕ 'keep'
+// keeps what arrived, the bin 'remove' discards it): one click, no confirmation dialog.
 async function stopIngest(page, screen, consoleMessages, action) {
   const controls = await ingestControlGeometry(page, consoleMessages, action);
   await page.mouse.click(screen.x + controls[action].x, screen.y + controls[action].y);
@@ -112,21 +115,130 @@ test('browser picker falls back under cross-origin isolation without removing th
   expect(errors).toEqual([]);
 });
 
+// A picked File is read lazily, never copied. A sparse file larger than the wasm32 address space can only load that
+// way, and the linear memory, which never shrinks, records the peak: it must not grow with the file.
+test('a picked file larger than the wasm address space loads without a copy', async ({ page }) => {
+  test.setTimeout(600000);
+  const errors = [];
+  const consoleMessages = [];
+  page.on('pageerror', error => errors.push(String(error)));
+  page.on('console', message => consoleMessages.push(message.text()));
+  await page.goto(process.env.PJ_WASM_URL || 'http://127.0.0.1:6931/plotjuggler4.html');
+  await waitForQtApp(page, consoleMessages);
+  const screen = await page.locator('#screen').boundingBox();
+  expect(screen).not.toBeNull();
+
+  // Sparse, from disk: Playwright refuses in-memory buffers over 50 MB.
+  const fileBytes = 4.5 * 1024 * 1024 * 1024;
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-pick-'));
+  const file = path.join(directory, 'large.pjprobe');
+  fs.closeSync(fs.openSync(file, 'w'));
+  fs.truncateSync(file, fileBytes);
+  try {
+    const before = await wasmHeap(page, consoleMessages);
+    const chooser = await openFileChooser(page, screen, true);
+    await chooser.setFiles(file);
+    await page.waitForTimeout(1000);
+    await clickActiveDialogButton(page, screen, consoleMessages, 'ok');
+    await expect.poll(
+      () => consoleMessages.find(message => message.includes('PJ_WASM_INGRESS_PROBE_OK')) || '',
+      { timeout: 540000 },
+    ).toContain(`bytes=${fileBytes} sum=0`);
+    const after = await wasmHeap(page, consoleMessages);
+    expect(after.memory - before.memory).toBeLessThan(64 * 1024 * 1024);
+    expect(errors).toEqual([]);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// Every offset past 2 GiB, where a 32-bit `long` stops, and past 4 GiB, where a 32-bit `size_t` wraps, must reach the
+// MCAP loader intact: its dialog and its loader both seek to the chunk, summary and footer beyond the sparse hole.
+test('a picked MCAP larger than 4 GiB loads its data', async ({ page }) => {
+  test.setTimeout(300000);
+  const errors = [];
+  const consoleMessages = [];
+  page.on('pageerror', error => errors.push(String(error)));
+  page.on('console', message => consoleMessages.push(message.text()));
+  await page.goto(process.env.PJ_WASM_URL || 'http://127.0.0.1:6931/plotjuggler4.html');
+  await waitForQtApp(page, consoleMessages);
+  const screen = await page.locator('#screen').boundingBox();
+  expect(screen).not.toBeNull();
+
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-pick-'));
+  const file = path.join(directory, 'large-ros2.mcap');
+  writeSparseRos2Float64Mcap(file, 4.5 * 1024 * 1024 * 1024, [1.25, 4.5, 7.75]);
+  try {
+    const chooser = await openFileChooser(page, screen, true);
+    await chooser.setFiles(file);
+    await page.waitForTimeout(2000);
+    await clickActiveDialogButton(page, screen, consoleMessages, 'ok');
+    await expect.poll(
+      () => firstLoadOutcome(page, '/ros2/value/data:3@'),
+      { timeout: 240000 },
+    ).toContain('=1.25..7.75');
+    expect(errors).toEqual([]);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// A lazily read File that changes on disk after the pick fails its reads; a std::istream reader would take that for
+// the end of the file, so the failure must be reported, and the app must stay usable for the next pick.
+test('a picked file changed on disk reports the failed read and leaves the app usable', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors = [];
+  const consoleMessages = [];
+  page.on('pageerror', error => errors.push(String(error)));
+  page.on('console', message => consoleMessages.push(message.text()));
+  await page.goto(process.env.PJ_WASM_URL || 'http://127.0.0.1:6931/plotjuggler4.html');
+  await waitForQtApp(page, consoleMessages);
+  const screen = await page.locator('#screen').boundingBox();
+  expect(screen).not.toBeNull();
+
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-pick-'));
+  const changing = path.join(directory, 'changing.pjprobe');
+  const good = path.join(directory, 'good.pjprobe');
+  fs.writeFileSync(changing, Buffer.alloc(8 * 1024 * 1024, 1));
+  fs.writeFileSync(good, Buffer.alloc(1024, 1));
+  try {
+    const chooser = await openFileChooser(page, screen, true);
+    await chooser.setFiles(changing);
+    await page.waitForTimeout(1000);
+    fs.writeFileSync(changing, Buffer.alloc(4 * 1024 * 1024, 2));
+    await clickActiveDialogButton(page, screen, consoleMessages, 'ok');
+    await expect.poll(
+      () => consoleMessages.find(message => message.includes('PJ_BROWSER_PICK_READ_FAILED')) || '',
+      { timeout: 60000 },
+    ).toContain('changing.pjprobe');
+
+    const probesBefore = consoleMessages.filter(message => message.includes('PJ_WASM_INGRESS_PROBE_OK')).length;
+    const next = await openFileChooser(page, screen, true);
+    await next.setFiles(good);
+    await page.waitForTimeout(1000);
+    await clickActiveDialogButton(page, screen, consoleMessages, 'ok');
+    await expect.poll(
+      () => consoleMessages.filter(message => message.includes('PJ_WASM_INGRESS_PROBE_OK')).slice(probesBefore).join(),
+      { timeout: 60000 },
+    ).toContain('bytes=1024 sum=1024');
+    expect(errors).toEqual([]);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('browser file dialog can reject then accept without a nested event loop', async ({ page }) => {
   test.setTimeout(90000);
   const errors = [];
   const consoleMessages = [];
-  // Qt prefers the File System Access API when Chrome exposes it. Playwright's
-  // setFiles hook targets `<input type=file>`, so force Qt's documented HTML
-  // fallback for this automation-only byte injection.
+  // Qt prefers the File System Access API when the browser exposes it; Playwright's setFiles only reaches an
+  // `<input type=file>`, so remove the API to force Qt's HTML fallback.
   await page.addInitScript(() => { delete window.showOpenFilePicker; });
   page.on('pageerror', error => errors.push(String(error)));
   page.on('console', message => consoleMessages.push(message.text()));
   await page.goto(process.env.PJ_WASM_URL || 'http://127.0.0.1:6931/plotjuggler4.html');
   await waitForQtApp(page, consoleMessages);
 
-  // Qt renders widgets into its canvas. Address the upload icon on the file
-  // page relative to that canvas.
   const screen = await page.locator('#screen').boundingBox();
   expect(screen).not.toBeNull();
   const chooser = await openFileChooser(page, screen);
@@ -135,22 +247,17 @@ test('browser file dialog can reject then accept without a nested event loop', a
     mimeType: 'application/octet-stream',
     buffer: Buffer.from([1, 2, 3, 4, 5]),
   });
-  // The static fixture has a real plugin configuration dialog. Rejecting must
-  // release FileLoader's suspended coroutine and leave the queue usable.
-  // Let the dialog's finished callback unwind the suspended coroutine and let
-  // Qt dispose the browser input element before invoking the picker again.
+  // The fixture has a plugin configuration dialog; rejecting it must release FileLoader's suspended coroutine
+  // and leave the queue usable. The wait lets the dialog's callback unwind the coroutine and Qt dispose the
+  // browser input element before the picker is invoked again.
   await page.waitForTimeout(1500);
   await clickActiveDialogButton(page, screen, consoleMessages, 'cancel');
-  // Wait for FileLoader's own rejection marker instead of a fixed delay, so
-  // the absence check below can't race the coroutine unwind.
+  // The rejection marker, not a delay, orders the absence check below after the coroutine unwind.
   await expect.poll(
-    () => consoleMessages.some(message => message.includes('PJ_FILE_LOAD_REJECTED')),
+    async () => (await loadOutcomeCount(page, 'PJ_FILE_LOAD_REJECTED')) > 0,
     { timeout: 10000 },
   ).toBe(true);
-  // Anchor the accept-path poll after the rejection marker: a stray early
-  // PROBE_OK (there shouldn't be one, but a fixed-length find() can't tell)
-  // must not satisfy it.
-  const rejectionIndex = consoleMessages.findIndex(message => message.includes('PJ_FILE_LOAD_REJECTED'));
+  // No PROBE_OK before the accept path, so the poll below can only see its own.
   expect(consoleMessages.some(message => message.includes('PJ_WASM_INGRESS_PROBE_OK'))).toBe(false);
 
   const secondChooser = await openFileChooser(page, screen, true);
@@ -161,8 +268,7 @@ test('browser file dialog can reject then accept without a nested event loop', a
   });
   await clickActiveDialogButton(page, screen, consoleMessages, 'ok');
   await expect.poll(
-    () => consoleMessages.slice(rejectionIndex + 1).find(message => message.includes('PJ_WASM_INGRESS_PROBE_OK')) ||
-        '',
+    () => consoleMessages.find(message => message.includes('PJ_WASM_INGRESS_PROBE_OK')) || '',
     { timeout: 10000 },
   ).toContain('bytes=5 sum=15');
   expect(errors).toEqual([]);
@@ -189,14 +295,13 @@ test('official CSV plugin previews and imports browser-selected data', async ({ 
     buffer: Buffer.from('time,value,temp\n0,1,10\n1,2,20\n2,3,30\n'),
   });
 
-  // Accept the production CSV configuration through its live Qt button.
   await page.waitForTimeout(1000);
   await clickActiveDialogButton(page, screen, consoleMessages, 'ok');
   await expect.poll(
-    () => consoleMessages.find(message => message.includes('PJ_FILE_LOAD_OK')) || '',
+    () => firstLoadOutcome(page),
     { timeout: 15000 },
   ).toContain('plugin=CSV Loader');
-  const loadMessage = consoleMessages.find(message => message.includes('PJ_FILE_LOAD_OK')) || '';
+  const loadMessage = await firstLoadOutcome(page);
   expect(loadMessage).toContain('catalog_items=3');
   expect(loadMessage).toContain('scalar_count=3');
   expect(loadMessage).toContain('scalar_series=sample/temp,sample/time,sample/value');
@@ -226,12 +331,10 @@ test('official CSV plugin applies delimiter and time-column choices', async ({ p
   });
   await page.waitForTimeout(750);
 
-  // An unambiguous semicolon file is auto-detected: the dialog locks the
-  // delimiter (auto-detection on, combo disabled) and the imported series names
-  // below prove it was applied. Then switch the Time Axis mode to "Selected
-  // Column" and pick `time`. The controls live in Qt's canvas; sample their
-  // current geometry because the canonical host title bar changes the embedded
-  // plugin's origin.
+  // An unambiguous semicolon file is auto-detected: the dialog locks the delimiter (auto-detection on, combo
+  // disabled) and the imported series names below prove it was applied. Then switch the Time Axis mode to
+  // "Selected Column" and pick `time`. Control geometry is sampled live because the host title bar shifts
+  // the embedded plugin's origin.
   let controls = await csvDialogControlGeometry(page, consoleMessages);
   expect(controls.autoDelimiter.checked).toBe(true);
   expect(controls.delimiter.enabled).toBe(false);
@@ -251,10 +354,10 @@ test('official CSV plugin applies delimiter and time-column choices', async ({ p
   await clickActiveDialogButton(page, screen, consoleMessages, 'ok');
 
   await expect.poll(
-    () => consoleMessages.find(message => message.includes('PJ_FILE_LOAD_OK')) || '',
+    () => firstLoadOutcome(page),
     { timeout: 15000 },
   ).toContain('plugin=CSV Loader');
-  const loadMessage = consoleMessages.find(message => message.includes('PJ_FILE_LOAD_OK')) || '';
+  const loadMessage = await firstLoadOutcome(page);
   expect(loadMessage).toContain('catalog_items=2');
   expect(loadMessage).toContain('scalar_count=2');
   expect(loadMessage).toContain('scalar_series=semicolon/temp,semicolon/value');
@@ -285,10 +388,9 @@ test('official CSV plugin can continue after a malformed-row warning', async ({ 
   await page.waitForTimeout(750);
   await clickActiveDialogButton(page, screen, consoleMessages, 'ok');
 
-  // CsvSource asks on its ingest worker while the GUI remains event-driven.
-  // Wait for FileLoader to queue the real QMessageBox, then activate its
-  // default Continue action by keyboard; the app-modal dialog's position can
-  // change as Qt lays out the wrapped text.
+  // CsvSource asks on its ingest worker while the GUI stays event-driven. Once FileLoader has queued the
+  // QMessageBox, press its default Continue by keyboard: the app-modal dialog's position moves with its
+  // wrapped text.
   await expect.poll(
     () => consoleMessages.find(message => message.includes('PJ_WASM_PLUGIN_MESSAGE')) || '',
     { timeout: 15000 },
@@ -297,10 +399,10 @@ test('official CSV plugin can continue after a malformed-row warning', async ({ 
   await page.keyboard.press('Enter');
 
   await expect.poll(
-    () => consoleMessages.find(message => message.includes('PJ_FILE_LOAD_OK')) || '',
+    () => firstLoadOutcome(page),
     { timeout: 15000 },
   ).toContain('plugin=CSV Loader');
-  const loadMessage = consoleMessages.find(message => message.includes('PJ_FILE_LOAD_OK')) || '';
+  const loadMessage = await firstLoadOutcome(page);
   expect(loadMessage).toContain('catalog_items=3');
   expect(loadMessage).toContain('scalar_count=3');
   expect(loadMessage).toContain('malformed/value:2@0..1000000000=1..3');
@@ -328,10 +430,10 @@ test('official CSV plugin can stop and keep a browser import', async ({ page }) 
   await stopIngest(page, screen, consoleMessages, 'keep');
 
   await expect.poll(
-    () => consoleMessages.find(message => message.includes('PJ_FILE_LOAD_OK')) || '',
+    () => firstLoadOutcome(page),
     { timeout: 30000 },
   ).toContain('plugin=CSV Loader');
-  const loadMessage = consoleMessages.find(message => message.includes('PJ_FILE_LOAD_OK')) || '';
+  const loadMessage = await firstLoadOutcome(page);
   const partial = loadMessage.match(/large\/value:(\d+)@/);
   expect(partial).not.toBeNull();
   expect(Number(partial[1])).toBeGreaterThan(0);
@@ -364,7 +466,7 @@ test('official CSV plugin can discard a partial import and load again', async ({
     () => consoleMessages.some(message => message.includes('import discarded by user; the new dataset is removed')),
     { timeout: 30000 },
   ).toBe(true);
-  expect(consoleMessages.some(message => message.includes('PJ_FILE_LOAD_OK'))).toBe(false);
+  expect(await loadOutcomes(page, 'PJ_FILE_LOAD_OK')).toEqual([]);
 
   // A discarded load must release the queue and its empty dataset shell.
   const retryChooser = await openFileChooser(page, screen, true);
@@ -376,7 +478,7 @@ test('official CSV plugin can discard a partial import and load again', async ({
   await page.waitForTimeout(750);
   await clickActiveDialogButton(page, screen, consoleMessages, 'ok');
   await expect.poll(
-    () => consoleMessages.find(message => message.includes('PJ_FILE_LOAD_OK')) || '',
+    () => firstLoadOutcome(page),
     { timeout: 15000 },
   ).toContain('after-discard/value:2@0..1000000000=5..6');
   expect(errors).toEqual([]);
@@ -409,17 +511,17 @@ test('same-named CSV uploads keep distinct browser identities and data', async (
 
   await loadCsv('time,value\n0,1\n1,2\n');
   await expect.poll(
-    () => consoleMessages.filter(message => message.includes('PJ_FILE_LOAD_OK')).length,
+    () => loadOutcomeCount(page),
     { timeout: 15000 },
   ).toBe(1);
   await page.waitForTimeout(1500);
   await loadCsv('time,value\n0,5\n1,6\n');
   await expect.poll(
-    () => consoleMessages.filter(message => message.includes('PJ_FILE_LOAD_OK')).length,
+    () => loadOutcomeCount(page),
     { timeout: 15000 },
   ).toBe(2);
 
-  const loads = consoleMessages.filter(message => message.includes('PJ_FILE_LOAD_OK'));
+  const loads = await loadOutcomes(page, 'PJ_FILE_LOAD_OK');
   expect(loads[0]).toContain('same/value:2@0..1000000000=1..2');
   expect(loads[1]).toContain('same/value:2@0..1000000000=5..6');
   const identities = loads.map(message => message.match(/identity=([^ ]+)/)?.[1]);
@@ -452,12 +554,16 @@ test('official Protobuf parser imports scalars and cold-decodes a Foxglove objec
   await clickActiveDialogButton(page, screen, consoleMessages, 'ok');
 
   await expect.poll(
-    () => consoleMessages.find(message => message.includes('/protobuf/telemetry/temperature:3@')) || '',
+    () => firstLoadOutcome(page, '/protobuf/telemetry/temperature:3@'),
     { timeout: 30000 },
   ).toContain('=12.5..-2');
-  const object = consoleMessages.find(
-    message => message.includes('PJ_WASM_PROTOBUF_OBJECT_OK topic=/foxglove/tf'),
+  // The object probe logs after the load does, once its cold fetch has read the picked file on demand.
+  const objectMessage = () => consoleMessages.find(
+    message => message.includes('PJ_WASM_PROTOBUF_OBJECT_OK topic=/foxglove/tf')
+      || message.includes('PJ_WASM_PROTOBUF_OBJECT_FAILED'),
   ) || '';
+  await expect.poll(objectMessage, { timeout: 30000 }).not.toBe('');
+  const object = objectMessage();
   expect(object).toContain('entries=1 type=kFrameTransforms');
   expect(object).toContain('transforms=1 parent=map child=base_link');
   expect(consoleMessages.some(message => message.includes('PJ_WASM_PROTOBUF_OBJECT_FAILED'))).toBe(false);
@@ -490,16 +596,13 @@ test('official Protobuf parser reports a bad descriptor and leaves the load queu
     () => consoleMessages.find(message => message.includes('PJ_WASM_PLUGIN_MESSAGE title=Parser Error')) || '',
     { timeout: 15000 },
   ).toContain('failed to parse FileDescriptorSet');
-  // QMessageBox geometry depends on the wrapped diagnostic text. Its default
-  // OK action is keyboard-stable even when the button's canvas coordinate is
-  // not. The diagnostic is emitted just before the queued GUI presentation, so
-  // wait for the modal window to acquire focus before sending Enter.
+  // QMessageBox geometry depends on the wrapped diagnostic text, so press its default OK by keyboard. The
+  // diagnostic is logged just before the queued GUI presentation: wait for the modal to take focus first.
   await page.waitForTimeout(750);
   await page.keyboard.press('Enter');
   await page.waitForTimeout(1500);
 
-  // A failed MCAP import must release the suspended worker and queue. Prove it
-  // with a real CSV import rather than only checking that the error appeared.
+  // A failed MCAP import must release the suspended worker and queue: a real CSV import afterwards proves it.
   const retryChooser = await openFileChooser(page, screen, true);
   await retryChooser.setFiles({
     name: 'after-mcap-error.csv',
@@ -509,7 +612,7 @@ test('official Protobuf parser reports a bad descriptor and leaves the load queu
   await page.waitForTimeout(750);
   await clickActiveDialogButton(page, screen, consoleMessages, 'ok');
   await expect.poll(
-    () => consoleMessages.find(message => message.includes('after-mcap-error/value:2@')) || '',
+    () => firstLoadOutcome(page, 'after-mcap-error/value:2@'),
     { timeout: 15000 },
   ).toContain('=7..8');
   expect(errors).toEqual([]);

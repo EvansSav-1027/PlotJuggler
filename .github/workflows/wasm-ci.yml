@@ -6,46 +6,48 @@
 #
 #   1. Production — the shipped defaults (Scene2D/Scene3D and browser Python
 #      ON), probes OFF: the app must configure, build, package deterministically
-#      with the sample presets (resources/wasm-presets), stay within its
-#      download budget, and pass the deployment contract + cold threaded
-#      Chromium boot.
+#      as app.plotjuggler.io publishes it (no presets: its Worker serves the
+#      samples' index, packaging/web), stay within its download budget, and pass
+#      the deployment contract + cold threaded Chromium boot.
 #   2. Acceptance — the same defaults with the ingress probe ON: the retained
 #      QRhi capability probe and functional browser suite (with python.spec.js
 #      and python_layout.spec.js) run against the same source graph used by the
 #      packaged application, in Chromium (wasm-chromium job, three Playwright
-#      workers) and Firefox (wasm-firefox, two shards of one worker), which run
-#      in parallel on this job's package.
+#      workers) and Firefox (wasm-firefox, two shards of one worker; nightly
+#      and manual runs only), which run in parallel on this job's package.
 #      It is packaged twice: without presets (deploy/, every spec) and with the
-#      samples (deploy-presets/, which presets.spec.js serves itself).
+#      samples (deploy-presets/, which presets.spec.js serves itself and whose
+#      deployed files the deployment contract checks).
 #
-# The deterministic release archive and performance budgets remain part of
-# the release tranche.
+# A version tag (e.g. `4.2.0`, no leading 'v') also builds the production
+# package as a release: stamped with the tag's version and the
+# PJ_EASTER_EGG_KEY secret, with its GPL-3.0 source offer (sources/), and the
+# wasm-release job attaches it to the tag's GitHub Release as
+# PlotJuggler4-web-bundle.zip once the Chromium suite passes. The name carries
+# no version, so releases/latest/download/PlotJuggler4-web-bundle.zip reaches
+# the latest release's copy once that job has finished. A manual run on a
+# branch builds the same archive as the wasm-release artifact, without the
+# Release upload, like the other release workflows. The hosted app
+# (app.plotjuggler.io) is still deployed by hand (packaging/web/README.md).
 name: WASM CI
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
   # Wasm breakage is invisible to the standard PR checks (native CI stays green
-  # when shared code calls a native-only API). Shared-code changes are caught by
-  # the nightly run; PRs run it only when they touch the browser build itself.
-  # Not a required check; ~20-30 min on warm caches. Drafts wait: marking one
-  # ready runs it.
+  # when shared code calls a native-only API, and behaviour changes only the
+  # browser specs pin go unnoticed). Every PR builds the browser app and runs the
+  # @smoke specs; PRs that touch the browser build itself (WASM_PATHS below) and
+  # the nightly run the whole Chromium suite. Not a required check; the build is
+  # ~20 min warm. Drafts wait: marking one ready runs it.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - '**/wasm/**'
-      - 'tests/wasm/**'
-      - 'cmake/PjWasm*'
-      - 'cmake/wasm_python/**'
-      - 'cmake/wasm_notices/**'
-      # The on-demand Python lane compiles into the browser build.
-      - 'pj_scripting/**'
-      # Packaging, serving and size-gate scripts: this job is their only
-      # consumer, and '**/wasm/**' does not match a file whose name — not
-      # directory — carries the wasm token.
-      - 'scripts/*wasm*'
-      # The sample presets the production and acceptance packages deploy.
-      - 'resources/wasm-presets/**'
-      - '.github/workflows/wasm-ci.yml'
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '.claude/**'
   schedule:
     - cron: "0 4 * * *"
 
@@ -67,12 +69,31 @@ jobs:
     if: >-
       ${{ !cancelled() && !github.event.pull_request.draft &&
       (github.event_name != 'schedule' || needs.changed.outputs.changed == 'true') }}
-    runs-on: depot-ubuntu-22.04-4
-    # Generous first-run ceiling (cold Qt+emsdk+ccache); warm runs are expected
-    # in the 20-30 minute band. Tighten once real timings accumulate.
+    # PR and manual runs on Depot, unlike the other workflows' GitHub-hosted runners:
+    # WASM is the slowest workflow, which Depot runs in 27 minutes against GitHub's
+    # 39 (warm medians), and its browser time bounds need a steady runner (GitHub's
+    # took 925-2268 ms for the same sample restore). The nightly run, which nobody
+    # waits on, stays on GitHub's free runners. Same choice for the browser jobs.
+    runs-on: ${{ github.event_name == 'schedule' && 'ubuntu-22.04' || 'depot-ubuntu-22.04-4' }}
+    # Generous ceiling for a cold run (Qt + emsdk + ccache); warm runs take 20-30 minutes.
     timeout-minutes: 120
+    env:
+      # Tags only: CMake stamps the binary with it and package_wasm.mjs the manifest and loading page. Empty means
+      # versions.env's.
+      PJ_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
 
     steps:
+      - name: Free up runner disk space
+        # GitHub-hosted Ubuntu runners (the nightly run) leave ~14 GB free, which the
+        # Conan closure, Qt and the build tree can exceed ("No space left on
+        # device"). Reclaim the preinstalled toolchains no job here uses.
+        if: github.event_name == 'schedule'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/lib/node_modules
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
       - name: Use HTTPS for github.com submodules
         run: git config --global url."https://github.com/".insteadOf "git@github.com:"
 
@@ -102,7 +123,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ccache ninja-build python3-pip make pkg-config
+          sudo apt-get install -y --no-install-recommends ccache ninja-build python3-pip make pkg-config zip
           # Scene2D video cross-compiles dav1d, whose build system is meson.
           python3 -m pip install --user meson
           # Runtime libraries for the desktop host Qt tools (qsb bakes the QRhi
@@ -154,7 +175,8 @@ jobs:
         # restore/save split rather than actions/cache: the implicit post-job
         # save fires on every run and the SHA-keyed entry is never an exact
         # hit, so each run persisted a new blob of up to max_size (4 G below)
-        # into billed Depot Cache storage. See linux-ci.yml's "Save ccache".
+        # into the cache store (billed Depot Cache on Depot, the repo's shared 10 GB
+        # Actions cache on the nightly GitHub runner). See linux-ci.yml's "Save ccache".
         id: ccache_restore
         uses: actions/cache/restore@v5
         with:
@@ -183,6 +205,11 @@ jobs:
 
       - name: Build production package (shipped defaults, probes off)
         shell: bash
+        env:
+          # Release archives only (tags and manual runs): the key that decrypts the empty-dock easter egg GIFs
+          # (pj_widgets). Empty means no key.
+          PJ_EASTER_EGG_KEY: >-
+            ${{ (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch') && secrets.PJ_EASTER_EGG_KEY || '' }}
         run: |
           set -euo pipefail
           source .emsdk/emsdk_env.sh >/dev/null
@@ -206,16 +233,19 @@ jobs:
         run: |
           set -euo pipefail
           npm --prefix tests/wasm run test:package
-          node scripts/package_wasm.mjs --presets resources/wasm-presets \
+          node scripts/package_wasm.mjs \
             --source build-wasm-prod/pj_app --output build-wasm-prod/deploy
-          node scripts/package_wasm.mjs --presets resources/wasm-presets \
+          node scripts/package_wasm.mjs \
             --source build-wasm-prod/pj_app --output build-wasm-prod/deploy-b
           diff -qr build-wasm-prod/deploy build-wasm-prod/deploy-b
 
       - name: Download budget of the production package
-        # 5 % over the measured 16,125,617 B (2026-10-21, Python and the
-        # notices included). Raise it deliberately, with the new measurement.
-        run: node scripts/wasm_size_budget.mjs build-wasm-prod/deploy/manifest.json 16932000
+        # Measured 16,125,617 B on 2026-10-21 (Python and the notices included), about
+        # 17 MB with the browser MCP server (16,992,912 B on 2026-11-11); the 20,000,000 B
+        # budget leaves room for more built-in plugins. Raise it
+        # deliberately. The Python stdlib zip (python_stdlib.zip, about 0.67 MB) is
+        # downloaded on first Python use and not counted.
+        run: node scripts/wasm_size_budget.mjs build-wasm-prod/deploy/manifest.json 20000000
 
       - name: Cache Playwright browsers
         uses: actions/cache@v5
@@ -234,6 +264,38 @@ jobs:
         env:
           PJ_WASM_PACKAGE_DIR: ${{ github.workspace }}/build-wasm-prod/deploy
         run: npm run test:deployment
+
+      - name: Release archive of the production package
+        # After the deployment contract, so the archive is the package that passed it. Like every desktop package
+        # (packaging/README.md, "Licences"), it carries PlotJuggler's LICENSE beside the build's
+        # THIRD_PARTY_NOTICES.txt, and the source offer goes in sources/, where those notices point.
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/wasm_source_offer.mjs --links --output build-wasm-prod/deploy/sources
+          cp LICENSE build-wasm-prod/deploy/LICENSE
+          for f in LICENSE THIRD_PARTY_NOTICES.txt sources/SOURCE-OFFER.txt; do
+            test -s "build-wasm-prod/deploy/${f}" || { echo "::error::the web bundle has no ${f}"; exit 1; }
+          done
+          # The bundle fetches each easter egg GIF by name from the asset host (pj_app/src/main.cpp): one missing or
+          # stale there never shows.
+          for f in resources/gif/*.gif.enc; do
+            url="https://assets.plotjuggler.io/v1/gif/$(basename "${f}")"
+            remote=$(curl -fsSL "${url}" | sha256sum | cut -d' ' -f1) || remote=missing
+            [ "${remote}" = "$(sha256sum "${f}" | cut -d' ' -f1)" ] || { echo "::error::${url} does not serve ${f}"; exit 1; }
+          done
+          (cd build-wasm-prod/deploy && zip -qr ../PlotJuggler4-web-bundle.zip .)
+
+      - name: Upload release archive
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-release
+          path: build-wasm-prod/PlotJuggler4-web-bundle.zip
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Build acceptance configuration (shipped defaults, ingress probe on)
         shell: bash
@@ -262,8 +324,8 @@ jobs:
         # Re-seed only when the restore found nothing at all. This workflow has
         # no push trigger, so a push-only gate would let the cache decay to
         # permanently cold; conversely saving every run persisted a fresh blob
-        # of up to 4 G into billed Depot Cache storage. Cold-only bounds it to
-        # roughly one blob per Depot retention period while staying
+        # of up to 4 G into the cache store. Cold-only bounds it to one blob per
+        # store until retention or eviction drops it, while staying
         # self-healing: whichever run finds an empty cache repopulates it.
         # always(): the browser suites below are irrelevant to object validity.
         if: always() && steps.ccache_restore.outputs.cache-matched-key == ''
@@ -297,6 +359,14 @@ jobs:
           node scripts/package_wasm.mjs --presets resources/wasm-presets \
             --source build-wasm-probe/pj_app --output build-wasm-probe/deploy-presets
 
+      - name: Deployed samples' contract (acceptance package with presets)
+        # The production package carries no presets (app.plotjuggler.io serves its index from the
+        # Worker), so its deployment run skips their file checks; this package has them.
+        working-directory: tests/wasm
+        env:
+          PJ_WASM_PACKAGE_DIR: ${{ github.workspace }}/build-wasm-probe/deploy-presets
+        run: npm run test:deployment -- --grep 'deployed presets'
+
       - name: Upload acceptance package for the browser jobs
         uses: actions/upload-artifact@v4
         with:
@@ -319,7 +389,7 @@ jobs:
   wasm-chromium:
     # The acceptance package of the wasm job, in Chromium (SwiftShader WebGL),
     # including the robot hosting spec, which runs docs/wasm/Caddyfile in Caddy.
-    # Skipped, like wasm-firefox, on PRs into release-* while the repo variable
+    # Skipped on PRs into release-* while the repo variable
     # PJ_CI_RELEASE_PR_LITE is 'true'; the wasm build itself still runs.
     needs: wasm
     # Explicit result check: the implicit success() also fails on the skipped
@@ -327,7 +397,7 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.wasm.result == 'success' &&
       !(github.event_name == 'pull_request' && startsWith(github.base_ref, 'release-') && vars.PJ_CI_RELEASE_PR_LITE == 'true') }}
-    runs-on: depot-ubuntu-22.04-4
+    runs-on: ${{ github.event_name == 'schedule' && 'ubuntu-22.04' || 'depot-ubuntu-22.04-4' }}
     timeout-minutes: 60
     env:
       PJ_WASM_URL: http://127.0.0.1:6931/
@@ -415,13 +485,46 @@ jobs:
           done
           curl -fsS -o /dev/null "${PJ_WASM_URL}" || { echo "wasm server failed to start"; exit 1; }
 
+      - name: Choose the suite
+        # A PR that touches the browser build itself runs everything; any other PR the @smoke specs.
+        id: scope
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The paths this job used to be limited to: the browser build, its tests and packaging.
+          WASM_PATHS: '(^|/)wasm/|^tests/wasm/|^cmake/PjWasm|^cmake/wasm_|^pj_scripting/|^scripts/[^/]*wasm|^resources/wasm-presets/|^\.github/workflows/wasm-ci\.yml$'
+        run: |
+          set -euo pipefail
+          full=true
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            files=$(gh pr diff "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --name-only)
+            grep -qE "${WASM_PATHS}" <<<"${files}" || full=false
+          fi
+          echo "full=${full}" >> "${GITHUB_OUTPUT}"
+          echo "Full Chromium suite: ${full}"
+
       - name: Functional browser suite (acceptance package)
         # Three workers (playwright.config.js); the @serial cases run alone below.
+        if: steps.scope.outputs.full == 'true'
         run: npm --prefix tests/wasm run test
 
       - name: Serial cases (acceptance package)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.scope.outputs.full == 'true' }}
         run: npm --prefix tests/wasm run test:serial
+
+      - name: Smoke specs (acceptance package)
+        if: steps.scope.outputs.full != 'true'
+        run: npm --prefix tests/wasm run test:smoke
+
+      - name: Upload failure output
+        # Playwright's per-test output: a failed snapshot's actual, expected and diff images.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-chromium-failures
+          path: tests/wasm/test-results
+          if-no-files-found: ignore
+          retention-days: 14
 
   wasm-firefox:
     # The acceptance package of the wasm job, in Firefox. Firefox has no
@@ -429,17 +532,19 @@ jobs:
     # and headless Firefox gets no WebGL at all without a display (Xvfb).
     # One Playwright worker (playwright.config.js), so the suite is split
     # across two jobs instead.
+    # Nightly and manual runs only: its single llvmpipe worker makes it the
+    # costliest part of a PR run, and Chromium already gates the PR. A nightly failure
+    # opens a "Nightly failure" issue (nightly-failure.yml); dispatch the workflow on
+    # a branch to run Firefox before merging a Firefox-sensitive change.
     needs: wasm
     strategy:
       fail-fast: false
       matrix:
         shard: [1, 2]
     # Explicit result check: the implicit success() also fails on the skipped
-    # `changed` gate two levels up, which would skip this job on every PR run.
-    if: >-
-      ${{ !cancelled() && needs.wasm.result == 'success' &&
-      !(github.event_name == 'pull_request' && startsWith(github.base_ref, 'release-') && vars.PJ_CI_RELEASE_PR_LITE == 'true') }}
-    runs-on: depot-ubuntu-22.04-4
+    # `changed` gate two levels up, which would skip this job on every manual run.
+    if: ${{ !cancelled() && needs.wasm.result == 'success' && github.event_name != 'pull_request' }}
+    runs-on: ${{ github.event_name == 'schedule' && 'ubuntu-22.04' || 'depot-ubuntu-22.04-4' }}
     timeout-minutes: 60
     env:
       LIBGL_ALWAYS_SOFTWARE: '1'
@@ -525,10 +630,32 @@ jobs:
           xvfb-run -a npm --prefix tests/wasm run test:firefox --
           --grep-invert editors.spec.js --shard=${{ matrix.shard }}/2
 
-      - name: Editors suite (Firefox, non-blocking)
-        # Non-blocking until the time-sliced first Luau materialization is
-        # proven to hold the 100 ms main-thread heartbeat budget in Firefox
-        # on CI runners.
+      - name: Editors suite (Firefox)
         if: ${{ !cancelled() && matrix.shard == 1 }}
-        continue-on-error: true
         run: xvfb-run -a npm --prefix tests/wasm run test:firefox -- --grep editors.spec.js
+
+  wasm-release:
+    # Gated on the Chromium suite, like deb-release on its smoke job: the archive reaches the Release only once the
+    # acceptance build of the same revision has passed in a browser.
+    needs: [wasm, wasm-chromium]
+    if: >-
+      ${{ !cancelled() && github.ref_type == 'tag' &&
+      needs.wasm.result == 'success' && needs.wasm-chromium.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write  # softprops/action-gh-release needs write to create/update the Release
+    steps:
+      - name: Download the release archive
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-release
+          path: pkg
+
+      - name: Attach the browser app to the GitHub Release
+        # No generate_release_notes: linux-appimage-release.yml writes this tag's notes, and regenerating would
+        # rewrite the release body.
+        uses: softprops/action-gh-release@v3
+        with:
+          files: pkg/PlotJuggler4-web-bundle.zip
+          fail_on_unmatched_files: true

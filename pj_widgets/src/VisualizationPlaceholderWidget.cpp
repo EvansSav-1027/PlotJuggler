@@ -4,22 +4,37 @@
 #include "pj_widgets/VisualizationPlaceholderWidget.h"
 
 #include <QAction>
+#include <QApplication>
+#include <QBuffer>
 #include <QContextMenuEvent>
+#include <QCryptographicHash>
+#include <QDate>
+#include <QDir>
 #include <QDragEnterEvent>
 #include <QDragMoveEvent>
 #include <QDropEvent>
 #include <QEvent>
-#include <QHBoxLayout>
+#include <QFile>
+#include <QFileInfo>
+#include <QGridLayout>
 #include <QIcon>
+#include <QLabel>
 #include <QMenu>
 #include <QMimeData>
+#include <QMovie>
 #include <QPaintEvent>
 #include <QPainter>
+#include <QPointer>
+#include <QRandomGenerator>
 #include <QResizeEvent>
 #include <QSize>
+#include <QTimer>
 #include <QToolButton>
+#include <QtEndian>
 #include <algorithm>
+#include <vector>
 
+#include "pj_widgets/AppSettings.h"
 #include "pj_widgets/CurveTreeView.h"
 #include "pj_widgets/FrameworkTokens.h"
 #include "pj_widgets/OwnedMenu.h"
@@ -29,16 +44,17 @@ using namespace Qt::StringLiterals;
 namespace PJ {
 namespace {
 
-/// Side of a family button at its natural size and at the narrowest the row may shrink to.
+/// Side of a family button at its natural size and at the smallest the grid may shrink to.
 constexpr int kButtonSide = 66;
 constexpr int kMinButtonSide = 44;
 /// Icon side inside a kButtonSide button; smaller buttons scale it by the same ratio.
 constexpr int kIconSide = 48;
+/// The family buttons fill a grid this many columns wide, row by row.
+constexpr int kColumns = 3;
 
-/// Width of a row of `count` buttons of `side`, with the layout's spacing and margins.
-int rowWidth(const QLayout* layout, int count, int side) {
-  const QMargins margins = layout->contentsMargins();
-  return count * side + std::max(count - 1, 0) * layout->spacing() + margins.left() + margins.right();
+/// Length of `count` buttons of `side` in a line, with the layout's spacing between them.
+int lineLength(int count, int side, int spacing) {
+  return count * side + std::max(count - 1, 0) * spacing;
 }
 
 QToolButton* makeIconButton(const QString& icon_path, const QString& tooltip, QWidget* parent) {
@@ -74,9 +90,8 @@ bool dropCatalogItems(QDropEvent* event, VisualizationPlaceholderWidget* target)
   if (keys.empty()) {
     return false;
   }
-  // A right-drag of exactly two curves carries the new_XY_axis mime — the
-  // "create XY plot" gesture. Route it so the host builds an XY plot instead of
-  // two ordinary curves; everything else is a normal catalog drop.
+  // A right-drag of exactly two curves carries the new_XY_axis mime, the "create XY plot" gesture: routed so the host
+  // builds an XY plot instead of two ordinary curves; everything else is a normal catalog drop.
   if (keys.size() == 2 && mime_data != nullptr && mime_data->hasFormat(CurveTreeView::newXyAxisMimeType())) {
     emit target->catalogItemsXyRequested(keys);
   } else {
@@ -86,31 +101,169 @@ bool dropCatalogItems(QDropEvent* event, VisualizationPlaceholderWidget* target)
   return true;
 }
 
+// Release builds compile in the key from the PJ_EASTER_EGG_KEY GitHub secret (pj_widgets/CMakeLists.txt); every
+// other build has none, and the easter egg is off.
+#ifndef PJ_EASTER_EGG_KEY
+#define PJ_EASTER_EGG_KEY ""
+#endif
+constexpr char kEasterEggKey[] = PJ_EASTER_EGG_KEY;
+
+// The easter egg pool: every encrypted 128x128 looping GIF scripts/pack_easter_eggs.py makes. The desktop lists this
+// resource folder (memes.qrc) at run time. The browser leaves memes.qrc out: pj_widgets/CMakeLists.txt compiles in
+// the folder's file names (comma-separated), and the host fetches the one it shows (setEasterEggFetch).
+#ifdef PJ_TARGET_WASM
+#ifndef PJ_EASTER_EGG_NAMES
+#define PJ_EASTER_EGG_NAMES ""
+#endif
+EasterEggFetch& easterEggFetch() {
+  static EasterEggFetch fetch;
+  return fetch;
+}
+#else
+constexpr auto kEasterEggDir = ":/resources/gif";
+#endif
+constexpr int kEasterEggSide = 128;
+// Persisted (ISO date string): the first day the easter egg may show (again). Missing means first run, which sets it.
+constexpr auto kEasterEggNextKey = "EasterEgg/next_date";
+// Persisted: the user's character (easterEggCharacter), fixed by their first easter egg; later ones are its variants.
+constexpr auto kEasterEggCharacterKey = "EasterEgg/character";
+constexpr int kMinCooldownDays = 2;
+constexpr int kMaxCooldownDays = 5;
+constexpr int kMinFirstRunGraceDays = 4;
+constexpr int kMaxFirstRunGraceDays = 8;
+// A fresh random idle stretch after each layout activity.
+constexpr int kMinIdleSeconds = 120;
+constexpr int kMaxIdleSeconds = 300;
+
+// After a random stretch with no layout activity (noteLayoutActivity), one visible placeholder chosen at random shows
+// the easter egg; at most once per process, then not again until the persisted date. Parented to qApp; deletes itself
+// once shown.
+class IdleEasterEgg : public QObject {
+ public:
+  static void arm() {
+    static bool armed = false;
+    if (armed || qApp == nullptr) {
+      return;
+    }
+    armed = true;
+    // Offscreen is the unit tests and the QA agent: a GIF appearing there is noise.
+    if (sizeof(kEasterEggKey) <= 1 || easterEggPool().isEmpty() || QGuiApplication::platformName() == u"offscreen"_s) {
+      return;
+    }
+    const QDate today = QDate::currentDate();
+    const QDate next =
+        QDate::fromString(appSettings().value(QString::fromLatin1(kEasterEggNextKey)).toString(), Qt::ISODate);
+    if (!next.isValid()) {
+      // First run: the first easter egg waits a random first-run grace after install.
+      appSettings().setValue(
+          QString::fromLatin1(kEasterEggNextKey),
+          today.addDays(QRandomGenerator::global()->bounded(kMinFirstRunGraceDays, kMaxFirstRunGraceDays + 1))
+              .toString(Qt::ISODate));
+      return;
+    }
+    if (next > today) {
+      return;
+    }
+    instance_ = new IdleEasterEgg(qApp);
+  }
+
+  static void restart() {
+    if (instance_ != nullptr) {
+      instance_->idle_.start(1000 * QRandomGenerator::global()->bounded(kMinIdleSeconds, kMaxIdleSeconds + 1));
+    }
+  }
+
+ private:
+  explicit IdleEasterEgg(QObject* parent) : QObject(parent) {
+    idle_.setSingleShot(true);
+    connect(&idle_, &QTimer::timeout, this, &IdleEasterEgg::onIdle);
+  }
+
+  void onIdle() {
+    if (!gif_.isEmpty()) {
+      show();
+      return;
+    }
+    if (fetching_) {
+      return;
+    }
+    path_ =
+        pickEasterEggGif(easterEggPool(), appSettings().value(QString::fromLatin1(kEasterEggCharacterKey)).toString());
+#ifdef PJ_TARGET_WASM
+    fetching_ = true;
+    easterEggFetch()(path_, this, [this](const QByteArray& encrypted) {
+      fetching_ = false;
+      gif_ = decryptEasterEgg(encrypted, path_);
+      // Layout activity during the download restarted the countdown: its timeout shows the GIF.
+      if (!idle_.isActive()) {
+        show();
+      }
+    });
+#else
+    gif_ = loadEasterEgg(path_);
+    show();
+#endif
+  }
+
+  // No placeholder with room: wait for the next layout activity. A GIF that does not decrypt (a wrong key, a failed
+  // download) ends it for this process.
+  void show() {
+    if (gif_.isEmpty()) {
+      deleteLater();
+      return;
+    }
+    std::vector<VisualizationPlaceholderWidget*> candidates;
+    for (QWidget* widget : QApplication::allWidgets()) {
+      if (auto* placeholder = qobject_cast<VisualizationPlaceholderWidget*>(widget)) {
+        candidates.push_back(placeholder);
+      }
+    }
+    while (!candidates.empty()) {
+      const auto pick = QRandomGenerator::global()->bounded(static_cast<qsizetype>(candidates.size()));
+      if (candidates[pick]->showEasterEgg(gif_)) {
+        appSettings().setValue(QString::fromLatin1(kEasterEggCharacterKey), easterEggCharacter(path_));
+        const int days = QRandomGenerator::global()->bounded(kMinCooldownDays, kMaxCooldownDays + 1);
+        appSettings().setValue(
+            QString::fromLatin1(kEasterEggNextKey), QDate::currentDate().addDays(days).toString(Qt::ISODate));
+        deleteLater();
+        return;
+      }
+      candidates.erase(candidates.begin() + pick);
+    }
+  }
+
+  static inline QPointer<IdleEasterEgg> instance_;
+  QTimer idle_;
+  QString path_;
+  QByteArray gif_;
+  bool fetching_ = false;
+};
+
 }  // namespace
 
 VisualizationPlaceholderWidget::VisualizationPlaceholderWidget(QWidget* parent) : QWidget(parent) {
   setAcceptDrops(true);
   setObjectName(u"VisualizationPlaceholderWidget"_s);
 
-  action_split_horizontal_ = new QAction(tr("&Split Horizontally"), this);
+  action_split_horizontal_ = new QAction(tr("Split &Horizontally"), this);
   connect(action_split_horizontal_, &QAction::triggered, this, [this]() { emit splitHorizontalRequested(); });
 
-  action_split_vertical_ = new QAction(tr("&Split Vertically"), this);
+  action_split_vertical_ = new QAction(tr("Split &Vertically"), this);
   connect(action_split_vertical_, &QAction::triggered, this, [this]() { emit splitVerticalRequested(); });
 
   action_paste_ = new QAction(tr("&Paste"), this);
   action_paste_->setEnabled(false);
   connect(action_paste_, &QAction::triggered, this, [this]() { emit pasteRequested(); });
 
-  auto* layout = new QHBoxLayout(this);
+  auto* layout = new QGridLayout(this);
   layout->setContentsMargins(
       theme::space(theme::Space::None), theme::space(theme::Space::None), theme::space(theme::Space::None),
       theme::space(theme::Space::None));
   layout->setSpacing(theme::space(theme::Space::Comfortable));
-  // The buttons' current fixed size must not become the widget's minimum: minimumSizeHint
-  // reports the narrowest row, and fitButtonsToWidth shrinks the buttons down to it.
+  // The buttons' current fixed size must not become the widget's minimum: minimumSizeHint reports the smallest grid,
+  // and fitButtons shrinks the buttons to it.
   layout->setSizeConstraint(QLayout::SetNoConstraint);
-  layout->addStretch(1);
+  layout->setAlignment(Qt::AlignCenter);
   const struct {
     const char* path;
     const char* tooltip;
@@ -118,12 +271,12 @@ VisualizationPlaceholderWidget::VisualizationPlaceholderWidget(QWidget* parent) 
     VisualizationKind kind;
   } specs[] = {
       {":/resources/svg/line_axis.svg", QT_TR_NOOP("Plot"), "buttonVizPlot", VisualizationKind::kPlot},
-      {":/resources/svg/state_transitions.svg", QT_TR_NOOP("State Transitions"), "buttonVizStateTransitions",
-       VisualizationKind::kStateTransitions},
       {":/resources/svg/image.svg", QT_TR_NOOP("2D"), "buttonVizScene2D", VisualizationKind::kScene2D},
       {":/resources/svg/cube.svg", QT_TR_NOOP("3D"), "buttonVizScene3D", VisualizationKind::kScene3D},
-      // Always offered, even with no Widget plugin installed: the host's picker then says so and
-      // points at the Marketplace, which is how the feature is discovered.
+      {":/resources/svg/view_list.svg", QT_TR_NOOP("Log"), "buttonVizLog", VisualizationKind::kLog},
+      {":/resources/svg/state_transitions.svg", QT_TR_NOOP("State Transitions"), "buttonVizStateTransitions",
+       VisualizationKind::kStateTransitions},
+      // Always shown; the shell enables it (setCustomWidgetsAvailable) according to the installed widget catalog.
       {":/resources/svg/custom_widget.svg", QT_TR_NOOP("Custom Widget"), "buttonVizCustomWidget",
        VisualizationKind::kCustomWidget},
   };
@@ -135,19 +288,93 @@ VisualizationPlaceholderWidget::VisualizationPlaceholderWidget(QWidget* parent) 
     button->installEventFilter(this);
     const VisualizationKind kind = spec.kind;
     connect(button, &QToolButton::clicked, this, [this, kind]() { emit visualizationRequested(kind); });
-    layout->addWidget(button);
+    const auto index = static_cast<int>(icon_buttons_.size());
+    layout->addWidget(button, index / kColumns, index % kColumns);
     icon_buttons_.push_back({button, QString::fromLatin1(spec.path)});
   }
-  layout->addStretch(1);
   // Initial paint at whatever theme is currently active. Subsequent
   // changes flow in through onStylesheetChanged.
   onStylesheetChanged(currentTheme());
+  IdleEasterEgg::arm();
+  noteLayoutActivity();
+}
+
+VisualizationPlaceholderWidget::~VisualizationPlaceholderWidget() {
+  noteLayoutActivity();
 }
 
 void VisualizationPlaceholderWidget::setPasteActionEnabled(bool enabled) {
   if (action_paste_ != nullptr) {
     action_paste_->setEnabled(enabled);
   }
+}
+
+void VisualizationPlaceholderWidget::setCustomWidgetsAvailable(bool available) {
+  QToolButton* button = customWidgetButton();
+  if (button == nullptr) {
+    return;
+  }
+  button->setEnabled(available);
+  // A disabled button must not swallow drops: they then reach this widget.
+  button->setAcceptDrops(available);
+  button->setCursor(available ? Qt::PointingHandCursor : Qt::ArrowCursor);
+  if (available) {
+    button->setToolTip(tr("Custom Widget"));
+  } else {
+#ifdef PJ_TARGET_WASM
+    button->setToolTip(tr("No custom widgets installed."));
+#else
+    button->setToolTip(tr("No custom widgets installed. Get them from the Marketplace."));
+#endif
+  }
+}
+
+QToolButton* VisualizationPlaceholderWidget::customWidgetButton() const {
+  return findChild<QToolButton*>(QStringLiteral("buttonVizCustomWidget"));
+}
+
+bool VisualizationPlaceholderWidget::showEasterEgg(const QByteArray& gif) {
+  if (easter_egg_ != nullptr) {
+    return easter_egg_->isVisible();
+  }
+  if (gif.isEmpty() || !isVisible() || !easterEggFits()) {
+    return false;
+  }
+  easter_egg_ = new QLabel(this);
+  easter_egg_->setObjectName(u"placeholderEasterEgg"_s);
+  // Clicks, drops and the context menu still reach the placeholder through it.
+  easter_egg_->setAttribute(Qt::WA_TransparentForMouseEvents);
+  auto* buffer = new QBuffer();
+  buffer->setData(gif);
+  buffer->open(QIODevice::ReadOnly);
+  auto* movie = new QMovie(buffer, {}, easter_egg_);
+  // Owned by the movie, so it outlives the movie's reader.
+  buffer->setParent(movie);
+  easter_egg_->setMovie(movie);
+  movie->start();
+  placeEasterEgg();
+  return true;
+}
+
+QRect VisualizationPlaceholderWidget::easterEggRect() const {
+  const int inset = theme::space(theme::Space::Comfortable);
+  return {inset, height() - inset - kEasterEggSide, kEasterEggSide, kEasterEggSide};
+}
+
+bool VisualizationPlaceholderWidget::easterEggFits() const {
+  // The layout centres the grid; computed rather than read from the buttons, whose geometry lags a resize.
+  QRect grid({}, gridSize(icon_buttons_.front().button->width()));
+  grid.moveCenter(rect().center());
+  const QRect egg = easterEggRect();
+  return egg.top() >= 0 && egg.right() < width() && !egg.intersects(grid);
+}
+
+void VisualizationPlaceholderWidget::placeEasterEgg() {
+  if (easter_egg_ == nullptr) {
+    return;
+  }
+  easter_egg_->setGeometry(easterEggRect());
+  easter_egg_->setVisible(easterEggFits());
 }
 
 void VisualizationPlaceholderWidget::onStylesheetChanged(const QString& theme) {
@@ -164,10 +391,9 @@ void VisualizationPlaceholderWidget::onStylesheetChanged(const QString& theme) {
 }
 
 void VisualizationPlaceholderWidget::renderIcons() {
-  // RenderSvgPixmap (not LoadSvg) so the central icons rasterize at
-  // exactly their display size (with DPR baked in) and stay crisp. The
-  // shared LoadSvg cache always renders to 64x64, which is downsampled
-  // to 48x48 here -- visible blur on the larger placeholder buttons.
+  // renderSvgPixmap, not loadSvg: the central icons rasterize at exactly their display size (DPR baked in) and stay
+  // crisp. The shared loadSvg cache always renders at 64x64, downsampled to 48x48 here, which blurs the larger
+  // placeholder buttons.
   for (const auto& entry : icon_buttons_) {
     const QSize icon_size = entry.button->iconSize();
     const QPixmap pixmap = renderSvgPixmap(entry.icon_path, theme_, icon_size, devicePixelRatioF());
@@ -175,11 +401,22 @@ void VisualizationPlaceholderWidget::renderIcons() {
   }
 }
 
-void VisualizationPlaceholderWidget::fitButtonsToWidth() {
-  const auto count = static_cast<int>(icon_buttons_.size());
+int VisualizationPlaceholderWidget::columnCount() const {
+  return std::min(static_cast<int>(icon_buttons_.size()), kColumns);
+}
+
+int VisualizationPlaceholderWidget::rowCount() const {
+  return (static_cast<int>(icon_buttons_.size()) + kColumns - 1) / kColumns;
+}
+
+void VisualizationPlaceholderWidget::fitButtons() {
   const QMargins margins = layout()->contentsMargins();
-  const int available = width() - margins.left() - margins.right();
-  const int side = std::clamp((available - (count - 1) * layout()->spacing()) / count, kMinButtonSide, kButtonSide);
+  const int spacing = layout()->spacing();
+  const int columns = columnCount();
+  const int rows = rowCount();
+  const int by_width = (width() - margins.left() - margins.right() - (columns - 1) * spacing) / columns;
+  const int by_height = (height() - margins.top() - margins.bottom() - (rows - 1) * spacing) / rows;
+  const int side = std::clamp(std::min(by_width, by_height), kMinButtonSide, kButtonSide);
   if (icon_buttons_.front().button->width() == side) {
     return;
   }
@@ -191,22 +428,26 @@ void VisualizationPlaceholderWidget::fitButtonsToWidth() {
   renderIcons();
 }
 
-QSize VisualizationPlaceholderWidget::rowSize(int side) const {
+QSize VisualizationPlaceholderWidget::gridSize(int side) const {
   const QMargins margins = layout()->contentsMargins();
-  return {rowWidth(layout(), static_cast<int>(icon_buttons_.size()), side), side + margins.top() + margins.bottom()};
+  const int spacing = layout()->spacing();
+  return {
+      lineLength(columnCount(), side, spacing) + margins.left() + margins.right(),
+      lineLength(rowCount(), side, spacing) + margins.top() + margins.bottom()};
 }
 
 QSize VisualizationPlaceholderWidget::sizeHint() const {
-  return rowSize(kButtonSide);
+  return gridSize(kButtonSide);
 }
 
 QSize VisualizationPlaceholderWidget::minimumSizeHint() const {
-  return rowSize(kMinButtonSide);
+  return gridSize(kMinButtonSide);
 }
 
 void VisualizationPlaceholderWidget::resizeEvent(QResizeEvent* event) {
   QWidget::resizeEvent(event);
-  fitButtonsToWidth();
+  fitButtons();
+  placeEasterEgg();
 }
 
 void VisualizationPlaceholderWidget::paintEvent(QPaintEvent* event) {
@@ -286,6 +527,77 @@ void VisualizationPlaceholderWidget::updateSplitActionIcons(const QString& theme
   action_paste_->setIcon(QIcon(loadSvg(":/resources/svg/paste.svg", theme)));
   action_split_horizontal_->setIcon(QIcon(loadSvg(":/resources/svg/add_column.svg", theme)));
   action_split_vertical_->setIcon(QIcon(loadSvg(":/resources/svg/add_row.svg", theme)));
+}
+
+void noteLayoutActivity() {
+  IdleEasterEgg::restart();
+}
+
+QString easterEggCharacter(const QString& gif_path) {
+  const QString base = QFileInfo(gif_path).baseName();
+  const auto underscore = base.lastIndexOf(u'_');
+  return underscore > 0 ? base.left(underscore) : base;
+}
+
+QStringList easterEggPool() {
+#ifdef PJ_TARGET_WASM
+  if (!easterEggFetch()) {
+    return {};
+  }
+  return QString::fromLatin1(PJ_EASTER_EGG_NAMES).split(u',', Qt::SkipEmptyParts);
+#else
+  const QDir dir(QString::fromLatin1(kEasterEggDir));
+  QStringList paths;
+  for (const QString& name : dir.entryList({u"*.gif.enc"_s}, QDir::Files)) {
+    paths.push_back(dir.filePath(name));
+  }
+  return paths;
+#endif
+}
+
+QByteArray loadEasterEgg(const QString& path) {
+  QFile file(path);
+  return file.open(QIODevice::ReadOnly) ? decryptEasterEgg(file.readAll(), path) : QByteArray();
+}
+
+QByteArray decryptEasterEgg(const QByteArray& encrypted, const QString& path) {
+  if (sizeof(kEasterEggKey) <= 1 || encrypted.isEmpty()) {
+    return {};
+  }
+  QByteArray gif = easterEggCipher(encrypted, QByteArray(kEasterEggKey), QFileInfo(path).fileName());
+  return gif.startsWith("GIF8") ? gif : QByteArray();
+}
+
+#ifdef PJ_TARGET_WASM
+void setEasterEggFetch(EasterEggFetch fetch) {
+  easterEggFetch() = std::move(fetch);
+}
+#endif
+
+QByteArray easterEggCipher(QByteArray data, const QByteArray& key, const QString& name) {
+  const QByteArray salt = key + name.toUtf8();
+  constexpr qsizetype kBlock = 32;  // one SHA-256 digest
+  for (qsizetype offset = 0; offset < data.size(); offset += kBlock) {
+    const auto counter = qToLittleEndian(static_cast<quint64>(offset / kBlock));
+    const QByteArray pad = QCryptographicHash::hash(
+        salt + QByteArray(reinterpret_cast<const char*>(&counter), sizeof(counter)), QCryptographicHash::Sha256);
+    const qsizetype end = std::min(offset + kBlock, data.size());
+    for (qsizetype i = offset; i < end; ++i) {
+      data[i] = static_cast<char>(data[i] ^ pad[i - offset]);
+    }
+  }
+  return data;
+}
+
+QString pickEasterEggGif(const QStringList& pool, const QString& character) {
+  QStringList variants;
+  for (const QString& gif : pool) {
+    if (easterEggCharacter(gif) == character) {
+      variants.push_back(gif);
+    }
+  }
+  const QStringList& from = variants.isEmpty() ? pool : variants;
+  return from.isEmpty() ? QString() : from[QRandomGenerator::global()->bounded(from.size())];
 }
 
 }  // namespace PJ

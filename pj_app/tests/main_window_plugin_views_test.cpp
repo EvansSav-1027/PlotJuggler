@@ -8,6 +8,7 @@
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QFrame>
+#include <QLabel>
 #include <QMimeData>
 #include <QPointer>
 #include <QSignalSpy>
@@ -52,7 +53,7 @@ using namespace Qt::StringLiterals;
 
 namespace PJ {
 
-/// Exercise the shell callbacks that enforce plugin identity and dataset liveness.
+/// Exercises the shell callbacks that enforce plugin identity and dataset liveness.
 class MainWindowPluginViewsTestPeer {
  public:
   [[nodiscard]] static PluginPlotTabsController& pluginTabs(MainWindow& window) {
@@ -135,6 +136,44 @@ class MainWindowPluginViewsTestPeer {
     EXPECT_EQ(source->currentBoundingRect(), original);
   }
 
+  // A series an agent adds before it has rows, and the zoom fit after it, fit only the agent's own plot when the rows
+  // arrive: the user's linked plot keeps its window.
+  static void checkAgentFitStaysOffTheZoomLink(MainWindow& window) {
+    auto& app = *window.session_;
+    app.sessionManager().setUseTimeOffset(false);
+    const auto dataset = pj_test::createDataset(app, "agent-fit", true);
+    ASSERT_NE(pj_test::addScalarTopic(app, dataset, "/signal", 0, 10'000'000'000), 0U);
+    const auto key = app.catalogModel().resolveCurveKey(0, u"agent-fit"_s, {}, u"/signal"_s, u"value"_s);
+    ASSERT_TRUE(key);
+    auto* docker = window.findChild<TabbedPlotWidget*>()->addTab(u"User"_s);
+    auto* user_plot = docker->plotAt(0)->ensurePlotWidget();
+    ASSERT_NE(user_plot->addCurve(*key), nullptr);
+    user_plot->setZoomRectangle(QRectF(2.0, 8.0, 2.0, -10.0), false);
+    const auto original = user_plot->currentBoundingRect();
+    auto* link = window.findChild<QAbstractButton*>(u"buttonLink"_s);
+    ASSERT_NE(link, nullptr);
+    link->setChecked(true);
+
+    DataWriter writer = app.sessionManager().dataEngine().createWriter();
+    const auto later = writer.registerScalarSeries(dataset, "/later", NumericType::kFloat64);
+    ASSERT_TRUE(later.has_value()) << later.error();
+    app.sessionManager().notifyIngest({later->topic_id});
+    const QString owner = u"agent-fit"_s;
+    ASSERT_TRUE(pluginTabs(window).createTab(owner, u"view"_s, u"Agent"_s));
+    ASSERT_TRUE(pluginTabs(window).addCurve(owner, u"view"_s, u"/later"_s, u"value"_s, u"agent-fit"_s));
+    ASSERT_TRUE(pluginTabs(window).zoomOut(owner, u"view"_s));
+    PlotWidget* agent_plot = pluginTabs(window).ownedTab(owner, u"view"_s)->plotAt(0)->plotWidget();
+    ASSERT_NE(agent_plot, nullptr);
+
+    writer.appendScalar(*later, 1'000'000'000, 5.0);
+    writer.appendScalar(*later, 6'000'000'000, 6.0);
+    ASSERT_FALSE(app.sessionManager().commitChunks(writer.flushAll()).empty());
+
+    EXPECT_NEAR(agent_plot->currentBoundingRect().left(), 1.0, 1e-6);
+    EXPECT_NEAR(agent_plot->currentBoundingRect().right(), 6.0, 1e-6);
+    EXPECT_EQ(user_plot->currentBoundingRect(), original);
+  }
+
   /// A plugin's pj.plot_tabs.v1 binding, wired exactly as launchToolbox wires it:
   /// the real runtime bridge over the shell's per-plugin callbacks.
   struct TabsApi {
@@ -181,8 +220,7 @@ class MainWindowPluginViewsTestPeer {
     app.catalogModel().rebuildFromDatastore();
   }
 
-  // ABI-38: create a 3D tab, attach a canonical PointCloud topic, read it back,
-  // detach it, focus and close the tab.
+  // Create a 3D tab, attach a canonical PointCloud topic, read it back, detach it, focus and close the tab.
   static void checkSceneViewsLifecycle(MainWindow& window) {
     const QString owner = u"scene-view-plugin"_s;
     AppSession& app = *window.session_;
@@ -241,8 +279,8 @@ class MainWindowPluginViewsTestPeer {
   }
 
 #ifdef PJ_WITH_SCENE3D
-  // DEM-06: a view embedded in a plugin panel is built by the shell, demands the
-  // topics it shows, follows the playback cursor and dies with its frame.
+  // A view embedded in a plugin panel is built by the shell, demands the topics it shows, follows the playback
+  // cursor and dies with its frame.
   static void checkEmbeddedSceneView(MainWindow& window) {
     AppSession& app = *window.session_;
     const auto dataset = pj_test::createDataset(app, "embedded-scene-view", true);
@@ -284,8 +322,7 @@ class MainWindowPluginViewsTestPeer {
     host.detach(view, u"/embedded-cloud"_s, u"embedded-scene-view"_s);
     EXPECT_EQ(scene->layers().size(), 0U);
 
-    // The protected tracker accessor, reached through a member pointer formed in a
-    // derived class (the test hooks accessor is not compiled into this runner).
+    // The protected tracker accessor, reached through a member pointer formed in a derived class.
     struct TrackerPeek : SceneDockWidget {
       static auto accessor() {
         return &TrackerPeek::lastTrackerNs;
@@ -550,7 +587,7 @@ class MainWindowPluginViewsTestPeer {
 #endif
 
 #ifdef PJ_HAS_FFMPEG
-  // ABI-40: a 2D tab takes a video topic as its background.
+  // A 2D tab takes a video topic as its background.
   static void checkVideoSceneView(MainWindow& window) {
     auto& app = *window.session_;
     const auto dataset = pj_test::createDataset(app, "video-scene-view", true);
@@ -576,8 +613,8 @@ class MainWindowPluginViewsTestPeer {
   }
 #endif
 
-  // LAY-16: a full-layout save/restore rebuilds an owned scene tab as a scene, found
-  // by (plugin, id) from a fresh controller, history-exempt, with its topic kept.
+  // A full-layout save/restore rebuilds an owned scene tab as a scene, found by (plugin, id) from a fresh
+  // controller, history-exempt, with its topic kept.
   static void checkSceneViewsLayoutRoundTrip(MainWindow& window) {
     const QString owner = u"scene-view-roundtrip-plugin"_s;
     AppSession& app = *window.session_;
@@ -616,9 +653,8 @@ class MainWindowPluginViewsTestPeer {
     EXPECT_EQ(restored_scene->layers().size(), 1U) << "the attached topic must survive the round trip";
   }
 
-  // ABI-39: one id namespace per plugin across kinds. Another kind closes the old tab
-  // and starts empty; the same kind clears a plot tab's curves but only retitles a
-  // scene tab (its topics stay); v1 create is the "plot" kind.
+  // One id namespace per plugin across kinds. Another kind closes the old tab and starts empty; the same kind
+  // clears a plot tab's curves but only retitles a scene tab (its topics stay); v1 create is the "plot" kind.
   static void checkSharedIdNamespace(MainWindow& window) {
     const QString owner = u"namespace-plugin"_s;
     AppSession& app = *window.session_;
@@ -941,8 +977,7 @@ class MainWindowPluginViewsTestPeer {
     ASSERT_TRUE(api.view.close("view"));
   }
 
-  // GAP-44: a kind this build cannot show is refused naming it, and an existing tab
-  // under that id stays as it was.
+  // A kind this build cannot show is refused naming it, and an existing tab under that id stays as it was.
   static void checkKnownUnservableKind(MainWindow& window) {
     const QString owner = u"unservable-plugin"_s;
     auto controller = makeController(window, [](const QString&, QWidget*) -> IDataWidget* { return nullptr; });
@@ -962,9 +997,8 @@ class MainWindowPluginViewsTestPeer {
     ASSERT_TRUE(api.view.close("t"));
   }
 
-  // SCN-17 through the plugin: a scene tab showing dataset A refuses B's topic with the
-  // dock's own reason; an unqualified name two datasets share is refused with both
-  // qualified candidates.
+  // A scene tab showing dataset A refuses B's topic with the dock's own reason; an unqualified name two datasets
+  // share is refused with both qualified candidates.
   static void checkAttachOfAnotherDatasetsTopic(MainWindow& window) {
     const QString owner = u"scene-dataset-plugin"_s;
     AppSession& app = *window.session_;
@@ -1153,6 +1187,18 @@ class MainWindowPluginViewsTestPeer {
     ASSERT_TRUE(config);
     EXPECT_NE(config->find("Renamed"), std::string::npos);
 
+    // Re-creating an owned tab with a new title retitles its tab-strip label too, not only the docker.
+    ASSERT_TRUE(pluginTabs(window).createTab(owner, u"run-b"_s, u"Retitled"_s));
+    EXPECT_EQ(pluginTabs(window).ownedTab(owner, u"run-b"_s), second);
+    EXPECT_EQ(second->name(), u"Retitled"_s);
+    QStringList strip_labels;
+    for (const QFrame* frame : tabs->findChildren<QFrame*>(u"plotTabFrame"_s)) {
+      for (const QLabel* label : frame->findChildren<QLabel*>()) {
+        strip_labels << label->text();
+      }
+    }
+    EXPECT_TRUE(strip_labels.contains(u"Retitled"_s)) << strip_labels.join(u", "_s).toStdString();
+
     DockWidget* second_dock = second->plotAt(0);
     ASSERT_NE(second_dock, nullptr);
     if (second_dock->plotWidget() == nullptr) {
@@ -1165,9 +1211,11 @@ class MainWindowPluginViewsTestPeer {
     const QString saved_xml = QString::fromUtf8(saved.toByteArray());
     EXPECT_TRUE(saved_xml.contains(u"owner_plugin=\"plugin-a\""_s));
     EXPECT_TRUE(saved_xml.contains(u"tab_id=\"run-b\""_s));
+    // The restore reuses the page with the same id: change the content it must bring back.
+    second_dock->plotWidget()->setStateId(u"changed-after-save"_s);
     ASSERT_TRUE(window.xmlLoadState(saved, MainWindow::RestoreIntent::kReplace));
     QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
-    EXPECT_TRUE(before_restore.isNull());
+    EXPECT_EQ(pluginTabs(window).ownedTab(owner, u"run-b"_s), before_restore.data());
 
     second = pluginTabs(window).ownedTab(owner, u"run-b"_s);
     foreign = pluginTabs(window).ownedTab(other, u"run-a"_s);
@@ -1243,12 +1291,16 @@ TEST_F(MainWindowPluginViewsTest, NewPlotInheritsLinkedTimeRangeWithoutChangingP
   PJ::MainWindowPluginViewsTestPeer::checkNewPlotLinkedZoom(*window_);
 }
 
-// Claim: time-range zoom preserves Y and both zoom operations leave user and other-plugin plots untouched.
+TEST_F(MainWindowPluginViewsTest, AgentFitWhoseRowsArriveLaterLeavesLinkedPlotsAlone) {
+  PJ::MainWindowPluginViewsTestPeer::checkAgentFitStaysOffTheZoomLink(*window_);
+}
+
+// Time-range zoom preserves Y; both zoom operations leave user and other-plugin plots untouched.
 TEST_F(MainWindowPluginViewsTest, ViewportCommandsOnlyChangeCallingPluginsPlots) {
   PJ::MainWindowPluginViewsTestPeer::checkViewportIsolation(*window_);
 }
 
-// Claim: curve operations resolve one dataset, enforce ownership, and replacing a tab clears its contents.
+// Curve operations resolve one dataset and enforce ownership; replacing a tab clears its contents.
 TEST_F(MainWindowPluginViewsTest, CurveCommandsEnforceOwnershipAndRejectAmbiguousDatasets) {
   PJ::MainWindowPluginViewsTestPeer::checkCurveOwnershipAndResolution(*window_);
 }

@@ -96,7 +96,6 @@ TEST(WelcomePresetsDialogTest, SelectionUploadAndCancel) {
   EXPECT_FALSE(retry_button->isVisible());
   EXPECT_FALSE(status->isVisible());
 
-  // Picking a preset reports it and shows the load until the shell settles it.
   open_second->click();
   ASSERT_EQ(selected.size(), 1);
   EXPECT_EQ(selected.at(0).at(0).toString(), second.id);
@@ -116,13 +115,11 @@ TEST(WelcomePresetsDialogTest, SelectionUploadAndCancel) {
   EXPECT_TRUE(open_first->isEnabled());
   EXPECT_TRUE(upload_button->isEnabled());
 
-  // A failure says so and offers to repeat the same preset.
   open_first->click();
   dialog.layoutLoadFinished(first.layout_url, false, u"download"_s);
   EXPECT_TRUE(retry_button->isVisible());
   EXPECT_FALSE(cancel_button->isVisible());
   EXPECT_TRUE(status->isVisible());
-  // A sentence for the user; the reason token is for the log.
   EXPECT_EQ(status->text(), u"FIRST could not be loaded."_s);
   EXPECT_TRUE(open_second->isEnabled());
   retry_button->click();
@@ -135,21 +132,18 @@ TEST(WelcomePresetsDialogTest, SelectionUploadAndCancel) {
   retry_button->click();
   ASSERT_EQ(selected.size(), 4);
 
-  // Success closes the dialog; reopened, it is idle again.
   dialog.layoutLoadFinished(first.layout_url, true, {});
   EXPECT_FALSE(dialog.isVisible());
   dialog.show();
   EXPECT_FALSE(cancel_button->isVisible());
   EXPECT_FALSE(retry_button->isVisible());
 
-  // A deep link selects without a click, through the same path.
   dialog.selectPreset(second.id);
   ASSERT_EQ(selected.size(), 5);
   EXPECT_EQ(selected.at(4).at(0).toString(), second.id);
   EXPECT_TRUE(cancel_button->isVisible());
   dialog.layoutLoadFinished(second.layout_url, false, u"cancelled"_s);
 
-  // Upload closes the dialog and hands over to the data-file picker.
   upload_button->click();
   EXPECT_EQ(upload.size(), 1);
   EXPECT_FALSE(dialog.isVisible());
@@ -176,13 +170,76 @@ TEST(WelcomePresetsDialogTest, ClosingWhileLoadingCancels) {
   EXPECT_FALSE(dialog.isVisible());
   EXPECT_EQ(cancel.size(), 1);
 
-  // Escape closes it the same way.
   dialog.layoutLoadFinished(first.layout_url, false, u"cancelled"_s);
   dialog.show();
   dialog.selectPreset(first.id);
   QTest::keyClick(&dialog, Qt::Key_Escape);
   EXPECT_FALSE(dialog.isVisible());
   EXPECT_EQ(cancel.size(), 2);
+}
+
+// A ?preset= link opens its preset with the load alone on screen (status, bar, Cancel): the picker never flashes
+// up while the visitor's chosen recording downloads. It comes back only when that load fails or is cancelled.
+TEST(WelcomePresetsDialogTest, DeepLinkShowsOnlyTheLoad) {
+  const PJ::PresetEntry first = presetEntry(u"first"_s);
+  const PJ::PresetEntry second = presetEntry(u"second"_s);
+  PJ::WelcomePresetsDialog dialog({first, second});
+  QSignalSpy selected(&dialog, &PJ::WelcomePresetsDialog::presetSelected);
+  auto* list = dialog.findChild<QWidget*>(u"scrollPresets"_s);
+  auto* intro = dialog.findChild<QWidget*>(u"labelIntro"_s);
+  auto* upload = dialog.findChild<QWidget*>(u"buttonUpload"_s);
+  auto* bar = dialog.findChild<QWidget*>(u"progressLoading"_s);
+  auto* cancel_button = dialog.findChild<QWidget*>(u"buttonCancel"_s);
+  ASSERT_NE(list, nullptr);
+  ASSERT_NE(intro, nullptr);
+  ASSERT_NE(upload, nullptr);
+  ASSERT_NE(bar, nullptr);
+  ASSERT_NE(cancel_button, nullptr);
+  const auto picker_shown = [&] { return !list->isHidden() && !intro->isHidden() && !upload->isHidden(); };
+
+  dialog.openDeepLink(u"nope"_s);  // not listed: the plain picker
+  dialog.show();
+  EXPECT_TRUE(picker_shown());
+  EXPECT_EQ(selected.size(), 0);
+  dialog.close();
+
+  PJ::WelcomePresetsDialog linked({first, second});
+  QSignalSpy linked_selected(&linked, &PJ::WelcomePresetsDialog::presetSelected);
+  auto* linked_list = linked.findChild<QWidget*>(u"scrollPresets"_s);
+  auto* linked_intro = linked.findChild<QWidget*>(u"labelIntro"_s);
+  auto* linked_upload = linked.findChild<QWidget*>(u"buttonUpload"_s);
+  auto* linked_bar = linked.findChild<QWidget*>(u"progressLoading"_s);
+  auto* linked_cancel = linked.findChild<QWidget*>(u"buttonCancel"_s);
+  linked.openDeepLink(second.id);
+  linked.show();
+  ASSERT_EQ(linked_selected.size(), 1);
+  EXPECT_EQ(linked_selected.front().at(0).toString(), second.id);
+  EXPECT_TRUE(linked_list->isHidden());
+  EXPECT_TRUE(linked_intro->isHidden());
+  EXPECT_TRUE(linked_upload->isHidden());
+  EXPECT_FALSE(linked_bar->isHidden());
+  EXPECT_FALSE(linked_cancel->isHidden());
+  EXPECT_LT(linked.height(), dialog.height());
+
+  // A failed load gives the picker back, with Retry.
+  linked.layoutLoadFinished(second.layout_url, false, u"download"_s);
+  EXPECT_FALSE(linked_list->isHidden());
+  EXPECT_FALSE(linked_intro->isHidden());
+  EXPECT_FALSE(linked_upload->isHidden());
+  EXPECT_FALSE(linked.findChild<QWidget*>(u"buttonRetry"_s)->isHidden());
+
+  // So does a cancelled one; a successful one just closes.
+  PJ::WelcomePresetsDialog cancelled({first, second});
+  cancelled.openDeepLink(first.id);
+  cancelled.show();
+  cancelled.layoutLoadFinished(first.layout_url, false, u"cancelled"_s);
+  EXPECT_FALSE(cancelled.findChild<QWidget*>(u"scrollPresets"_s)->isHidden());
+
+  PJ::WelcomePresetsDialog opened({first, second});
+  opened.openDeepLink(first.id);
+  opened.show();
+  opened.layoutLoadFinished(first.layout_url, true, {});
+  EXPECT_FALSE(opened.isVisible());
 }
 
 // While the picked preset's recording downloads, the bar shows how much of it has arrived; once it has, the bar
@@ -212,7 +269,6 @@ TEST(WelcomePresetsDialogTest, DownloadProgressFillsTheBar) {
   EXPECT_EQ(bar->value(), 459);
   EXPECT_EQ(status->text(), u"Downloading FIRST: 120 of 261 MB"_s);
 
-  // No declared size: the count without a percentage.
   dialog.layoutLoadProgress(first.layout_url, 130'000'000, -1);
   EXPECT_EQ(bar->maximum(), 0);
   EXPECT_EQ(status->text(), u"Downloading FIRST: 130 MB"_s);
@@ -271,6 +327,24 @@ TEST(WelcomePresetsDialogTest, CardsShareOneHeightAndAlignment) {
     EXPECT_EQ(thumbnails[index], thumbnails[0]) << index;
     EXPECT_EQ(open_tops[index], open_tops[0]) << index;
   }
+}
+
+// An entry the index marks unlisted has no card, but its ?preset= link opens it.
+TEST(WelcomePresetsDialogTest, UnlistedPresetOpensOnlyByItsLink) {
+  const PJ::PresetEntry shown = presetEntry(u"shown"_s);
+  PJ::PresetEntry linked = presetEntry(u"linked"_s);
+  linked.listed = false;
+  PJ::WelcomePresetsDialog dialog({shown, linked});
+  QSignalSpy selected(&dialog, &PJ::WelcomePresetsDialog::presetSelected);
+
+  EXPECT_EQ(dialog.findChildren<QFrame*>(u"presetCard"_s).size(), 1);
+  EXPECT_NE(entryWidget<QPushButton>(dialog, u"buttonOpenPreset"_s, shown.id), nullptr);
+  EXPECT_EQ(entryWidget<QPushButton>(dialog, u"buttonOpenPreset"_s, linked.id), nullptr);
+
+  dialog.openDeepLink(linked.id);
+  ASSERT_EQ(selected.size(), 1);
+  EXPECT_EQ(selected.front().at(0).toString(), linked.id);
+  EXPECT_EQ(selected.front().at(1).toUrl(), linked.layout_url);
 }
 
 TEST(WelcomePresetsDialogTest, BrokenThumbnailKeepsThePlaceholder) {

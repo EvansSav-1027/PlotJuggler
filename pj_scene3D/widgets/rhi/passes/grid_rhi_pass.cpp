@@ -27,16 +27,6 @@ glm::vec4 opaque(const glm::dvec3& color) {
 
 }  // namespace
 
-QRhiVertexInputLayout GridRhiPass::vertexLayout() {
-  QRhiVertexInputLayout layout;
-  layout.setBindings({QRhiVertexInputBinding(sizeof(Vertex))});
-  layout.setAttributes({
-      QRhiVertexInputAttribute(0, 0, QRhiVertexInputAttribute::Float3, offsetof(Vertex, x)),
-      QRhiVertexInputAttribute(0, 1, QRhiVertexInputAttribute::Float4, offsetof(Vertex, r)),
-  });
-  return layout;
-}
-
 bool GridRhiPass::initialize(const RhiPassSetup& setup) {
   QRhi* rhi = setup.rhi;
   if (rhi == nullptr || setup.view_uniforms == nullptr || setup.annotation_render_mode_uniforms == nullptr ||
@@ -67,15 +57,17 @@ bool GridRhiPass::initialize(const RhiPassSetup& setup) {
       {
           .vertex = loadRhiShader(QStringLiteral(":/scene3d_rhi/grid_cell.vert.qsb")),
           .fragment = loadRhiShader(QStringLiteral(":/scene3d_rhi/grid_cell.frag.qsb")),
-          .input_layout = vertexLayout(),
+          .input_layout = colorVertexLayout(),
           .bindings = shader_resources_,
       },
       setup.part);
   PipelineDesc desc{
       .topology = QRhiGraphicsPipeline::Lines,
-      .vertex = loadRhiShader(QStringLiteral(":/scene3d_rhi/grid.vert.qsb")),
+      .vertex = loadRhiShader(
+          setup.line_segments ? QStringLiteral(":/scene3d_rhi/grid_segment.vert.qsb")
+                              : QStringLiteral(":/scene3d_rhi/grid.vert.qsb")),
       .fragment = loadRhiShader(QStringLiteral(":/scene3d_rhi/scene.frag.qsb")),
-      .input_layout = vertexLayout(),
+      .input_layout = setup.line_segments ? lineSegmentLayout() : colorVertexLayout(),
       .bindings = shader_resources_,
   };
   line_pipeline_ = setup.pipelines->add(desc, setup.part);
@@ -104,13 +96,11 @@ bool GridRhiPass::createShadowReceiver(
           QRhiShaderResourceBinding::uniformBuffer(
               8, QRhiShaderResourceBinding::FragmentStage, setup_.render_mode_uniforms),
       });
-  // Optional: a GPU that cannot build it draws the cells unshadowed, and the
-  // view turns shadows off (shadowReceiverFailed()), instead of failing the scene.
   shadow_pipeline_ = registry.add(
       {
           .vertex = loadRhiShader(QStringLiteral(":/scene3d_rhi/grid_cell.vert.qsb")),
           .fragment = loadRhiShader(QStringLiteral(":/scene3d_rhi/grid_cell_shadow.frag.qsb")),
-          .input_layout = vertexLayout(),
+          .input_layout = colorVertexLayout(),
           .bindings = shadow_shader_resources_,
       },
       setup_.part, /*optional=*/true);
@@ -128,11 +118,11 @@ void GridRhiPass::releaseShadowReceiver(ScenePipelineRegistry& registry) {
   shadow_shader_resources_ = nullptr;
 }
 
-void GridRhiPass::appendVertex(std::vector<Vertex>& out, const glm::dvec3& point, const glm::vec4& color) {
+void GridRhiPass::appendSegment(
+    std::vector<LineSegment>& out, const glm::vec3& a, const glm::vec3& b, const glm::vec4& color) {
   out.push_back(
-      Vertex{
-          static_cast<float>(point.x), static_cast<float>(point.y), static_cast<float>(point.z), color.r, color.g,
-          color.b, color.a});
+      LineSegment{
+          {a.x, a.y, a.z, color.r, color.g, color.b, color.a}, {b.x, b.y, b.z, color.r, color.g, color.b, color.a}});
 }
 
 void GridRhiPass::build(
@@ -147,40 +137,43 @@ void GridRhiPass::build(
 
   if (grid_key_ != settings) {
     grid_key_ = settings;
-    grid_vertices_.clear();
-    grid_cell_vertex_count_ = 0;
-    grid_line_vertex_count_ = 0;
-    // Each style is one buffer range: line primitives, or cells whose shader
-    // draws the lines.
+    grid_cells_.clear();
+    grid_lines_.clear();
+    // One style fills the buffer: line primitives, or cells whose shader draws the lines.
     if (settings.grid_visible && settings.style == GridStyle::kFilledCells) {
       const glm::vec4 tone_a = opaque(settings.colors.tone_a);
       const glm::vec4 tone_b = opaque(settings.colors.tone_b);
       for (const GridVertex& vertex : buildCheckerboardCells(settings.extent_m, settings.divisions)) {
-        appendVertex(grid_vertices_, glm::dvec3(vertex.pos), vertex.parity < 0.5F ? tone_a : tone_b);
+        const glm::vec4& tone = vertex.parity < 0.5F ? tone_a : tone_b;
+        grid_cells_.push_back(ColorVertex{vertex.pos.x, vertex.pos.y, vertex.pos.z, tone.r, tone.g, tone.b, tone.a});
       }
-      grid_cell_vertex_count_ = static_cast<quint32>(grid_vertices_.size());
     } else if (settings.grid_visible) {
       const glm::vec4 line = opaque(settings.colors.line);
-      for (const GridVertex& vertex : buildGridLines(settings.extent_m, settings.divisions)) {
-        appendVertex(grid_vertices_, glm::dvec3(vertex.pos), line);
+      const std::vector<GridVertex> lines = buildGridLines(settings.extent_m, settings.divisions);
+      for (std::size_t index = 0; index + 1 < lines.size(); index += 2) {
+        appendSegment(grid_lines_, lines[index].pos, lines[index + 1].pos, line);
       }
-      grid_line_vertex_count_ = static_cast<quint32>(grid_vertices_.size());
     }
     grid_upload_pending_ = true;
     ++grid_build_count_;
   }
 
   ConnectionKey connection_key{
-      settings.connections_visible, tf, tf != nullptr ? tf->revision() : 0U, fixed_frame, time, render_origin};
+      settings.connections_visible,
+      tf,
+      tf != nullptr ? tf->revision() : 0U,
+      viewSampling(),
+      fixed_frame,
+      time,
+      render_origin};
   if (connection_key_ != connection_key) {
     connection_key_ = std::move(connection_key);
-    connection_vertices_.clear();
+    connection_lines_.clear();
     if (tf != nullptr && !fixed_frame.empty() && settings.connections_visible) {
       buildTfConnectionSegments(*tf, fixed_frame, time, segments_, render_origin);
       const glm::vec4 color(look::kTfConnectionColor, 1.0F);
       for (const TfConnectionSegment& segment : segments_) {
-        appendVertex(connection_vertices_, glm::dvec3(segment.child), color);
-        appendVertex(connection_vertices_, glm::dvec3(segment.parent), color);
+        appendSegment(connection_lines_, segment.child, segment.parent, color);
       }
     }
     connection_upload_pending_ = true;
@@ -193,22 +186,25 @@ void GridRhiPass::prepare(const RhiFrameContext& frame, bool shadow_active) {
   frame.updates->updateDynamicBuffer(origin_offset_uniforms_, 0, kGridUniformBytes, grid_uniforms_.data());
   // A failed allocation retries next frame.
   if (grid_upload_pending_) {
-    const auto bytes = static_cast<quint32>(grid_vertices_.size() * sizeof(Vertex));
+    const bool cells = !grid_cells_.empty();
+    const auto bytes = static_cast<quint32>(
+        cells ? grid_cells_.size() * sizeof(ColorVertex) : grid_lines_.size() * sizeof(LineSegment));
     grid_ready_ = ensureStaticVertexBuffer(frame.rhi, grid_buffer_, grid_capacity_, bytes, kMinimumGridBufferBytes);
     if (grid_ready_) {
       if (bytes != 0) {
-        PJ::uploadStaticBufferInPieces(frame.updates, grid_buffer_, 0, bytes, grid_vertices_.data());
+        const void* data = cells ? static_cast<const void*>(grid_cells_.data()) : grid_lines_.data();
+        PJ::uploadStaticBufferInPieces(frame.updates, grid_buffer_, 0, bytes, data);
       }
       grid_upload_pending_ = false;
     }
   }
   if (connection_upload_pending_) {
-    const auto bytes = static_cast<quint32>(connection_vertices_.size() * sizeof(Vertex));
+    const auto bytes = static_cast<quint32>(connection_lines_.size() * sizeof(LineSegment));
     connections_ready_ =
         ensureVertexBuffer(frame.rhi, connection_buffer_, connection_capacity_, bytes, kInitialConnectionBufferBytes);
     if (connections_ready_) {
       if (bytes != 0) {
-        frame.updates->updateDynamicBuffer(connection_buffer_, 0, bytes, connection_vertices_.data());
+        frame.updates->updateDynamicBuffer(connection_buffer_, 0, bytes, connection_lines_.data());
       }
       connection_upload_pending_ = false;
     }
@@ -222,7 +218,7 @@ void GridRhiPass::submit(
     return;
   }
   const auto draw = [&](const ScenePipeline* registered, QRhiShaderResourceBindings* resources, QRhiBuffer* buffer,
-                        quint32 first, quint32 count) {
+                        quint32 count, bool lines) {
     if (buffer == nullptr || count == 0U) {
       return;  // before resolve(): an empty part (the cells of the line style) builds no variant
     }
@@ -233,24 +229,28 @@ void GridRhiPass::submit(
     command_buffer->setGraphicsPipeline(pipeline);
     command_buffer->setViewport(viewport);
     command_buffer->setShaderResources(resources);
-    const QRhiCommandBuffer::VertexInput input(buffer, first * static_cast<quint32>(sizeof(Vertex)));
+    const QRhiCommandBuffer::VertexInput input(buffer, 0);
     command_buffer->setVertexInput(0, 1, &input);
-    command_buffer->draw(count);
+    if (lines) {
+      drawLines(*command_buffer, count, setup_.line_segments);
+    } else {
+      command_buffer->draw(count);
+    }
   };
   if (grid_ready_) {
     const bool shadowed =
-        receive_shadow_ && grid_cell_vertex_count_ != 0U && registry.resolve(shadow_pipeline_, pass) != nullptr;
+        receive_shadow_ && !grid_cells_.empty() && registry.resolve(shadow_pipeline_, pass) != nullptr;
     draw(
         shadowed ? shadow_pipeline_ : triangle_pipeline_, shadowed ? shadow_shader_resources_ : shader_resources_,
-        grid_buffer_, 0U, grid_cell_vertex_count_);
-    draw(line_pipeline_, shader_resources_, grid_buffer_, grid_cell_vertex_count_, grid_line_vertex_count_);
+        grid_buffer_, static_cast<quint32>(grid_cells_.size()), false);
+    draw(line_pipeline_, shader_resources_, grid_buffer_, static_cast<quint32>(2U * grid_lines_.size()), true);
   }
   // Only the HDR target carries the data/annotation split in its alpha: the
   // direct pass and the depth replay's coverage draw the connections like grid lines.
   if (connections_ready_) {
     draw(
         pass == ScenePass::kHdrColor ? connection_line_pipeline_ : line_pipeline_, annotation_shader_resources_,
-        connection_buffer_, 0U, static_cast<quint32>(connection_vertices_.size()));
+        connection_buffer_, static_cast<quint32>(2U * connection_lines_.size()), true);
   }
 }
 

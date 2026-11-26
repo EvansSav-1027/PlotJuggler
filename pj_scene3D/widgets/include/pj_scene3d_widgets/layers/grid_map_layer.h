@@ -17,6 +17,7 @@
 #include "pj_datastore/object_store.hpp"  // PJ::ObjectTopicId, PJ::SequentialUID
 #include "pj_runtime/SessionManager.h"    // PJ::DatasetId
 #include "pj_scene3d_core/grid_map_view.h"
+#include "pj_scene3d_widgets/channel_coloring.h"
 #include "pj_scene3d_widgets/scene3d_layer.h"
 #include "pj_widgets/Colormap.h"
 
@@ -29,12 +30,10 @@ namespace pj::scene3d {
 // distinct from any real channel name. An empty request means "auto-pick".
 inline constexpr std::string_view kGridMapElevationNone = "<none>";
 
-// Scene3DLayer for an sdk::GridMap topic: the sample at-or-before the tracker time
-// is resolved (parser or canonical codec), validated, de-interleaved into an
-// elevation + a color channel, and staged ONCE per new sample / selector change;
-// the view reads the staged grid through prepareForRender()/stagedGrid(). The
-// requested field names are kept apart from the effective ones so a persisted
-// request is honoured again once its field reappears.
+// Scene3DLayer for an sdk::GridMap topic: the sample at or before the tracker time is resolved (parser or canonical
+// codec), validated, de-interleaved into an elevation + a colour channel, and staged ONCE per new sample / selector
+// change; the view reads the staged grid through prepareForRender()/stagedGrid(). The requested field names are kept
+// apart from the effective ones so a persisted request is honoured again once its field reappears.
 class GridMapLayer : public Scene3DLayer {
   Q_OBJECT
  public:
@@ -51,6 +50,8 @@ class GridMapLayer : public Scene3DLayer {
   [[nodiscard]] uint64_t renderKey(PJ::Timepoint time) const override;
   QDomElement xmlSaveState(QDomDocument& doc) const override;
   bool xmlLoadState(const QDomElement& element) override;
+  // Parse-only check of what xmlLoadState accepts, reporting to an active PJ::XmlOptionsRecorder.
+  [[nodiscard]] static bool validateXml(const QDomElement& element);
 
   bool attach(const PJ::SceneLayerContext& ctx) override;
   void detach() override;
@@ -61,33 +62,32 @@ class GridMapLayer : public Scene3DLayer {
 
   [[nodiscard]] std::optional<AABB> worldBounds() const override;
 
-  // QRhi view hook, called once per frame for a visible layer: decodes and packs
-  // the sample at the last tracker time when a tracker move or selector change is
-  // pending. The result is stagedGrid(); stagedRevision() bumps on every change.
+  // QRhi view hook, once per frame for a visible layer: decodes and packs the sample at the last tracker time when a
+  // tracker move or selector change is pending. The result is stagedGrid(); stagedRevision() bumps on every change.
   void prepareForRender();
-  // The grid to draw, nullopt when none (before the first sample, a refused one).
   [[nodiscard]] const std::optional<GridMapUpload>& stagedGrid() const {
     return staged_grid_;
   }
   [[nodiscard]] std::uint64_t stagedRevision() const {
     return staged_revision_;
   }
-  // The last decoded sample's frame id (empty before the first sample).
   [[nodiscard]] const std::string& renderFrameId() const override {
     return source_frame_;
   }
   [[nodiscard]] std::optional<PJ::Timepoint> renderStamp() const override {
     return render_stamp_;
   }
-  // Display params as set (the persisted values).
   [[nodiscard]] PJ::Colormap colormap() const {
-    return colormap_;
+    return coloring_.colormap();
   }
   [[nodiscard]] bool autoRange() const {
-    return auto_range_;
+    return coloring_.autoRange();
   }
   [[nodiscard]] std::pair<double, double> manualRange() const {
-    return {manual_lo_, manual_hi_};
+    return coloring_.manualRange();
+  }
+  [[nodiscard]] const ChannelColoring& coloring() const {
+    return coloring_;
   }
   [[nodiscard]] bool lighting() const {
     return lighting_;
@@ -101,8 +101,8 @@ class GridMapLayer : public Scene3DLayer {
 
   QWidget* createConfigWidget(QWidget* parent) override;
 
-  // Display params. The two selectors re-pack on the next render; the rest are
-  // uniform-only. Empty = auto; kGridMapElevationNone = flat plane.
+  // The two selectors re-pack on the next render, the other params are uniform-only. Empty = auto;
+  // kGridMapElevationNone = flat plane.
   void setElevationField(const QString& field_name);
   void setColorField(const QString& field_name);  // empty = follow the elevation field
   void setColormap(PJ::Colormap colormap);
@@ -139,22 +139,26 @@ class GridMapLayer : public Scene3DLayer {
     return field_names_;
   }
   [[nodiscard]] std::pair<double, double> manualRangeForTest() const {
-    return {manual_lo_, manual_hi_};
+    return coloring_.manualRange();
   }
 #endif
 
  signals:
-  // The scalar field list or the effective picks changed (a new schema, or a
-  // request re-resolved): the config panel's selectors rebuild from field_names_.
   void fieldsChanged();
 
  private:
-  // Decode the first sample at attach to learn the source frame + field list.
+  struct ParsedSettings {
+    QString elevation_field;
+    QString color_field;
+    ChannelColoring coloring;
+    bool lighting = true;
+    double opacity = 1.0;
+  };
+  [[nodiscard]] static std::optional<ParsedSettings> parseSettings(const QDomElement& element);
   bool bootstrap();
-  // Fetch the sample at time_ns, pack the selected fields, stage the upload. Cheap
-  // no-op when the same sample + selectors are already staged (the scrub path).
+  // Fetches the sample at time_ns, packs the selected fields and stages the upload; a cheap no-op when the same sample
+  // + selectors are already staged (the scrub path).
   void renderAt(int64_t time_ns);
-  // Hand a packed grid to the view (stagedGrid()).
   void stageGrid(GridMapUpload upload);
   void clearStagedGrid();
   // Forget everything learned from the topic's bytes (parse/upload memos, bounds,
@@ -167,11 +171,10 @@ class GridMapLayer : public Scene3DLayer {
   // Returns false when the grid offers no usable color field.
   bool resolveFields(const PJ::sdk::GridMap& grid);
   void pushDisplayParamsToPass();
-  // Bounds change inside renderAt, i.e. during the paint that follows the dock's
-  // bounds union, so a changed extent requests another repaint to re-fit the camera.
+  void coloringChanged();
+  // Bounds change inside renderAt, i.e. during the paint that follows the dock's bounds union, so a changed extent
+  // requests another repaint to re-fit the camera.
   void setBounds(std::optional<AABB> bounds);
-  // The auto-range toggle plus the two manual-range scrubbers it seeds/enables.
-  void buildRangeRows(QFormLayout* form, QWidget* parent);
 
   PJ::ObjectTopicId topic_id_;
   QString display_name_;
@@ -200,24 +203,18 @@ class GridMapLayer : public Scene3DLayer {
   bool visible_ = true;
   int pack_count_ = 0;
 
-  // Requested (persisted) vs effective field names.
   std::string elevation_request_;
   std::string color_request_;
   std::string resolved_elevation_;  // empty = flat plane
   std::string resolved_color_;
   std::vector<std::string> field_names_;  // scalar fields of the last decoded grid, for the UI
-  // resolveFields memo: the full schema (name, offset, datatype, count: a swapped
-  // datatype changes the auto-pick) and requests it last resolved, plus the
-  // warning it produced (re-applied when the memo hits).
+  // resolveFields memo: the full schema (name, offset, datatype, count: a swapped datatype changes the auto-pick) and
+  // requests it last resolved, plus the warning it produced (re-applied when the memo hits).
   std::vector<PJ::sdk::PointField> fields_memo_;
   std::optional<std::pair<std::string, std::string>> resolved_requests_;
   QString resolve_warning_;
 
-  PJ::Colormap colormap_ = PJ::Colormap::kTurbo;
-  bool auto_range_ = true;
-  double manual_lo_ = 0.0;
-  double manual_hi_ = 1.0;
-  FiniteRange last_auto_range_;  // seeds the manual spinboxes when auto is switched off
+  ChannelColoring coloring_;  // colormap, auto / manual range, the last auto range
   bool lighting_ = true;
   double opacity_ = 1.0;
 

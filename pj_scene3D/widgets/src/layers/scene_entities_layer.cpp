@@ -9,7 +9,6 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLoggingCategory>
-#include <QSettings>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -43,6 +42,7 @@
 #include "pj_widgets/Fnv1a.h"
 #include "pj_widgets/FrameworkTokens.h"
 #include "pj_widgets/ToggleSwitch.h"
+#include "urdf_package_resolver.h"
 using namespace Qt::StringLiterals;
 
 namespace pj::scene3d {
@@ -50,11 +50,9 @@ namespace pj::scene3d {
 namespace {
 Q_LOGGING_CATEGORY(lcSceneEntitiesLayer, "pj.scene3d.entity.markers")
 
-// At most this many per-model failure lines in the notice.
 constexpr qsizetype kMaxNoticeLines = 8;
 
-// The source frame of a batch is the message-level frame: the frame_id of its
-// first entity (per-entity frames are handled by the renderers).
+// The source frame of a batch is the frame_id of its first entity (per-entity frames are handled by the renderers).
 std::string batchSourceFrame(const PJ::sdk::SceneEntities& batch) {
   return batch.entities.empty() ? std::string{} : batch.entities.front().frame_id;
 }
@@ -92,8 +90,7 @@ QString hintFromMediaType(const std::string& media_type, const std::string& url)
   return QFileInfo(path).suffix();
 }
 
-// Identity of a model's source bytes: content hash for embedded data, URL+type
-// for remote sources. A changed signature for the same mesh key forces a reload.
+// Identity of a model's source bytes: content hash for embedded data, URL+type for remote sources.
 std::string sourceSignature(const PJ::sdk::ModelPrimitive& primitive) {
   if (!primitive.data.empty()) {
     return "data:" + primitive.media_type + ":" + std::to_string(primitive.data.size()) + ":" +
@@ -105,16 +102,6 @@ std::string sourceSignature(const PJ::sdk::ModelPrimitive& primitive) {
   return {};
 }
 
-// Policy gate for DATA-SUPPLIED model URLs. Remote model fetch defaults ON
-// (datasets routinely reference their mesh by URL, and a fetch is bounded by
-// UrlFetcher's redirect/size/timeout limits and cached on disk); a user who
-// wants no dataset-driven network egress opts OUT via this QSettings key. Read
-// per newly-seen model source.
-bool remoteModelFetchAllowed() {
-  return QSettings().value(u"pj_scene3d/allow_remote_model_fetch"_s, true).toBool();
-}
-
-// Heap footprint of a decoded batch (saturating), for the snapshot-cache budget.
 std::uint64_t estimateSnapshotBytes(const PJ::sdk::SceneEntities& snapshot) {
   std::uint64_t bytes = sizeof(snapshot);
   bytes = saturatedAdd(bytes, saturatedMultiply(snapshot.entities.capacity(), sizeof(PJ::sdk::SceneEntity)));
@@ -216,16 +203,11 @@ std::optional<SceneEntitiesLayer::ParsedSettings> SceneEntitiesLayer::parseSetti
     return std::nullopt;
   }
   ParsedSettings settings;
-  if (!detail::parseFiniteFloat(element, "opacity", 1.0F, 0.0F, 1.0F, settings.opacity) ||
-      !detail::parseTrueFalse(element, "color_override", false, settings.color_override) ||
-      !detail::parseTrueFalse(element, "wireframe", false, settings.wireframe)) {
+  if (!PJ::readXmlFloat(element, u"opacity"_s, 1.0F, 0.0F, 1.0F, settings.opacity) ||
+      !PJ::readXmlBool(element, u"color_override"_s, false, settings.color_override) ||
+      !PJ::readXmlBool(element, u"wireframe"_s, false, settings.wireframe) ||
+      !detail::parseColor(element, "override_color", {}, settings.override_color)) {
     return std::nullopt;
-  }
-  if (element.hasAttribute(u"override_color"_s)) {
-    settings.override_color = QColor(element.attribute(u"override_color"_s));
-    if (!settings.override_color->isValid()) {
-      return std::nullopt;
-    }
   }
   return settings;
 }
@@ -261,8 +243,7 @@ bool SceneEntitiesLayer::attach(const PJ::SceneLayerContext& ctx) {
   }
   ctx_ = scene3d_ctx;
   snapshot_stream_ = isSnapshotStream(ctx_.session->objectStore().descriptor(topic_id_));
-  // A dataset reload may re-attach without a detach(): start from the pristine
-  // baseline so prior-generation state never skips or anchors the new replay.
+  // A dataset reload may re-attach without a detach(): start from the pristine baseline.
   resetReplayState();
   disconnect(reload_connection_);
   reload_connection_ = connect(
@@ -275,8 +256,7 @@ bool SceneEntitiesLayer::attach(const PJ::SceneLayerContext& ctx) {
       emit repaintRequested();
     }
   });
-  // Seed only when a first sample exists; gate on presence, not on a 0 sentinel
-  // (t=0 is a valid first timestamp under ROS sim time).
+  // Seed only when a first sample exists: gate on presence, not a 0 sentinel (t=0 is valid under ROS sim time).
   PJ::ObjectStore& store = ctx_.session->objectStore();
   if (store.entryCount(topic_id_) > 0) {
     const PJ::Timepoint first = PJ::fromRaw(store.timeRange(topic_id_).first);
@@ -341,6 +321,18 @@ void SceneEntitiesLayer::setTrackerTime(PJ::Timepoint time) {
   ensureModelStateAt(time);
 }
 
+std::optional<PJ::Timepoint> SceneEntitiesLayer::markerStamp(std::size_t index) const {
+  if (finding_stamp_.has_value()) {
+    return finding_stamp_;
+  }
+  return index < geometry_.frame_stamps.size() ? objectStamp(geometry_.frame_stamps[index], marker_stamp_shift_)
+                                               : std::nullopt;
+}
+
+PlacementHold* SceneEntitiesLayer::markerPlacementHold(std::size_t index) const {
+  return &marker_holds_[index];
+}
+
 PlacementHold* SceneEntitiesLayer::placementHoldFor(const std::string& frame) const {
   return &frame_holds_[frame];  // ponytail: one per frame ever drawn; prune when entity frames churn by the thousand
 }
@@ -392,7 +384,6 @@ std::shared_ptr<PJ::sdk::SceneEntities> SceneEntitiesLayer::decodeEntry(
     error = tr("Object parser returned the wrong type for SceneEntities");
     return nullptr;
   }
-  // Moved, not copied: the ObjectRecord is discarded right after.
   return std::make_shared<PJ::sdk::SceneEntities>(std::move(*decoded));
 }
 
@@ -402,10 +393,9 @@ SceneEntitiesLayer::MarkerPick SceneEntitiesLayer::selectMarkerBatch(
     return MarkerPick::kNoSample;
   }
   PJ::ObjectStore& store = ctx_.session->objectStore();
-  // Checked metadata-first (latestEntryIdAt) so an unchanged batch never
-  // resolves payload bytes: a resolve can be a cold refetch once a pool seed
-  // is evicted. SequentialUID is stable across front eviction. Re-checked after
-  // the resolve, since a racing insert can change the pick in between.
+  // Checked metadata-first (latestEntryIdAt) so an unchanged batch never resolves payload bytes (a resolve can be a
+  // cold refetch once a pool seed is evicted); SequentialUID is stable across front eviction. Re-checked after the
+  // resolve, since a racing insert can change the pick in between.
   const auto entry_id = store.latestEntryIdAt(topic_id_, time_ns);
   if (!entry_id.has_value()) {
     return MarkerPick::kNoSample;
@@ -422,6 +412,7 @@ SceneEntitiesLayer::MarkerPick SceneEntitiesLayer::selectMarkerBatch(
   }
   last_marker_uid_ = resolved->sequential_uid;
   shown_store_ns_ = resolved->timestamp;
+  marker_stamp_shift_ = resolved->payload_stamp_shift;
   finding_stamp_.reset();
   if (resolved->timestamp == PJ::kFindingTimestamp) {
     if (const auto stamp = PJ::derivedTopicPresentation(ctx_.session, topic_id_).finding_stamp) {
@@ -446,8 +437,7 @@ SceneEntitiesLayer::MarkerPick SceneEntitiesLayer::selectMarkerBatch(
       return MarkerPick::kRejected;
     }
     batch = decoded;
-    // Seed the model path's cache so the following model fold reuses this batch
-    // instead of re-parsing the same entry.
+    // Seed the model path's cache so the following model fold reuses this batch instead of re-parsing it.
     cacheSnapshot(resolved->sequential_uid, std::move(decoded), resolved->timestamp);
   }
   setBatchWarning({});
@@ -465,15 +455,13 @@ void SceneEntitiesLayer::renderAt(std::int64_t time_ns) {
       if (shown_store_ns_.has_value() && time_ns >= *shown_store_ns_) {
         return;  // the shown entry was evicted under the cursor: it stays
       }
-      // Nothing at/before the playhead: drop stale geometry and any in-flight
-      // expansion of the previous pick.
+      // Nothing at/before the playhead: drop stale geometry and any in-flight expansion of the previous pick.
       shown_store_ns_.reset();
       invalidateDecodeState();
       clearGeometry();
       finding_stamp_.reset();
       return;
     case MarkerPick::kRejected: {
-      // Keep the rejected UID memoized; only the geometry and in-flight work go.
       const PJ::SequentialUID rejected = last_marker_uid_;
       invalidateDecodeState();
       last_marker_uid_ = rejected;
@@ -654,7 +642,6 @@ void SceneEntitiesLayer::ensureModelStateAt(PJ::Timepoint time) {
   }
   const PJ::SequentialUID high_now = store.maxUidAtOrBefore(topic_id_, time_ns);
   if (state_built_at_.has_value() && *state_built_at_ == time && high_now == applied_uid_high_) {
-    // Already built at this playhead and no batch at/before it arrived since.
     return;
   }
   // Incremental forward fold when the playhead only advanced AND nothing changed
@@ -680,7 +667,6 @@ void SceneEntitiesLayer::ensureModelStateAt(PJ::Timepoint time) {
     }
   }
   rebuildModelStateAt(time);
-  // No loop risk: the next ensure at this playhead takes the early return.
   emit repaintRequested();
 }
 
@@ -761,22 +747,43 @@ void SceneEntitiesLayer::startModelLoad(
     load.phase = ModelLoad::Phase::kFailed;
     return;
   }
+  std::string location = primitive.url;
+  if (primitive.data.empty() && location.starts_with("package://")) {
+    ResolvedMesh resolved;
+    if (package_resolver_ != nullptr) {
+      package_resolver_->autoSeedSearchRoots(QString());
+      resolved = package_resolver_->resolveUri(
+          location, /*urdf_dir=*/{}, /*source_is_url=*/false, /*package_url_roots=*/{}, /*remote_only=*/false);
+    }
+    if (!resolved.resolved) {
+      load.error =
+          resolved.package.empty()
+              ? tr("cannot resolve the package:// reference")
+              : tr("package '%1' not found in the mesh search folders").arg(QString::fromStdString(resolved.package));
+      load.phase = ModelLoad::Phase::kFailed;
+      return;
+    }
+    location = std::move(resolved.path);
+  }
+  // Decided once per (key, signature) through startModelLoad's identity early-return: a setting change takes effect on
+  // the next source change.
+  const bool allow_remote_fetch = remoteModelFetchAllowed();
   if (primitive.data.empty()) {
-    const QUrl url(QString::fromStdString(primitive.url));
+    const QUrl url(QString::fromStdString(location));
     // Local sources (bare paths / file:// URLs) stay ungated: reading the
     // user's disk is not network egress. Fetched bytes are capped by UrlFetcher.
-    const bool remote = PJ::isHttpUrl(url);
-    if (remote && !remoteModelFetchAllowed()) {
-      // Decided once per (key, signature), never re-checked per tick.
+    if (PJ::isHttpUrl(url) && !allow_remote_fetch) {
       load.phase = ModelLoad::Phase::kBlocked;
       qCWarning(lcSceneEntitiesLayer) << "blocked remote model fetch for" << url.toString()
                                       << "- enable pj_scene3d/allow_remote_model_fetch to allow";
       return;
     }
   }
-  // Resolved when the job gets a slot, so waiting jobs hold no copy of the bytes.
+  // Resolved when the job gets a slot (embedded bytes: an import slot), so queued jobs hold no copy of the bytes.
   load.job = model_queue_->enqueue(
-      [this, entity_id, model_index]() -> std::optional<MeshLoadQueue::Source> {
+      primitive.data.empty() ? MeshLoadQueue::Source::Kind::kUrl : MeshLoadQueue::Source::Kind::kBytes,
+      [this, entity_id, model_index, allow_remote_fetch,
+       location = QString::fromStdString(location)]() -> std::optional<MeshLoadQueue::Source> {
         const auto entity = model_state_.entities().find(entity_id);
         if (entity == model_state_.entities().end() || model_index >= entity->second.models.size()) {
           return std::nullopt;  // syncModelSources cancels a gone model's job; stay defensive
@@ -784,13 +791,14 @@ void SceneEntitiesLayer::startModelLoad(
         const PJ::sdk::ModelPrimitive& model = entity->second.models[model_index];
         MeshLoadQueue::Source source;
         source.format_hint = hintFromMediaType(model.media_type, model.url);
+        source.allow_remote_fetch = allow_remote_fetch;
         if (!model.data.empty()) {
           source.kind = MeshLoadQueue::Source::Kind::kBytes;
           source.bytes =
               QByteArray(reinterpret_cast<const char*>(model.data.data()), static_cast<qsizetype>(model.data.size()));
         } else {
           source.kind = MeshLoadQueue::Source::Kind::kUrl;
-          source.location = QString::fromStdString(model.url);
+          source.location = location;
         }
         return source;
       },
@@ -829,8 +837,6 @@ void SceneEntitiesLayer::admitModel(const std::string& key, MeshData mesh, bool 
     load.fetch_failed = fetch_failed;
     load.error = std::move(error);
   }
-  // The settle requests its own repaint, so a landed mesh shows without waiting
-  // for an unrelated paint.
   updateRemoteFetchNotice();
   emit repaintRequested();
 }
@@ -973,7 +979,6 @@ SceneEntitiesLayer::DecodeResult SceneEntitiesLayer::expandBatch(const DecodeReq
 }
 
 void SceneEntitiesLayer::onDecodeFinished(DecodeResult result) {
-  // A newer batch may have been picked while this one expanded.
   if (!visible_ || result.uid != last_marker_uid_) {
     return;
   }
@@ -982,6 +987,7 @@ void SceneEntitiesLayer::onDecodeFinished(DecodeResult result) {
     setBatchWarning(std::move(result.built.error));
   } else {
     geometry_ = std::move(result.built.geometry);
+    marker_holds_.assign(geometry_.frames.size(), {});
     ++geometry_revision_;
     setBatchWarning({});
   }
@@ -998,6 +1004,7 @@ void SceneEntitiesLayer::clearGeometry() {
     return;
   }
   geometry_ = {};
+  marker_holds_.clear();
   ++geometry_revision_;
 }
 
@@ -1051,7 +1058,6 @@ QWidget* SceneEntitiesLayer::createConfigWidget(QWidget* parent) {
   form->setVerticalSpacing(PJ::theme::space(PJ::theme::Space::Snug));
   outer->addLayout(form);
 
-  // Opacity (always active): multiplies every primitive's alpha.
   auto* opacity_spin = new PJ::DoubleScrubber(container);
   opacity_spin->setRange(0.0, 1.0);
   opacity_spin->setDecimals(2);
@@ -1061,8 +1067,7 @@ QWidget* SceneEntitiesLayer::createConfigWidget(QWidget* parent) {
   QObject::connect(
       opacity_spin, &PJ::DoubleScrubber::valueChanged, this, [this](double v) { setOpacity(static_cast<float>(v)); });
 
-  // Override color: a sliding switch + swatch on one row. Picking a color
-  // auto-enables it.
+  // Override colour: a sliding switch + swatch on one row; picking a colour auto-enables it.
   auto* override_row = new QWidget(container);
   auto* override_layout = new QHBoxLayout(override_row);
   override_layout->setContentsMargins(
@@ -1087,13 +1092,11 @@ QWidget* SceneEntitiesLayer::createConfigWidget(QWidget* parent) {
     setColorOverrideEnabled(true);  // apply now; the toggled-driven call lags the slide animation
   });
 
-  // Wireframe (always active): draws marker primitives as edges.
   auto* wire_toggle = new PJ::ToggleSwitch(container);
   wire_toggle->setChecked(overrides_.wireframe, /*animate=*/false);
   form->addRow(tr("Wireframe:"), wire_toggle);
   QObject::connect(wire_toggle, &PJ::ToggleSwitch::toggled, this, [this](bool on) { setWireframe(on); });
 
-  // Data / model-load warnings. Hidden while there is nothing to surface.
   auto* warning_label = new QLabel(statusWarning(), container);
   warning_label->setWordWrap(true);
   warning_label->setVisible(!statusWarning().isEmpty());

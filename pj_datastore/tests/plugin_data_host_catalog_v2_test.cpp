@@ -75,6 +75,25 @@ TEST(PluginDataHostCatalogV2Test, ObjectTopicsCarryDatasetTypeCountAndRange) {
   EXPECT_EQ(toStringView(snapshot->dataSources()[0].name), "s");
 }
 
+// Two sources with one name (two data.csv from different folders) are reported under their labels
+// (DataEngine::datasetLabel), so a "label:topic/field" qualifier can pick either, and a source literally named like a
+// suffixed label gets a third: every name in the snapshot is unique, so the agent tools' first match is the only one.
+TEST(PluginDataHostCatalogV2Test, SourcesSharingANameGetDistinctNames) {
+  Fixture f;
+  ASSERT_TRUE(f.toolbox.createDataSource("data.csv").has_value());
+  ASSERT_TRUE(f.toolbox.createDataSource("other.csv").has_value());
+  ASSERT_TRUE(f.toolbox.createDataSource("data.csv").has_value());
+  ASSERT_TRUE(f.toolbox.createDataSource("data.csv (2)").has_value());
+
+  auto snapshot = f.toolbox.catalogSnapshotV2();
+  ASSERT_TRUE(snapshot.has_value()) << snapshot.error();
+  std::vector<std::string> names;
+  for (const PJ_data_source_info_t& source : snapshot->dataSources()) {
+    names.emplace_back(toStringView(source.name));
+  }
+  EXPECT_EQ(names, (std::vector<std::string>{"data.csv", "other.csv", "data.csv (2)", "data.csv (2) (2)"}));
+}
+
 TEST(PluginDataHostCatalogV2Test, EmptyTopicHasZeroRange) {
   Fixture f;
   const auto source = *f.toolbox.createDataSource("s");
@@ -187,9 +206,6 @@ TEST(PluginDataHostCatalogV2Test, SameNameOnTwoDatasetsIsTwoRowsSortedByDataset)
   EXPECT_EQ(toStringView(topics[2].name), "points");
 }
 
-// builtin_object_type is a PJ::sdk::name() value or "": a type this SDK does not know,
-// kNone, a non-string type and metadata that is not a JSON object all give "", and the
-// metadata itself is passed through as it is.
 TEST(PluginDataHostCatalogV2Test, AMergedAwayDatasetCarriesNoTopics) {
   Fixture f;
   const auto anchor = *f.toolbox.createDataSource("log_0.mcap");
@@ -205,6 +221,9 @@ TEST(PluginDataHostCatalogV2Test, AMergedAwayDatasetCarriesNoTopics) {
   EXPECT_EQ(snapshot->topics()[0].source.id, anchor.id);
 }
 
+// builtin_object_type is a PJ::sdk::name() value or "": a type this SDK does not know,
+// kNone, a non-string type and metadata that is not a JSON object all give "", and the
+// metadata itself is passed through as it is.
 TEST(PluginDataHostCatalogV2Test, TypeIsACanonicalNameOrEmpty) {
   Fixture f;
   const auto source = *f.toolbox.createDataSource("s");

@@ -27,8 +27,7 @@ TEST(ToggleSwitchTest, TextAndLabelSideRoundTrip) {
   EXPECT_EQ(sw.labelSide(), PJ::ToggleSwitch::LabelSide::Left);
 }
 
-// Backward-compat pin: with no label the widget keeps its historical compact
-// 34x18 size hint exactly, so existing form/grid users are unaffected.
+// With no label the widget keeps its compact 34x18 size hint exactly, so existing form and grid users are unaffected.
 TEST(ToggleSwitchTest, SizeHintUnchangedWithoutText) {
   PJ::ToggleSwitch sw;
   EXPECT_EQ(sw.sizeHint(), QSize(34, 18));
@@ -62,11 +61,9 @@ TEST(ToggleSwitchTest, ClickingLabelRegionToggles) {
   EXPECT_TRUE(sw.isChecked());
 }
 
-// Regression: the inline label's size hint must reserve a few px BEYOND the
-// exact text advance. With zero slack (size hint == text width to the pixel),
-// any sub-pixel/DPI/font-render difference between the size-hint metrics and the
-// actual paint shaves the tail — the real bug was a converted plugin checkbox
-// whose "...(if present)" rendered as "...(if prese…".
+// The inline label's size hint reserves a few px beyond the exact text advance: with zero slack, any sub-pixel, DPI or
+// font-render difference between the size-hint metrics and the paint shaves the tail (a converted plugin checkbox whose
+// "...(if present)" rendered as "...(if prese...").
 TEST(ToggleSwitchTest, LabelSizeHintReservesSlackBeyondText) {
   PJ::ToggleSwitch sw;
   sw.setText(u"Override with the message header timestamp (if present)"_s);
@@ -87,6 +84,21 @@ TEST(ToggleSwitchTest, ClickTogglesWithoutLabel) {
   ASSERT_FALSE(sw.isChecked());
   QTest::mouseClick(&sw, Qt::LeftButton, Qt::NoModifier, QPoint(sw.width() / 2, sw.height() / 2));
   EXPECT_TRUE(sw.isChecked());
+}
+
+}  // namespace
+
+namespace {
+
+// The off-state thumb sat on the off track in the same neutral fill, so an unchecked switch showed no thumb.
+TEST(ToggleSwitchTest, ThumbFillDiffersFromTheOffTrack) {
+  PJ::ToggleSwitch sw;
+  sw.resize(sw.sizeHint());
+  const QImage image = sw.grab().toImage();
+  const int mid_y = image.height() / 2;
+  const QColor thumb_centre = image.pixelColor(image.height() / 2, mid_y);  // the unchecked thumb sits at the left
+  const QColor track_right = image.pixelColor(image.width() - image.height() / 2, mid_y);
+  EXPECT_NE(thumb_centre.rgb(), track_right.rgb());
 }
 
 }  // namespace

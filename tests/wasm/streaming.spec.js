@@ -25,12 +25,10 @@ const STREAM_REPORT_MARKERS = [
   'PJ_WASM_STREAM_CURVE sequence=',
 ];
 
-// One probe call prints four console lines tagged with the same sequence.
-// Firefox occasionally never delivers one of them (seen on the P8 build too:
-// a main-thread line lost while the streamer worker logs at the same moment);
-// the app stays responsive and the next call reports normally. A report whose
-// four lines do not all arrive is requested again, so one lost console line
-// cannot fail the test; the state checks themselves are unchanged.
+// One probe call prints four console lines tagged with the same sequence. Firefox occasionally never
+// delivers one of them (a main-thread line lost while the streamer worker logs at the same moment); the app
+// stays responsive and the next call reports normally. A report whose four lines do not all arrive is
+// requested again, so one lost console line cannot fail the test.
 async function awaitStreamingReport(page, consoleMessages) {
   let report;
   await expect(async () => {
@@ -216,10 +214,11 @@ test('dummy stream runs, plots, pauses, resumes, stops, and shuts down cleanly',
     quit: typeof window.pjWasmReportQuitActionProbe,
   }))).toEqual({ stream: 'function', quit: 'function' });
 
-  // The built-in streams are the Dummy Streamer, selected first, and the PlotJuggler Bridge.
+  // The built-in streams are the Dummy Streamer, selected first, the PlotJuggler Bridge and the
+  // Foxglove Bridge.
   let state = await requestStreamingState(page, consoleMessages);
   expect(state).toMatchObject({
-    sources: 2,
+    sources: 3,
     source: 'Dummy Streamer',
     active: false,
     datasets: 0,
@@ -241,7 +240,7 @@ test('dummy stream runs, plots, pauses, resumes, stops, and shuts down cleanly',
     consoleMessages,
     value => value.active && value.datasets === 1 && value.catalog === 11 && value.range.max > value.range.min,
   );
-  expect(state).toMatchObject({ sources: 2, source: 'Dummy Streamer', active: true, datasets: 1, catalog: 11 });
+  expect(state).toMatchObject({ sources: 3, source: 'Dummy Streamer', active: true, datasets: 1, catalog: 11 });
   expect(state.tree.datasetName).toBe('[stream] Dummy Streamer');
   expect(state.tree.topicName).toBe('dummy/sin_cos');
   expect(state.tree.fieldName).toBe('sin');
@@ -310,7 +309,7 @@ test('dummy stream runs, plots, pauses, resumes, stops, and shuts down cleanly',
     consoleMessages,
     value => !value.active && value.datasets === 0 && value.catalog === 0 && !value.curve.plotted,
   );
-  expect(state.sources).toBe(2);
+  expect(state.sources).toBe(3);
 
   // Start once more, then close through the real File -> Quit action. The
   // WASM close boundary must cooperatively stop and join the worker even

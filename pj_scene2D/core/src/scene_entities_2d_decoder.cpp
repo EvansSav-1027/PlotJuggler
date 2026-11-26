@@ -227,8 +227,7 @@ void appendEntity(const sdk::SceneEntity& entity, ImageAnnotation& annotation) {
   for (const auto& axes : entity.axes) {
     appendAxes(axes, annotation);
   }
-  // TODO: Cylinders could reuse the sphere top-down circle projection.
-  // Models are intentionally skipped: mesh assets need a loader before 2D projection.
+  // Cylinders are not projected; models would need a mesh loader.
 }
 
 // Project a canonical SceneEntities batch onto a 2D SceneFrame (the primitives'
@@ -237,8 +236,8 @@ void appendEntity(const sdk::SceneEntity& entity, ImageAnnotation& annotation) {
   SceneFrame frame;
   ImageAnnotation annotation;
   if (!entities.entities.empty()) {
-    frame.timestamp = entities.entities.front().timestamp;
-    annotation.timestamp = frame.timestamp;
+    frame.timestamp = entities.entities.front().timestamp_ns;
+    annotation.timestamp_ns = frame.timestamp;
   }
 
   for (const auto& entity : entities.entities) {

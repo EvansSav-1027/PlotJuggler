@@ -7,16 +7,15 @@
 
 #include <gtest/gtest.h>
 
-#include <QApplication>
 #include <QDir>
 #include <QDomDocument>
 #include <QFile>
-#include <QPushButton>
+#include <QPointer>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QTemporaryDir>
-#include <QTimer>
 #include <algorithm>
+#include <cstddef>
 #include <memory>
 #include <vector>
 
@@ -32,6 +31,7 @@
 #include "support/gui_test_env.h"
 #include "support/layout_import_gui_support.h"
 #include "support/loader_test_support.h"
+#include "support/modal_answerer.h"
 
 using namespace Qt::StringLiterals;
 
@@ -196,6 +196,34 @@ TEST_F(MainWindowCustomWidgetTest, InstalledPluginRestoresIntoALiveWidgetAndSave
   EXPECT_EQ(pj_cw_test::g.destroyed_while_parented, 0);
 }
 
+TEST_F(MainWindowCustomWidgetTest, AnEditInsideTheWidgetIsUndone) {
+  pj_cw_test::g = pj_cw_test::PluginStats{};
+  ASSERT_TRUE(session().extensionCatalog().pluginCatalog().registerStaticWidget(pj_cw_test::goodVtable()));
+  const QPointer<PJ::CustomWidgetDockWidget> edited = loadWith(u"test_widgets"_s);
+  ASSERT_NE(edited, nullptr);
+  ASSERT_TRUE(pj_cw_test::g.edit_in_widget);
+  const std::size_t depth = Peer::undoSize(*window_);
+
+  // The user changes a filter in the widget's own UI: only the plugin knows, until it says so.
+  pj_cw_test::g.edit_in_widget(R"({"unit":"km","filter":"warn"})");
+  ASSERT_TRUE(pumpUntil([&]() { return Peer::undoSize(*window_) == depth + 1; })) << "one undo step";
+
+  // The undo rebuilds the tab: a new panel restores the earlier state, the edited one is deleted later.
+  Peer::undo(*window_);
+  PJ::CustomWidgetDockWidget* dock = nullptr;
+  ASSERT_TRUE(pumpUntil([&]() {
+    for (PJ::CustomWidgetDockWidget* candidate : window_->findChildren<PJ::CustomWidgetDockWidget*>()) {
+      if (candidate != edited && !candidate->isMissing()) {
+        dock = candidate;
+      }
+    }
+    return dock != nullptr;
+  }));
+  const QString settings = dock->settingsJson();
+  EXPECT_EQ(settings.indexOf(u"filter"_s), -1) << qPrintable(settings);
+  EXPECT_NE(settings.indexOf(u"km"_s), -1) << qPrintable(settings);
+}
+
 TEST_F(MainWindowCustomWidgetTest, AWireThatStartsWaitingLaterStillDemandsItsTopic) {
   ASSERT_TRUE(session().extensionCatalog().pluginCatalog().registerStaticWidget(pj_cw_test::goodVtable()));
   PJ::CustomWidgetDockWidget* dock = loadWith(u"test_widgets"_s);
@@ -301,21 +329,11 @@ TEST_F(UncleanShutdownTest, AnsweringDisableTurnsThePluginOffAndItsPanelsRestore
 
   // Answer the question the way a user would: click its "Disable" button once it is up.
   bool clicked = false;
-  QTimer answer;
-  QObject::connect(&answer, &QTimer::timeout, [&]() {
-    QWidget* modal = QApplication::activeModalWidget();
-    if (modal == nullptr || clicked) {
-      return;
-    }
-    for (QPushButton* button : modal->findChildren<QPushButton*>()) {
-      if (button->text() == u"Disable"_s) {
-        clicked = true;
-        button->click();
-        return;
-      }
-    }
+  pj_app_test::ModalAnswerer answer;
+  answer.next(pj_app_test::messageBoxWithButton({u"Disable"_s}), [&clicked](QWidget* box) {
+    clicked = true;
+    pj_app_test::clickMessageBoxButton(box, {u"Disable"_s});
   });
-  answer.start(20);
   window_->reviewUncleanShutdown(/*interactive=*/true);
   answer.stop();
   ASSERT_TRUE(clicked);

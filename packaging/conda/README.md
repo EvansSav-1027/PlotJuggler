@@ -16,14 +16,31 @@ Without ROS: `pixi global install -c conda-forge -c https://prefix.dev/plotjuggl
 ```bash
 # PJ4's own dependency packages (recipes/), once:
 pixi exec --spec "rattler-build>=0.66,<0.67" rattler-build build \
-  --recipe recipes/luau --recipe recipes/libmcap --recipe recipes/cloudini \
-  --recipe recipes/kissfft --recipe recipes/libnanoarrow \
+  --recipe recipes/luau --recipe recipes/libmcap \
   -m recipes/variants.yaml -c conda-forge --output-dir local-channel
 packaging/conda/build_conda.sh --channel ./local-channel   # -> conda-output/
 ```
 
+That builds all four variants (below). `--variant python=3.14 --variant ffmpeg=9.0`
+builds one, and `CCACHE_DIR=<dir>` in the environment compiles through ccache,
+so the variants and later builds reuse each other's objects.
+
 Release tags publish both through `.github/workflows/conda-release.yml`, for
-linux-64 and osx-arm64 (macOS 13+).
+linux-64 and osx-arm64 (macOS 14+: conda-forge's Qt needs it). Pull requests that touch the recipes build
+one variant there.
+
+Publishing requires the repository Actions secret `PREFIX_API_KEY`, with write
+access to the `plotjuggler` channel. Tag builds check this before compiling.
+If a completed tag run built its packages but publication failed, configure the
+credential and publish its saved artifacts without rebuilding:
+
+```bash
+gh workflow run conda-release.yml --repo PlotJuggler/PlotJuggler \
+  --ref main -f publish_run_id=<tag-run-id>
+```
+
+The retry checks that the saved run belongs to this workflow and still matches
+its release tag, and requires packages for both supported platforms.
 
 ## Compatibility with RoboStack
 
@@ -31,7 +48,18 @@ A conda environment holds one version of each library, so the package has to
 build against what RoboStack's ROS packages were built against:
 
 - **Pins** in `variants.yaml` and `recipes/variants.yaml` follow RoboStack's
-  `conda_build_config.yaml`: GCC 14 on Linux, clang 19 on macOS, and fmt 12.1.
+  `conda_build_config.yaml`: GCC 14 on Linux, clang 19 on macOS, fmt 12.1,
+  lz4-c 1.10 (RoboStack's `vtk-base` cannot install next to 1.11), and
+  Qt 6.11 (`qt6_main`; the build passes it to CMake as `PJ_QT_MIN_VERSION`, below
+  the release kit in `versions.env`). There is one build per Python RoboStack
+  ships (3.12 and 3.14), since the embedded interpreter links that `libpython`.
+- **Qt 6.11** is also a run pin to that minor: PJ4 builds against Qt's private
+  headers (QRhi and others), which change ABI every minor release.
+- **Qt-Advanced-Docking** is conda-forge's `qt6-advanced-docking-system` from
+  build 3 on, which carries the fork's "keep inactive tabs parented" patch (`PJ_SYSTEM_ADS`, see the root `CMakeLists.txt`).
+- **plotjuggler_sdk** (on the `plotjuggler` channel for linux-64 only) and
+  **pocketfft** (on neither channel) are not taken from conda: the configure step downloads them (pinned by SHA-256) and the build cannot run
+  with `FETCHCONTENT_FULLY_DISCONNECTED`.
 - **ffmpeg** and **libarchive** come from conda-forge's LGPL builds (PJ4 is
   MPL-2.0; the GPL libarchive links lzo). There are two builds, one per ffmpeg
   major, because RoboStack's OpenCV pins it: Jazzy is on 9, Kilted on 8.
@@ -40,10 +68,12 @@ build against what RoboStack's ROS packages were built against:
 | --- | --- |
 | Jazzy | installs (ffmpeg 9 build) |
 | Kilted | installs (ffmpeg 8 build) |
-| Humble | does not solve: its snapshot holds Qt 6.10, PJ4 needs `PJ_QT_VERSION` from `versions.env`. Humble users are on Ubuntu 22.04: use the [apt repository](../deb/README.md). |
+| Humble | installs (ffmpeg 9, Python 3.14 build) |
 
 The marketplace ROS 2 plugin is built against `/opt/ros` and does not load in
-a RoboStack environment yet.
+a RoboStack environment. Neither do the marketplace Widget plugins: they are
+built against the official Qt kit in `versions.env`, and the host refuses a
+widget library of another Qt minor.
 
 `PJ_INSTALLATION=conda`: the in-app update check points conda users at the
 GitHub release, not at `pixi update`.

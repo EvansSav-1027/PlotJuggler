@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "pj_scene3d_core/tf/view_sampling.h"
 #include "pj_tf/tf_buffer.h"
 
 namespace pj::scene3d {
@@ -72,7 +73,6 @@ TEST(BuildTfFrameTrail, StaticChildInheritsParentMotion) {
   (void)buffer.setTransform(stampedAt(5ns, "base", "lidar", 0.5));
 
   const TrailPolyline trail = buildTfFrameTrail(buffer, "odom", "lidar", TimePoint::min(), TimePoint::max(), 1000);
-  // Stamp 5 is unresolvable (odom->base has no sample yet) -> skipped (gap rule).
   ASSERT_EQ(trail.size(), 2U);
   EXPECT_DOUBLE_EQ(trail[0].pos.x, 1.5);
   EXPECT_DOUBLE_EQ(trail[1].pos.x, 2.5);
@@ -111,7 +111,7 @@ TEST(BuildPoseTopicTrail, TransformsEachSampleAtItsOwnStamp) {
   EXPECT_DOUBLE_EQ(trail[1].pos.x, 201.0);
 }
 
-// TF R6: the trail is sampled in the entry clock (the cursor's), so its head meets
+// The trail is sampled in the entry clock (the cursor's), so its head meets
 // the frame's triad. The odom->base samples were logged 5 ns after their stamps.
 TEST(BuildTfFrameTrail, SamplesTheEntryClock) {
   TransformBuffer buffer(TransformBuffer::kKeepAll);
@@ -130,8 +130,8 @@ TEST(BuildTfFrameTrail, SamplesTheEntryClock) {
 // A pose is placed like the pose layer places it: at its own header stamp (the
 // header clock), else at its store timestamp t (the entry clock).
 TEST(BuildPoseTopicTrail, PlacesEachPoseAtItsOwnHeaderStamp) {
+  setViewSampling(pj::tf::Sampling::kHold);  // reads between two TF samples: which one each clock holds
   TransformBuffer buffer(TransformBuffer::kKeepAll);
-  // map->odom stamped 10 and 20, logged at 40 and 50.
   ASSERT_TRUE(buffer.setTransform(stampedAt(10ns, "map", "odom", 100.0), tp(40ns)).has_value());
   ASSERT_TRUE(buffer.setTransform(stampedAt(20ns, "map", "odom", 200.0), tp(50ns)).has_value());
 

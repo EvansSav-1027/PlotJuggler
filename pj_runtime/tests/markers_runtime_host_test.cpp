@@ -25,6 +25,7 @@
 #include "pj_base/sdk/plugin_data_api.hpp"
 #include "pj_base/span.hpp"
 #include "pj_base/types.hpp"
+#include "pj_datastore/engine.hpp"
 #include "pj_datastore/object_store.hpp"
 #include "pj_runtime/BatchEngine.h"
 #include "pj_runtime/DatasetQualifiedName.h"
@@ -68,8 +69,27 @@ PJ::CatalogItem catalogRow(PJ::DatasetId ds, const char* key) {
   return item;
 }
 
-std::optional<std::string> sourceNameOf(PJ::DatasetId id) {
-  return id == 1 ? "a" : "b";
+// Datasets 1 and 2, loaded from sources "a" and "b".
+const PJ::DataEngine& sourcesAB() {
+  static const PJ::DataEngine engine = [] {
+    PJ::DataEngine created;
+    (void)created.createDataset(PJ::DatasetDescriptor{.source_name = "a"});
+    (void)created.createDataset(PJ::DatasetDescriptor{.source_name = "b"});
+    return created;
+  }();
+  return engine;
+}
+
+// The label callback as DerivedRuntimeHosts wires it, over `engine`.
+std::function<std::optional<std::string>(PJ::DatasetId)> labelsOf(const PJ::DataEngine& engine) {
+  return [&engine](PJ::DatasetId id) -> std::optional<std::string> {
+    std::string label = engine.datasetLabel(id);
+    return label.empty() ? std::nullopt : std::optional{std::move(label)};
+  };
+}
+
+std::optional<std::string> labelOf(PJ::DatasetId id) {
+  return labelsOf(sourcesAB())(id);
 }
 
 // The dataset callback exactly as MainWindow wires it: the real resolver over a
@@ -78,16 +98,17 @@ std::function<PJ::Expected<PJ::DatasetId>(std::vector<std::string>&, std::vector
 realResolverOverTwoDatasets() {
   return [](std::vector<std::string>& inputs, std::vector<std::string>& outputs) -> PJ::Expected<PJ::DatasetId> {
     const std::vector<PJ::CatalogItem> items = {catalogRow(1, "in"), catalogRow(2, "in")};
-    return PJ::resolveMarkerDataset(inputs, outputs, items, {1, 2}, sourceNameOf);
+    return PJ::resolveMarkerDataset(inputs, outputs, items, sourcesAB());
   };
 }
 
-// The production wiring over a catalog the test can grow after a create.
+// The production wiring over a catalog the test can grow after a create, labelled by `engine`.
 using SharedCatalog = std::shared_ptr<std::vector<PJ::CatalogItem>>;
 std::function<PJ::Expected<PJ::DatasetId>(std::vector<std::string>&, std::vector<std::string>&)> realResolverOver(
-    SharedCatalog items) {
-  return [items](std::vector<std::string>& inputs, std::vector<std::string>& outputs) -> PJ::Expected<PJ::DatasetId> {
-    return PJ::resolveMarkerDataset(inputs, outputs, *items, {1, 2}, sourceNameOf);
+    SharedCatalog items, const PJ::DataEngine& engine = sourcesAB()) {
+  return [items, &engine](
+             std::vector<std::string>& inputs, std::vector<std::string>& outputs) -> PJ::Expected<PJ::DatasetId> {
+    return PJ::resolveMarkerDataset(inputs, outputs, *items, engine);
   };
 }
 
@@ -107,26 +128,21 @@ TEST(MarkersRuntimeHostTest, PluginCreateRunsPublishesAndNamespaces) {
   ASSERT_TRUE(created) << created.error();
   EXPECT_EQ(created->front(), PJ::markerOwnerTopicName("in", "anomaly/gen1")) << "the physical topic, readable back";
 
-  // Markers were published by the HOST into the ObjectStore, in the __markers__/in family.
   EXPECT_EQ(markerFamily(store, kDataset, "in").size(), 1u);
 
-  // The service stored it under the plugin-namespaced key.
   ASSERT_EQ(service.recipes().size(), 1u);
   EXPECT_EQ(service.recipes()[0].id, "anomaly/gen1");
 
-  // list() returns the plugin-LOCAL id (namespace stripped).
   const PJ::Expected<std::vector<std::string>> ids = view.list();
   ASSERT_TRUE(ids) << ids.error();
   ASSERT_EQ(ids->size(), 1u);
   EXPECT_EQ((*ids)[0], "gen1");
 
-  // config round-trips kind + inputs + outputs.
   const PJ::Expected<std::string> recipe = view.recipeOf("gen1");
   ASSERT_TRUE(recipe) << recipe.error();
   EXPECT_NE(recipe->find("\"kind\":\"markers\""), std::string::npos);
   EXPECT_NE(recipe->find("\"outputs\":[\"in\"]"), std::string::npos);
 
-  // remove drops it.
   EXPECT_TRUE(view.remove("gen1"));
   EXPECT_TRUE(service.recipes().empty());
 }
@@ -287,10 +303,9 @@ TEST(MarkersRuntimeHostTest, ScopeAllPublishesAcrossDatasets) {
   EXPECT_TRUE(markerFamily(store, 2, PJ::kAllDatasetsMarkerTopic).empty());
 }
 
-// The Anomaly Detector submits a Dataset-scope and a Global-scope rule with the SAME
-// output key ("__global__") and only the id and the scope hint to tell them apart. Both
-// must survive as separate generators and publish to separate topics: the collision this
-// guards against left one of the two rules silently unpublished.
+// The Marker Editor submits a Dataset-scope and a Global-scope rule with the same output key ("__global__") and
+// only the id and the scope hint to tell them apart. Both must survive as separate generators and publish to separate
+// topics; a collision would leave one of the two rules silently unpublished.
 TEST(MarkersRuntimeHostTest, DatasetAndGlobalScopeRulesCoexistOverTheAbi) {
   PJ::ObjectStore store;
   BatchEngine service(store, rampResolver());
@@ -320,8 +335,8 @@ TEST(MarkersRuntimeHostTest, DatasetAndGlobalScopeRulesCoexistOverTheAbi) {
   EXPECT_TRUE(readMarkerUnion(store, kAllDatasetsMarkerDataset, PJ::kAllDatasetsMarkerTopic).markers.empty());
 }
 
-// Preview is now create(EPHEMERAL) + remove: the host publishes ephemerally (returns
-// the auto-named preview topic, readable in the store, excluded from recipes()).
+// Preview is create(EPHEMERAL) + remove: the host publishes ephemerally (returns the auto-named preview topic,
+// readable in the store, excluded from recipes()).
 TEST(MarkersRuntimeHostTest, PreviewViaEphemeralFlagPublishesAndIsEphemeral) {
   PJ::ObjectStore store;
   BatchEngine service(store, rampResolver());
@@ -348,7 +363,7 @@ TEST(MarkersRuntimeHostTest, PreviewViaEphemeralFlagPublishesAndIsEphemeral) {
   EXPECT_TRUE(markerFamily(store, kDataset, topics->front()).empty());
 }
 
-// The Anomaly Detector submits its Dataset-scope id ("rule/__global__") on whatever
+// The Marker Editor submits its Dataset-scope id ("rule/__global__") on whatever
 // dataset is active when the user (re)runs it — the SAME plugin-local id, over and
 // over, on different datasets as the active one changes. This must produce one
 // binding PER dataset (one id, several bindings), not the second overwriting the
@@ -388,9 +403,8 @@ TEST(MarkersRuntimeHostTest, DatasetScopeRuleOnEachDatasetKeepsBoth) {
   EXPECT_TRUE(service.recipes().empty());
 }
 
-// Bug (PR #619 #2a): onCreate resolves the dataset BEFORE reading {"scope":"all"},
-// so a global generator whose bare input lives in two datasets is refused as
-// ambiguous although scope=all evaluates every dataset separately.
+// A global generator (scope=all) whose bare input lives in two datasets is not refused as ambiguous: scope=all
+// evaluates every dataset separately, so onCreate reads the scope before it resolves a target dataset.
 TEST(MarkersRuntimeHostTest, ScopeAllWithBareInputInTwoDatasetsIsNotAmbiguous) {
   PJ::ObjectStore store;
   BatchEngine service(store, rampResolver());
@@ -406,8 +420,8 @@ TEST(MarkersRuntimeHostTest, ScopeAllWithBareInputInTwoDatasetsIsNotAmbiguous) {
   EXPECT_EQ(markerFamily(store, kAllDatasetsMarkerDataset, PJ::kAllDatasetsMarkerTopic).size(), 1u);
 }
 
-// Bug (PR #619 #2b): the same ordering makes a constant, input-free scope=all
-// generator fail with "none of the generator's inputs matches a loaded series".
+// A constant, input-free scope=all generator installs; it does not fail with "none of the generator's inputs matches
+// a loaded series".
 TEST(MarkersRuntimeHostTest, ScopeAllWithZeroInputsSucceeds) {
   PJ::ObjectStore store;
   BatchEngine service(store, rampResolver());
@@ -422,8 +436,8 @@ TEST(MarkersRuntimeHostTest, ScopeAllWithZeroInputsSucceeds) {
   EXPECT_EQ(markerFamily(store, kAllDatasetsMarkerDataset, PJ::kAllDatasetsMarkerTopic).size(), 1u);
 }
 
-// Bug (PR #619 #1): the callback strips "b:in" to "in" for storage, but the script
-// is kept verbatim, so series("b:in") — the name the plugin declared — is nil.
+// The script is kept verbatim while the callback strips "b:in" to "in" for storage, so series("b:in"), the name the
+// plugin declared, still resolves.
 TEST(MarkersRuntimeHostTest, ScriptCanReadTheQualifiedInputNameItDeclared) {
   PJ::ObjectStore store;
   BatchEngine service(store, rampResolver());
@@ -491,7 +505,7 @@ TEST(MarkersRuntimeHostTest, ConfigKeepsAUniqueBareInputBare) {
   BatchEngine service(store, rampResolver());
   const SharedCatalog items = std::make_shared<std::vector<PJ::CatalogItem>>();
   items->push_back(catalogRow(1, "in"));
-  MarkersRuntimeHost bridge(service, "anomaly", realResolverOver(items), sourceNameOf);
+  MarkersRuntimeHost bridge(service, "anomaly", realResolverOver(items), labelOf);
   PJ::sdk::DataProcessorsHostView view(bridge.raw());
 
   const std::string_view inputs[] = {"in"};
@@ -508,7 +522,7 @@ TEST(MarkersRuntimeHostTest, ConfigQualifiesAnInputOnceItsBareNameIsAmbiguous) {
   BatchEngine service(store, rampResolver());
   const SharedCatalog items = std::make_shared<std::vector<PJ::CatalogItem>>();
   items->push_back(catalogRow(1, "in"));
-  MarkersRuntimeHost bridge(service, "anomaly", realResolverOver(items), sourceNameOf);
+  MarkersRuntimeHost bridge(service, "anomaly", realResolverOver(items), labelOf);
   PJ::sdk::DataProcessorsHostView view(bridge.raw());
 
   const std::string_view inputs[] = {"in"};
@@ -519,6 +533,79 @@ TEST(MarkersRuntimeHostTest, ConfigQualifiesAnInputOnceItsBareNameIsAmbiguous) {
   EXPECT_NE(recipe->find("\"inputs\":[\"a:in\"]"), std::string::npos) << *recipe;
 }
 
+// Two copies of source "X": a generator bound to the newer one reads back under its label "X (2)", and that echo
+// resubmits onto the same copy.
+TEST(MarkersRuntimeHostTest, ConfigEchoesTheNewerCopysLabelAndResubmits) {
+  PJ::DataEngine engine;
+  (void)engine.createDataset(PJ::DatasetDescriptor{.source_name = "X"});
+  (void)engine.createDataset(PJ::DatasetDescriptor{.source_name = "X"});
+  PJ::ObjectStore store;
+  BatchEngine service(store, rampResolver());
+  const SharedCatalog items = std::make_shared<std::vector<PJ::CatalogItem>>();
+  items->push_back(catalogRow(1, "in"));
+  items->push_back(catalogRow(2, "in"));
+  MarkersRuntimeHost bridge(service, "anomaly", realResolverOver(items, engine), labelsOf(engine));
+  PJ::sdk::DataProcessorsHostView view(bridge.raw());
+
+  const std::string_view inputs[] = {"X (2):in"};
+  ASSERT_TRUE(view.createMarkers("g", PJ::Span<const std::string_view>(inputs), "in", "createMarker(0.0)\n", "{}"));
+  const PJ::Expected<std::string> recipe = view.recipeOf("g");
+  ASSERT_TRUE(recipe) << recipe.error();
+  EXPECT_NE(recipe->find("\"inputs\":[\"X (2):in\"]"), std::string::npos) << *recipe;
+
+  const std::string_view echoed[] = {"X (2):in"};
+  ASSERT_TRUE(view.createMarkers("g2", PJ::Span<const std::string_view>(echoed), "in", "createMarker(0.0)\n", "{}"));
+  ASSERT_NE(service.firstBinding(BatchEngine::ownerPrefix("anomaly").append("g2")), nullptr);
+  EXPECT_EQ(service.firstBinding(BatchEngine::ownerPrefix("anomaly").append("g2"))->dataset_id, 2u);
+}
+
+// Labels are stable: once the older copy is removed, the generator still reads back "X (2):in", which still resubmits.
+TEST(MarkersRuntimeHostTest, ConfigStaysResubmittableAfterTheOlderCopyIsRemoved) {
+  PJ::DataEngine engine;
+  (void)engine.createDataset(PJ::DatasetDescriptor{.source_name = "X"});
+  (void)engine.createDataset(PJ::DatasetDescriptor{.source_name = "X"});
+  PJ::ObjectStore store;
+  BatchEngine service(store, rampResolver());
+  const SharedCatalog items = std::make_shared<std::vector<PJ::CatalogItem>>();
+  items->push_back(catalogRow(1, "in"));
+  items->push_back(catalogRow(2, "in"));
+  MarkersRuntimeHost bridge(service, "anomaly", realResolverOver(items, engine), labelsOf(engine));
+  PJ::sdk::DataProcessorsHostView view(bridge.raw());
+
+  const std::string_view inputs[] = {"X (2):in"};
+  ASSERT_TRUE(view.createMarkers("g", PJ::Span<const std::string_view>(inputs), "in", "createMarker(0.0)\n", "{}"));
+  engine.removeDataset(1);
+  items->erase(items->begin());
+
+  const PJ::Expected<std::string> recipe = view.recipeOf("g");
+  ASSERT_TRUE(recipe) << recipe.error();
+  EXPECT_NE(recipe->find("\"inputs\":[\"X (2):in\"]"), std::string::npos) << *recipe;
+  const std::string_view echoed[] = {"X (2):in"};
+  EXPECT_TRUE(view.createMarkers("g2", PJ::Span<const std::string_view>(echoed), "in", "createMarker(0.0)\n", "{}"));
+}
+
+// A qualified input reads back under the dataset's CURRENT label, even while its bare name is unique: after a relabel
+// (a merge names its anchor "<label>_merged") the declared "X:in" would no longer resubmit.
+TEST(MarkersRuntimeHostTest, ConfigRederivesAQualifiedInputAfterARelabel) {
+  PJ::DataEngine engine;
+  (void)engine.createDataset(PJ::DatasetDescriptor{.source_name = "X"});
+  (void)engine.createDataset(PJ::DatasetDescriptor{.source_name = "Y"});
+  PJ::ObjectStore store;
+  BatchEngine service(store, rampResolver());
+  const SharedCatalog items = std::make_shared<std::vector<PJ::CatalogItem>>();
+  items->push_back(catalogRow(1, "in"));
+  MarkersRuntimeHost bridge(service, "anomaly", realResolverOver(items, engine), labelsOf(engine));
+  PJ::sdk::DataProcessorsHostView view(bridge.raw());
+
+  const std::string_view inputs[] = {"X:in"};
+  ASSERT_TRUE(view.createMarkers("g", PJ::Span<const std::string_view>(inputs), "in", "createMarker(0.0)\n", "{}"));
+  ASSERT_EQ(engine.setDatasetLabel(1, "X_merged"), "X_merged");
+
+  const PJ::Expected<std::string> recipe = view.recipeOf("g");
+  ASSERT_TRUE(recipe) << recipe.error();
+  EXPECT_NE(recipe->find("\"inputs\":[\"X_merged:in\"]"), std::string::npos) << *recipe;
+}
+
 // Under scope=all every dataset is evaluated with literal keys, so a qualifier
 // naming a loaded source is a contradiction — refused, not silently used as a
 // key that resolves nowhere.
@@ -526,7 +613,7 @@ TEST(MarkersRuntimeHostTest, ScopeAllRejectsARecognizedDatasetQualifier) {
   PJ::ObjectStore store;
   BatchEngine service(store, rampResolver());
   service.setDatasetLister([] { return std::vector<PJ::DatasetId>{1, 2}; });
-  MarkersRuntimeHost bridge(service, "anomaly", realResolverOverTwoDatasets(), sourceNameOf);
+  MarkersRuntimeHost bridge(service, "anomaly", realResolverOverTwoDatasets(), labelOf);
   PJ::sdk::DataProcessorsHostView view(bridge.raw());
 
   const std::string_view inputs[] = {"b:in"};
@@ -547,7 +634,7 @@ TEST(MarkersRuntimeHostTest, ScopeAllKeepsAColonNameThatMatchesNoSource) {
     return rampResolver()(1, key == "zz:in" ? "in" : key, window);
   });
   service.setDatasetLister([] { return std::vector<PJ::DatasetId>{1, 2}; });
-  MarkersRuntimeHost bridge(service, "anomaly", realResolverOverTwoDatasets(), sourceNameOf);
+  MarkersRuntimeHost bridge(service, "anomaly", realResolverOverTwoDatasets(), labelOf);
   PJ::sdk::DataProcessorsHostView view(bridge.raw());
 
   const std::string_view inputs[] = {"zz:in"};
@@ -662,7 +749,7 @@ PJ::sdk::DataProcessorRequest markerRequest(std::string_view id, std::string scr
   return request;
 }
 
-// BAT-10: a WINDOW on the typed create installs a generator clipped to it.
+// A WINDOW on the typed create installs a generator clipped to it.
 TEST(MarkersRuntimeHostTest, CreateV2WithWindowInstallsAClippedGenerator) {
   PJ::ObjectStore store;
   BatchEngine service(store, rampResolver());
@@ -686,7 +773,7 @@ TEST(MarkersRuntimeHostTest, CreateV2WithWindowInstallsAClippedGenerator) {
   EXPECT_EQ(readMarkerUnion(store, kDataset, "in").markers.size(), 2u) << "only samples 2 and 3 fall in the window";
 }
 
-// BAT-10: config reports the window the last run actually staged (coverage_ns), not the
+// Config reports the window the last run actually staged (coverage_ns), not the
 // requested one: the ramp has samples 0..4, so [1, 100] staged [1, 4]. An unwindowed
 // rule reports no coverage.
 TEST(MarkersRuntimeHostTest, ConfigReportsTheStagedCoverage) {
@@ -708,7 +795,7 @@ TEST(MarkersRuntimeHostTest, ConfigReportsTheStagedCoverage) {
   EXPECT_EQ(whole->find("coverage_ns"), std::string::npos) << *whole;
 }
 
-// BAT-10: a window whose start is after its end is refused; nothing is installed.
+// A window whose start is after its end is refused; nothing is installed.
 TEST(MarkersRuntimeHostTest, CreateV2WindowStartAfterEndIsRejected) {
   PJ::ObjectStore store;
   BatchEngine service(store, rampResolver());
@@ -740,8 +827,7 @@ TEST(MarkersRuntimeHostTest, CreateV2WithInstantIsRejected) {
   EXPECT_TRUE(service.recipes().empty());
 }
 
-// Until the catalog v2 work, the markers kind takes no typed output and no dataset_id;
-// each is refused naming the kind, nothing installed.
+// The markers kind takes no typed output and no dataset_id; each is refused naming the kind, nothing installed.
 TEST(MarkersRuntimeHostTest, CreateV2WithATypedOutputOrDatasetIdIsRejectedNamingTheKind) {
   PJ::ObjectStore store;
   BatchEngine service(store, rampResolver());

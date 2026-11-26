@@ -17,10 +17,6 @@
 namespace PJ {
 namespace {
 
-// ---------------------------------------------------------------------------
-// Helper: build and seal a test chunk with given time range
-// ---------------------------------------------------------------------------
-
 TopicChunk makeTestChunk(TopicId topic_id, Timestamp t_start, Timestamp t_end, uint32_t num_rows) {
   std::vector<ColumnDescriptor> cols = {{0, PrimitiveType::kFloat32, "value"}};
   TopicChunkBuilder builder(topic_id, /*schema_id=*/1, cols, num_rows);
@@ -32,10 +28,6 @@ TopicChunk makeTestChunk(TopicId topic_id, Timestamp t_start, Timestamp t_end, u
   }
   return builder.seal();
 }
-
-// ===========================================================================
-// Test 1: Append chunks
-// ===========================================================================
 
 TEST(TopicStorageTest, AppendChunks) {
   TopicDescriptor desc;
@@ -52,9 +44,18 @@ TEST(TopicStorageTest, AppendChunks) {
   EXPECT_EQ(storage.sealedChunks().size(), 3U);
 }
 
-// ===========================================================================
-// Test 2: time_min / time_max
-// ===========================================================================
+// A chunk sealed before the newest one but committed after it reads as newer.
+TEST(TopicStorageTest, ChunkIdsAscendInAppendOrder) {
+  TopicStorage storage(/*topic_id=*/1, TopicDescriptor{.name = "ids"});
+  TopicChunk older = makeTestChunk(1, 3000, 3900, 10);
+  TopicChunk newer = makeTestChunk(1, 1000, 1900, 10);
+  ASSERT_LT(older.id, newer.id);
+
+  ASSERT_TRUE(storage.appendSealedChunk(std::move(newer)).has_value());
+  ASSERT_TRUE(storage.appendSealedChunk(std::move(older)).has_value());
+
+  EXPECT_GT(storage.sealedChunks()[1].id, storage.sealedChunks()[0].id);
+}
 
 TEST(TopicStorageTest, TimeMinMax) {
   TopicDescriptor desc;
@@ -74,10 +75,6 @@ TEST(TopicStorageTest, TimeMinMax) {
   EXPECT_EQ(storage.timeMin(), 1000);
   EXPECT_EQ(storage.timeMax(), 3900);
 }
-
-// ===========================================================================
-// Test 3: Evict none
-// ===========================================================================
 
 TEST(TopicStorageTest, EvictNone) {
   TopicDescriptor desc;
@@ -99,10 +96,6 @@ TEST(TopicStorageTest, EvictNone) {
   storage.evictBefore(1000);
   EXPECT_EQ(storage.sealedChunks().size(), 3U);
 }
-
-// ===========================================================================
-// Test 4: Evict some
-// ===========================================================================
 
 TEST(TopicStorageTest, EvictSome) {
   TopicDescriptor desc;
@@ -129,10 +122,6 @@ TEST(TopicStorageTest, EvictSome) {
   EXPECT_EQ(storage.timeMax(), 3900);
 }
 
-// ===========================================================================
-// Test 5: Evict all
-// ===========================================================================
-
 TEST(TopicStorageTest, EvictAll) {
   TopicDescriptor desc;
   desc.name = "evict_all_topic";
@@ -151,10 +140,6 @@ TEST(TopicStorageTest, EvictAll) {
   EXPECT_EQ(storage.timeMin(), 0);
   EXPECT_EQ(storage.timeMax(), 0);
 }
-
-// ===========================================================================
-// Evicted-through chunk id: dropped chunks and the one the floor cuts into
-// ===========================================================================
 
 TEST(TopicStorageTest, EvictedThroughChunkIdCoversDroppedAndStraddlingChunks) {
   TopicDescriptor desc;
@@ -185,10 +170,6 @@ TEST(TopicStorageTest, EvictedThroughChunkIdCoversDroppedAndStraddlingChunks) {
   EXPECT_EQ(storage.evictedThroughChunkId(), 0U);
 }
 
-// ===========================================================================
-// Test 6: Metadata
-// ===========================================================================
-
 TEST(TopicStorageTest, Metadata) {
   TopicDescriptor desc;
   desc.name = "metadata_topic";
@@ -213,10 +194,6 @@ TEST(TopicStorageTest, Metadata) {
   EXPECT_GT(meta.total_byte_size, 0U);
 }
 
-// ===========================================================================
-// Test 7: Empty
-// ===========================================================================
-
 TEST(TopicStorageTest, Empty) {
   TopicDescriptor desc;
   desc.name = "empty_topic";
@@ -224,21 +201,14 @@ TEST(TopicStorageTest, Empty) {
 
   TopicStorage storage(/*topic_id=*/7, std::move(desc));
 
-  // Initially empty
   EXPECT_TRUE(storage.empty());
 
-  // After appending, not empty
   ASSERT_TRUE(storage.appendSealedChunk(makeTestChunk(7, 1000, 1900, 10)).has_value());
   EXPECT_FALSE(storage.empty());
 
-  // After evicting all, empty again
   storage.evictBefore(5000);
   EXPECT_TRUE(storage.empty());
 }
-
-// ===========================================================================
-// Test 8: Update schema
-// ===========================================================================
 
 TEST(TopicStorageTest, UpdateSchema) {
   TopicDescriptor desc;
@@ -252,14 +222,9 @@ TEST(TopicStorageTest, UpdateSchema) {
   storage.updateSchema(42);
   EXPECT_EQ(storage.descriptor().schema_id, 42U);
 
-  // Metadata should reflect the updated schema
   TopicMetadata meta = storage.metadata();
   EXPECT_EQ(meta.current_schema, 42U);
 }
-
-// ===========================================================================
-// Test 9: Accept out-of-order chunk (lossless out-of-order ingest)
-// ===========================================================================
 
 TEST(TopicStorageTest, AcceptsOutOfOrderChunk) {
   TopicDescriptor desc;
@@ -270,8 +235,8 @@ TEST(TopicStorageTest, AcceptsOutOfOrderChunk) {
 
   ASSERT_TRUE(storage.appendSealedChunk(makeTestChunk(9, 2000, 2900, 10)).has_value());
 
-  // A chunk entirely before the previous one is retained — rejecting it
-  // silently lost late-committed data (multi-publisher recordings).
+  // A chunk entirely before the previous one is retained: rejecting it would silently lose late-committed data
+  // (multi-publisher recordings).
   ASSERT_TRUE(storage.appendSealedChunk(makeTestChunk(9, 1000, 1900, 10)).has_value());
 
   EXPECT_EQ(storage.sealedChunks().size(), 2U);
@@ -279,10 +244,6 @@ TEST(TopicStorageTest, AcceptsOutOfOrderChunk) {
   EXPECT_EQ(storage.timeMin(), 1000);
   EXPECT_EQ(storage.timeMax(), 2900);
 }
-
-// ===========================================================================
-// Test 10: Accept overlapping chunk, including equal t_min
-// ===========================================================================
 
 TEST(TopicStorageTest, AcceptsOverlappingChunk_SameTMin) {
   // A chunk whose t_min falls inside the previous chunk's [t_min, t_max] is
@@ -299,10 +260,6 @@ TEST(TopicStorageTest, AcceptsOverlappingChunk_SameTMin) {
   EXPECT_EQ(storage.sealedChunks().size(), 2U);
   EXPECT_EQ(storage.metadata().total_row_count, 15U);
 }
-
-// ===========================================================================
-// Test 11: Retention floor raised by a straddling eviction
-// ===========================================================================
 
 TEST(TopicStorageTest, RetentionFloorRaisedByStraddlingEvict) {
   TopicDescriptor desc;
@@ -329,10 +286,6 @@ TEST(TopicStorageTest, RetentionFloorRaisedByStraddlingEvict) {
   EXPECT_EQ(storage.metadata().time_range_max, 5000);
 }
 
-// ===========================================================================
-// Test 12: Retention floor is monotonic
-// ===========================================================================
-
 TEST(TopicStorageTest, RetentionFloorIsMonotonic) {
   TopicDescriptor desc;
   desc.name = "floor_mono_topic";
@@ -350,10 +303,6 @@ TEST(TopicStorageTest, RetentionFloorIsMonotonic) {
   EXPECT_EQ(storage.timeMin(), 3000);
 }
 
-// ===========================================================================
-// Test 13: clearChunks() resets the retention floor
-// ===========================================================================
-
 TEST(TopicStorageTest, ClearChunksResetsRetentionFloor) {
   TopicDescriptor desc;
   desc.name = "floor_clear_topic";
@@ -370,10 +319,6 @@ TEST(TopicStorageTest, ClearChunksResetsRetentionFloor) {
   EXPECT_EQ(storage.retentionFloor(), kNoRetentionFloor);
 }
 
-// ===========================================================================
-// Test: a default (un-evicted) topic must not clamp negative timestamps
-// ===========================================================================
-
 TEST(TopicStorageTest, NoFloorDoesNotClampNegativeTimestamps) {
   // Timestamp is signed: a topic with negative timestamps and NO eviction must
   // report its true (negative) minimum. The "no floor" sentinel is
@@ -389,10 +334,6 @@ TEST(TopicStorageTest, NoFloorDoesNotClampNegativeTimestamps) {
   EXPECT_EQ(storage.timeMin(), -1000);
   EXPECT_EQ(storage.metadata().time_range_min, -1000);
 }
-
-// ===========================================================================
-// Test 14: Two straddling chunks under out-of-order ingest
-// ===========================================================================
 
 TEST(TopicStorageTest, RetentionFloorTwoStraddlingChunksOutOfOrder) {
   // Out-of-order ingest can leave more than one chunk straddling the cutoff.
@@ -414,10 +355,6 @@ TEST(TopicStorageTest, RetentionFloorTwoStraddlingChunksOutOfOrder) {
   EXPECT_EQ(storage.timeMin(), 3000);
   EXPECT_EQ(storage.metadata().time_range_min, 3000);
 }
-
-// ===========================================================================
-// Test 15: detachChunks() empties the storage exactly like clearChunks()
-// ===========================================================================
 
 TEST(TopicStorageTest, DetachChunksLeavesStorageEmptyLikeClear) {
   TopicDescriptor desc;
@@ -441,10 +378,6 @@ TEST(TopicStorageTest, DetachChunksLeavesStorageEmptyLikeClear) {
   // The rows moved OUT, they were not dropped.
   EXPECT_EQ(detached.chunks.size(), 1U);
 }
-
-// ===========================================================================
-// Test 16: restoreChunks() puts back every field detachChunks() captured
-// ===========================================================================
 
 TEST(TopicStorageTest, DetachRestoreRoundTripsChunksAndMutableMetadata) {
   TopicDescriptor desc;
@@ -506,9 +439,7 @@ TEST(TopicStorageTest, DetachRestoreRoundTripsChunksAndMutableMetadata) {
   EXPECT_EQ(restored.readNumericAsDouble(0, 30), 30.0);
 }
 
-// ===========================================================================
 // wholeNumbersOnly(): per float field, AND of ColumnStats::all_integral
-// ===========================================================================
 
 TopicChunk makeFloatChunk(Timestamp t, std::vector<double> values) {
   std::vector<ColumnDescriptor> cols = {{7, PrimitiveType::kFloat64, "mode"}, {8, PrimitiveType::kInt64, "count"}};
@@ -620,6 +551,42 @@ TEST(TopicStorageTest, AllNullChunkDoesNotCountAsWholeNumbers) {
 
   storage.evictBefore(50);
   EXPECT_EQ(storage.wholeNumbersOnly(7), std::nullopt);
+}
+
+// A refill that no longer writes a column pads it with nulls; retiring it hides it from listings while its field id
+// (and so every other column's) stays.
+TEST(TopicStorageTest, RetireValuelessColumnsKeepsLayoutAndUnretiresOnValue) {
+  const std::vector<ColumnDescriptor> cols = {
+      {0, PrimitiveType::kFloat64, "time"}, {1, PrimitiveType::kFloat64, "a"}, {2, PrimitiveType::kFloat64, "b"}};
+  const auto chunk_with = [&cols](bool time_has_value) {
+    TopicChunkBuilder builder(/*topic_id=*/1, /*schema_id=*/0, cols, /*max_rows=*/1000);
+    builder.beginRow(100);
+    if (time_has_value) {
+      builder.set(0, 1.0);
+    }
+    builder.set(1, 2.0);
+    builder.finishRow();
+    return builder.seal();
+  };
+  TopicStorage storage(/*topic_id=*/1, TopicDescriptor{.name = "data"});
+  storage.setColumnDescriptors(cols);
+  ASSERT_TRUE(storage.appendSealedChunk(chunk_with(false)).has_value());
+
+  storage.retireValuelessColumns();
+  EXPECT_TRUE(storage.isColumnRetired(0));
+  EXPECT_FALSE(storage.isColumnRetired(1));
+  EXPECT_TRUE(storage.isColumnRetired(2)) << "a column null in every row holds no value";
+  EXPECT_EQ(storage.columnDescriptors().size(), 3U) << "field ids stay dense positions";
+
+  storage.clearChunks();
+  EXPECT_TRUE(storage.isColumnRetired(0)) << "emptying the topic for a refill keeps the column hidden";
+
+  TopicStorage::DetachedState detached = storage.detachChunks();
+  ASSERT_TRUE(storage.appendSealedChunk(chunk_with(true)).has_value());
+  EXPECT_FALSE(storage.isColumnRetired(0)) << "a value lands: the column is back";
+  EXPECT_TRUE(storage.isColumnRetired(2));
+  storage.restoreChunks(std::move(detached));
+  EXPECT_TRUE(storage.isColumnRetired(0)) << "a restore brings the prior retirement back";
 }
 
 }  // namespace

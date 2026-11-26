@@ -1,17 +1,16 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 //
-// The QRhi cube shaders share one source for how a solid LOOKS (key light, edge band,
-// point colour): pj_scene3D/widgets/shaders/cube/*.glslinc, which the shaders #include
-// directly (qsb honours GL_GOOGLE_include_directive). This test reads the shader sources
-// and packs as data and guards that arrangement from the ways it can quietly rot:
+// The QRhi cube shaders share one source for how a solid LOOKS (key light, edge band, point colour):
+// pj_scene3D/widgets/shaders/cube/*.glslinc, which the shaders #include directly (qsb honours
+// GL_GOOGLE_include_directive). This test reads the shader sources and packs as data and guards that arrangement from
+// the ways it can quietly rot:
 //
 //   1. a shader stops including the shared file,
 //   2. someone re-inlines a literal light or edge constant next to the include, or
 //   3. the shared GLSL and cube_mesh.h's C++ mirrors of its constants drift apart.
 //
-// It needs no GPU, so it runs on every desktop build (the WASM target never compiles
-// the test).
+// It needs no GPU, so it runs on every desktop build (the WASM target never compiles the test).
 
 #include <gtest/gtest.h>
 #include <rhi/qshader.h>
@@ -29,8 +28,6 @@
 
 namespace {
 
-// `name` is relative to rhi/shaders; the shared cube GLSL is reached the way the
-// shaders #include it.
 std::string readShader(std::string_view name) {
   const std::filesystem::path path = std::filesystem::path(PJ_SCENE3D_SHADER_DIR) / name;
   std::ifstream stream(path);
@@ -40,7 +37,6 @@ std::string readShader(std::string_view name) {
   return buffer.str();
 }
 
-// The literals that must exist in the shared source and NOWHERE else.
 constexpr std::string_view kKeyLightVector = "0.4, 0.5, 0.8";
 constexpr std::string_view kAmbient = "0.35";
 constexpr std::string_view kEdgeWidth = "0.06";
@@ -67,7 +63,7 @@ TEST(ShaderConstantsTest, SharedSourceDeclaresTheMirroredConstants) {
       << "cube_edge.glslinc no longer declares the width the C++ mirror assumes";
   EXPECT_NE(edge.find("kCubeEdgeDarken = 0.6"), std::string::npos)
       << "cube_edge.glslinc no longer declares the darkening the C++ mirror assumes";
-  EXPECT_NE(readCubeGlsl("cube_sprite.glslinc").find("kCubeEdgeMeanScale = 0.887"), std::string::npos)
+  EXPECT_NE(readCubeGlsl("cube_sprite.glslinc").find("kCubeEdgeMeanScale = 0.886"), std::string::npos)
       << "the sprite shader's kCubeEdgeMeanScale drifted from the C++ constant";
   EXPECT_NE(readCubeGlsl("cube_point_color.glslinc").find("kSphereDiscShading = 0.702"), std::string::npos)
       << "the shader's kSphereDiscShading drifted from the C++ constant";
@@ -94,13 +90,13 @@ TEST(ShaderConstantsTest, SolidsIncludeTheSharedEdgeBand) {
   }
 }
 
-// The QRhi point and grid-map shaders evaluate the colormap polynomials from a file copy of
+// The QRhi point, grid-map and mesh-map shaders evaluate the colormap polynomials from a file copy of
 // PJ::colormapGlsl() (qsb can only #include files); the two must stay identical.
 TEST(ShaderConstantsTest, ColormapCopyMatchesTheSharedPolynomials) {
   const std::string copy = readShader("colormap.glslinc");
   EXPECT_NE(copy.find(PJ::colormapGlsl()), std::string::npos)
       << "rhi/shaders/colormap.glslinc drifted from PJ::colormapGlsl(): paste the Colormap.cpp string again";
-  for (const std::string_view shader : {"point.vert", "cube.vert", "gridmap.frag"}) {
+  for (const std::string_view shader : {"point.vert", "cube.vert", "gridmap.frag", "meshmap.frag"}) {
     EXPECT_NE(readShader(shader).find("colormap.glslinc"), std::string::npos) << shader;
   }
 }

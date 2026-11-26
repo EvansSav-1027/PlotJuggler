@@ -26,12 +26,10 @@ namespace pj::scene3d {
 class SceneEntitiesLayer;
 struct MarkerGeometry;
 
-/// A typed array held in a QByteArray, so an upload shares its bytes (the
-/// batch takes a reference: no copy) and a rewrite on a later frame, once the
-/// batch has let go, reuses the same pages. Padded for upload
-/// (PJ::padForUpload()): the padded array still uploads as one shared piece,
-/// which the retention rule depends on. At namespace scope: nested in
-/// MarkerRhiPass, Clang emits none of its members (undefined references).
+/// A typed array held in a QByteArray, so an upload shares its bytes (the batch takes a reference: no copy) and a
+/// rewrite on a later frame, once the batch has let go, reuses the same pages. Padded for upload
+/// (PJ::padForUpload()): the padded array still uploads as one shared piece, which the retention rule depends on. At
+/// namespace scope: nested in MarkerRhiPass, Clang emits none of its members (undefined references).
 template <typename T>
 class MarkerUploadArray {
  public:
@@ -52,7 +50,6 @@ class MarkerUploadArray {
     count_ = count;
     PJ::padForUpload(bytes_, used);
   }
-  /// Shrinks to `count` elements, keeping the allocation.
   void truncate(std::size_t count) {
     count_ = count;
     PJ::padForUpload(bytes_, static_cast<qsizetype>(count * sizeof(T)));
@@ -74,24 +71,16 @@ class MarkerUploadArray {
   std::size_t count_ = 0;
 };
 
-/// The SceneEntities marker family of the QRhi view: instanced unit primitives
-/// (cube + its edge overlay, sphere, cylinder/cone, arrow/axes) and the
-/// expanded line/triangle stream batches. Each admitted layer owns Static
-/// instance and stream buffers (LayerGpu), rebuilt only when its LayerKey
-/// changes: geometry revision, style, the resolved placement of
-/// every frame it references (a TF-only move bumps no revision), and the render
-/// origin. Orbit, zoom and playback without new samples or TF motion reuse the
-/// buffers. Vertices stay camera-relative, subtracted in double, for pixel parity,
-/// so a pan or follow step (a change of the render origin alone) re-uploads: a layer
-/// re-uploaded within the last few frames keeps its CPU expansion and the
-/// world-space translation of every instance, and an origin-only change then
-/// rewrites the translations and re-places the stream vertices in the same buffer
-/// layout. A one-off rebuild drops the expansion right after its upload, a
-/// recurring one after a few frames without another, or a short idle spell
-/// without any frame (the view renders nothing while settled). The layer's model
-/// primitives belong to ModelRhiPass. Per frame the view calls admit() (once),
-/// prepare() (once), then submit() per ScenePass for each draw. Markers cast no
-/// shadows; the layer's model primitives do, through ModelRhiPass.
+/// The SceneEntities marker family of the QRhi view: instanced unit primitives (cube + its edge overlay, sphere,
+/// cylinder/cone, arrow/axes) and the expanded line/triangle stream batches. Each admitted layer owns Static instance
+/// and stream buffers (LayerGpu), rebuilt only when its LayerKey changes: geometry revision, style, the resolved
+/// placement of every frame it references (a TF-only move bumps no revision) and the render origin. Vertices stay
+/// camera-relative, subtracted in double, for pixel parity, so a pan or follow step (a render-origin change alone)
+/// re-uploads: a layer re-uploaded within the last few frames keeps its CPU expansion and each instance's world
+/// translation, and an origin-only change then rewrites the translations and re-places the stream vertices in the
+/// same buffer layout. A one-off rebuild drops the expansion right after its upload, a recurring one after a few
+/// frames without another or a short idle spell without any frame (the view renders nothing while settled). The
+/// layer's model primitives belong to ModelRhiPass, which casts their shadows; markers cast none.
 class MarkerRhiPass {
  public:
   /// kCubeEdges: the cube fill's instance range again, drawn as the twelve box
@@ -122,27 +111,22 @@ class MarkerRhiPass {
   /// stream batches). False leaves the pass unusable.
   [[nodiscard]] bool initialize(const RhiPassSetup& setup);
   [[nodiscard]] bool ready() const;
-  /// Adopts the view's marker layers; drops GPU state of layers that left or are hidden.
   void setLayers(const std::vector<SceneEntitiesLayer*>& layers);
-  /// A layer of this family is in the view: the view builds the family (initialize()) only then.
   [[nodiscard]] bool hasLayers() const {
     return !layers_.empty();
   }
 
-  /// Runs each visible layer's prepareForRender(), places its frames, applies
-  /// the per-layer and per-view instance/stream budgets (row warnings on
-  /// rejection) and records the family's fixed-frame bounds (lastBounds()).
+  /// Admits visible layers: places their frames, applies the per-layer and per-view instance/stream budgets (row
+  /// warnings on rejection) and records the family's fixed-frame bounds (lastBounds()).
   void admit(const PlaceFn& place);
-  /// Rebuilds and uploads the admitted layers whose LayerKey changed (and the
-  /// unit meshes once) and releases the GPU state of layers not admitted this
-  /// frame. A layer whose buffers cannot be allocated has
-  /// no draws this frame and retries the next.
+  /// Rebuilds and uploads the admitted layers whose LayerKey changed (and the unit meshes once) and releases the GPU
+  /// state of layers not admitted this frame. A layer whose buffers cannot be allocated has no draws this frame and
+  /// retries the next.
   void prepare(const RhiFrameContext& frame);
   /// The prepared ranges of `layer`, in submission order.
   [[nodiscard]] std::span<const Draw> drawsFor(const SceneEntitiesLayer* layer) const {
     return findDraws(draws_, layer);
   }
-  /// Records one range; false when nothing could be recorded for `pass`.
   bool submit(
       QRhiCommandBuffer* command_buffer, const Draw& draw, ScenePass pass, const ScenePipelineRegistry& registry,
       const QRhiViewport& viewport) const;
@@ -208,16 +192,6 @@ class MarkerRhiPass {
     float unused0 = 0.0F;
     float unused1 = 0.0F;
   };
-  /// One stream vertex (scene.vert layout): camera-relative position + colour.
-  struct StreamVertex {
-    float x = 0.0F;
-    float y = 0.0F;
-    float z = 0.0F;
-    float r = 0.0F;
-    float g = 0.0F;
-    float b = 0.0F;
-    float a = 1.0F;
-  };
 
  private:
   /// Everything a layer's expansion depends on but the render origin. The
@@ -242,7 +216,6 @@ class MarkerRhiPass {
   };
   template <typename T>
   using UploadArray = MarkerUploadArray<T>;
-  /// One layer's CPU expansion, what its buffers hold.
   struct Expansion {
     std::vector<std::optional<glm::dmat4>> fixed_from_frame;  ///< the key's placements as matrices
     UploadArray<Instance> instances;
@@ -250,8 +223,11 @@ class MarkerRhiPass {
     /// subtracted and the result narrowed to float; parallel to `instances` in
     /// an expansion kept for origin-only updates, else empty.
     std::vector<glm::dvec3> instance_world;
-    UploadArray<StreamVertex> lines;
-    UploadArray<StreamVertex> triangles;
+    /// Camera-relative stream vertices. `lines` holds whole segments, two consecutive vertices each: the segment
+    /// pipeline (RhiPassSetup::line_segments) reads every pair as one LineSegment instance, so an odd vertex would
+    /// shift every later segment.
+    UploadArray<ColorVertex> lines;
+    UploadArray<ColorVertex> triangles;
     std::vector<glm::vec3> placed_points;  ///< scratch: one stream batch's points, camera-relative
     std::vector<Draw> draws;               ///< buffer unset: offsets index the vectors above
   };
@@ -332,6 +308,7 @@ class MarkerRhiPass {
   /// [pipeline][depth_write]
   std::array<std::array<const ScenePipeline*, 2>, kPipelineCount> pipelines_{};
   std::array<MeshGpu, 5> meshes_{};
+  bool line_segments_ = false;  ///< RhiPassSetup::line_segments of initialize()
 
   std::vector<SceneEntitiesLayer*> layers_;
   std::unordered_map<SceneEntitiesLayer*, LayerGpu> layer_gpu_;

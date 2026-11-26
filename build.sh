@@ -18,7 +18,7 @@ usage() {
     "  --no-widget-demos    Skip the pj_widgets demo apps" \
     "  --no-marketplace-app Skip the standalone marketplace executable" \
     "  --target NAME        CMake target to build (default: all; pj_app = app + plugin checker)" \
-    "  --debug-info LEVEL   none|lines|full|split (Linux default: split, asan: lines)" \
+    "  --debug-info LEVEL   none|lines|full|split (Linux default: lines)" \
     "  --no-compress-debug  Keep DWARF uncompressed (default on Linux: zlib-compressed)" \
     "  --sanitize LANE      none|asan|tsan|msan (default: none; trees: build/, build/asan, build/tsan, build/msan)" \
     "  --tsan               Deprecated alias for --sanitize tsan: build and run concurrency tests" \
@@ -29,7 +29,7 @@ usage() {
     "  --help               Show this help message" \
     "" \
     "Examples:" \
-    "  ./build.sh                    full dev tree: tests + demos, split DWARF" \
+    "  ./build.sh                    full dev tree: tests + demos, line-table debug info" \
     "  ./build.sh --minimal          what the packaging build compiles, on the host" \
     "  ./build.sh --no-tests --debug-info full" \
     "" \
@@ -44,7 +44,7 @@ usage() {
 # ThreadSanitizer in a separate build/tsan tree.
 # It guards the datastore worker-thread race regressions; the Linux CI `tsan` job
 # runs the same target set. TSan is wired via -DPJ_ENABLE_TSAN=ON on a normal
-# RelWithDebInfo configure, so the Conan dependency closure is reused as-is (no
+# Release configure, so the Conan dependency closure is reused as-is (no
 # Debug rebuild), except for the SDK, which must be built from source as well.
 PJ_SANITIZE="${PJ_SANITIZE-none}"
 TSAN=0
@@ -181,11 +181,10 @@ if [[ "$MSAN" == "1" ]]; then
   fi
   # A DEDICATED Conan cache, because the settings above do not isolate this lane.
   # The sanitizer flags travel in tools.build:*, which does NOT participate in
-  # package_id, and compiler.libcxx is dropped for C-only packages such as
-  # nanoarrow — so an ordinary Clang build and this instrumented one resolve to
-  # the SAME id. With a shared cache, --build=missing would reuse an
-  # uninstrumented nanoarrow here, and an instrumented one would contaminate
-  # later ordinary builds. Neither is detectable from the final executable: it
+  # package_id, and compiler.libcxx is dropped for C-only packages — so an
+  # ordinary Clang build and this instrumented one resolve to the SAME id. With a
+  # shared cache, --build=missing would reuse an uninstrumented package here, and
+  # an instrumented one would contaminate later ordinary builds. Neither is detectable from the final executable: it
   # still carries __msan_ symbols from our own code, so the lane would report a
   # confident, meaningless clean run.
   #
@@ -204,7 +203,7 @@ if [[ "$MSAN" == "1" ]]; then
   # And build the closure from source regardless of what that cache holds: a
   # cache is only trustworthy if nothing ever wrote an uninstrumented package
   # into it, which is an invariant no build can verify after the fact.
-  CONAN_LANE_ARGS+=(--build="nanoarrow/*" --build="gtest/*")
+  CONAN_LANE_ARGS+=(--build="gtest/*")
   CONAN_LANE_ARGS+=(
     -s compiler=clang
     -s "compiler.version=${PJ_SANITIZER_CLANG_VERSION:-22}"
@@ -270,7 +269,8 @@ PJ_FLAG_ARGS+=(
 # dependency binaries link unchanged. See docs/SANITIZERS.md.
 SANITIZER_COMPILER_ARGS=(-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++)
 case "${PJ_SANITIZE}" in
-  none) PJ_FLAG_ARGS+=(-DPJ_ENABLE_SANITIZERS=OFF -DPJ_ENABLE_TSAN=OFF -DPJ_SDK_FORCE_SOURCE=OFF) ;;
+  # PJ_WARNINGS_AS_ERRORS explicitly: the sanitizer lanes force it OFF in the cache.
+  none) PJ_FLAG_ARGS+=(-DPJ_ENABLE_SANITIZERS=OFF -DPJ_ENABLE_TSAN=OFF -DPJ_SDK_FORCE_SOURCE=OFF -DPJ_WARNINGS_AS_ERRORS=ON) ;;
   asan) PJ_FLAG_ARGS+=(-DPJ_ENABLE_SANITIZERS=ON -DPJ_ENABLE_TSAN=OFF -DPJ_SDK_FORCE_SOURCE=ON "${SANITIZER_COMPILER_ARGS[@]}") ;;
   tsan) PJ_FLAG_ARGS+=(-DPJ_ENABLE_SANITIZERS=OFF -DPJ_ENABLE_TSAN=ON -DPJ_SDK_FORCE_SOURCE=ON "${SANITIZER_COMPILER_ARGS[@]}") ;;
   msan)
@@ -292,12 +292,10 @@ PJ_FLAG_ARGS+=("-DPJ_SANITIZE_CONTAINERS=${PJ_SANITIZE_CONTAINERS:-OFF}")
 
 # PJ_DEBUG_INFO/PJ_COMPRESS_DEBUG keep Linux dev trees debuggable without
 # duplicating DWARF; see cmake/PjDebugInfo.cmake for the policy.
+# Line tables (-g1) carry what profiling and backtraces need (function names,
+# file:line, inlined frames); gdb needs --debug-info split|full to show variables.
 if [[ "$(uname -s)" == Linux ]]; then
-  if [[ "${PJ_SANITIZE}" == asan ]]; then
-    : "${PJ_DEBUG_INFO:=lines}"
-  else
-    : "${PJ_DEBUG_INFO:=split}"
-  fi
+  : "${PJ_DEBUG_INFO:=lines}"
   : "${PJ_COMPRESS_DEBUG:=ON}"
 fi
 [[ -n "${PJ_DEBUG_INFO:-}" ]] && PJ_FLAG_ARGS+=("-DPJ_DEBUG_INFO=${PJ_DEBUG_INFO}")
@@ -306,7 +304,7 @@ fi
 CMAKE_ARGS=(
   -S "$SCRIPT_DIR" -B "$BUILD_DIR"
   "-DCMAKE_TOOLCHAIN_FILE=$BUILD_DIR/conan_toolchain.cmake"
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo
+  -DCMAKE_BUILD_TYPE=Release
   "-DCMAKE_PREFIX_PATH=${QT_DIR}"
   "-DPJ_SDK_LOCAL_DIR=${SDK_LOCAL_DIR}"
   "${CMAKE_CCACHE_ARGS[@]+"${CMAKE_CCACHE_ARGS[@]}"}" "${PJ_FLAG_ARGS[@]}"
@@ -398,15 +396,21 @@ fi
 # may have unrelated private remotes that host forked recipes under a user
 # channel; those must never shadow PJ4's intended dependency graph.
 if [[ "$SKIP_CONAN_INSTALL" == "0" ]]; then
-  # Dependencies stay RelWithDebInfo because Release luau built from source is
-  # not PIC and fails to link into PIE executables. Revisit when the Conan
-  # remote ships Release binaries.
   # The MSan lane resolves its OWN minimal requirement list. The app's conanfile
   # would drag FFmpeg, CPython and the rest into a from-source rebuild under
   # Clang + instrumented libc++, to instrument code its four Qt-free targets
   # never load. The lockfile is skipped with it: it pins the app graph, not this
   # one.
   conan_recipe="$SCRIPT_DIR"
+  # Linux: ConanCenter's luau recipe has no fPIC option and its prebuilt Release
+  # binary is not PIC, so it cannot link into PIE executables. -fPIC in luau's
+  # package_id makes Conan build it here (once, then cached) instead. Keep in sync
+  # with linux-ci.yml, linux-appimage-release.yml and Dockerfile.build.
+  CONAN_LUAU_PIC_ARGS=()
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    CONAN_LUAU_PIC_ARGS=(-c "luau/*:tools.build:cxxflags=['-fPIC']"
+      -c "luau/*:tools.info.package_id:confs=['tools.build:cxxflags']")
+  fi
   conan_lock_args=(${CONAN_LOCKFILE_ARGS[@]+"${CONAN_LOCKFILE_ARGS[@]}"})
   if [[ "$MSAN" == "1" ]]; then
     conan_recipe="$SCRIPT_DIR/cmake/msan"
@@ -414,7 +418,8 @@ if [[ "$SKIP_CONAN_INSTALL" == "0" ]]; then
   fi
   conan install "$conan_recipe" --output-folder="$BUILD_DIR" --build=missing \
     ${conan_lock_args[@]+"${conan_lock_args[@]}"} \
-    -s build_type=RelWithDebInfo -s compiler.cppstd=20 \
+    -s build_type=Release -s compiler.cppstd=20 \
+    ${CONAN_LUAU_PIC_ARGS[@]+"${CONAN_LUAU_PIC_ARGS[@]}"} \
     ${CONAN_LANE_ARGS[@]+"${CONAN_LANE_ARGS[@]}"} "${CONAN_REMOTE_ARGS[@]}"
 elif [[ ! -f "$BUILD_DIR/conan_toolchain.cmake" ]]; then
   echo "Missing $BUILD_DIR/conan_toolchain.cmake; run Conan install first." >&2

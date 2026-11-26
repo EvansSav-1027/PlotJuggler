@@ -7,6 +7,7 @@ pj_add_test_runner(pj_widgets_tests
     SOURCES
         curve_tree_view_test.cpp
         svg_button_test.cpp
+        dialog_theme_test.cpp
         file_dialog_test.cpp
         credentials_editor_test.cpp
         raster_frame_test.cpp
@@ -19,10 +20,13 @@ pj_add_test_runner(pj_widgets_tests
         eliding_label_test.cpp
         toggle_switch_test.cpp
         color_picker_widget_test.cpp
+        style_focus_ring_test.cpp
         style_input_height_test.cpp
         marker_timeline_test.cpp
         progress_bar_test.cpp
         colormap_test.cpp
+        # Headless: contrast math over QColor.
+        color_contrast_test.cpp
         graphics_api_test.cpp
         messagebox_test.cpp
         ingest_progress_widget_test.cpp
@@ -33,6 +37,8 @@ pj_add_test_runner(pj_widgets_tests
         # Headless: TimelineScene is Qt-free math (no QApplication). Links pj_widgets
         # only for the Timeline.h include path / TimelineScene symbols.
         timeline_scene_test.cpp
+        # Headless: time-label formatting is pure math over QDateTime.
+        time_format_test.cpp
         # Widget test: needs QApplication (xvfb under CI).
         state_transitions_view_test.cpp
         # Widget test: needs QApplication (xvfb under CI).
@@ -42,14 +48,17 @@ pj_add_test_runner(pj_widgets_tests
         # the stylesheets are readable as `:/resources/...` at runtime.
         framework_tokens_test.cpp
         scrollbar_test.cpp
+        app_settings_test.cpp
         search_test.cpp
         section_header_band_test.cpp
         header_divider_highlight_test.cpp
         header_resize_policy_test.cpp
         visualization_placeholder_test.cpp
-    # The layout margins/spacing + button wrap budget now resolve from the framework
-    # palette (pj_widgets FrameworkTokens), so the stylesheet resource must be linked.
-    LIBS pj_widgets pj_resources Qt6::Test Qt6::GuiPrivate
+        icon_ink_test.cpp
+    # Layout margins, spacing and the button wrap budget resolve from the framework palette (FrameworkTokens), so the
+    # stylesheet resource is linked. app_settings_test reaches the plugin settings service (pj_runtime QSettingsBackend):
+    # the library itself links no other PJ module.
+    LIBS pj_widgets pj_resources pj_runtime Qt6::Test Qt6::GuiPrivate
 )
 set_target_properties(pj_widgets_tests PROPERTIES AUTOMOC ON)
 

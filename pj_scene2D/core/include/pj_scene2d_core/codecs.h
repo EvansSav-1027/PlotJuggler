@@ -12,16 +12,10 @@
 
 namespace PJ {
 
-/// Upper bound on decoded image dimensions, enforced BEFORE allocating a pixel
-/// buffer from header-declared geometry. Decoders consume untrusted bytes (files,
-/// network); a crafted header can declare enormous dimensions that would drive a
-/// multi-gigabyte value-initialized allocation (or std::bad_alloc). 100 MP
-/// comfortably covers any real camera/video frame (8K is ~33 MP) while bounding
-/// the worst case.
+/// Checked BEFORE allocating from header-declared geometry: the bytes are untrusted, and a crafted header would
+/// otherwise drive a multi-gigabyte allocation. 8K is about 33 MP.
 inline constexpr int64_t kMaxImagePixels = 100'000'000;
 
-/// True when (width, height) is a positive image size whose pixel count is within
-/// kMaxImagePixels. Computed in 64-bit so the product cannot overflow.
 [[nodiscard]] inline bool imageDimensionsWithinLimit(int width, int height) noexcept {
   return width > 0 && height > 0 && static_cast<int64_t>(width) * static_cast<int64_t>(height) <= kMaxImagePixels;
 }
@@ -32,9 +26,7 @@ enum class ImageContainer : uint8_t {
   kPng,
 };
 
-/// Sniff the self-describing image container carried by a byte payload. PNG uses
-/// the full 8-byte signature, not only "\x89PNG": a shorter match can confuse
-/// raw/Bayer buffers with compressed containers and route them to the wrong path.
+/// PNG needs the full 8-byte signature: a shorter match can take a raw or Bayer buffer for a container.
 [[nodiscard]] inline ImageContainer sniffImageContainer(const uint8_t* data, size_t size) noexcept {
   if (data == nullptr) {
     return ImageContainer::kUnknown;
@@ -67,10 +59,14 @@ struct ImageHeader {
 /// pointers, row buffers, the library's state, and for a multi-scan JPEG the whole-image coefficient buffer.
 [[nodiscard]] size_t codecWorkspaceBound(const ImageHeader& header, ImageContainer container) noexcept;
 
-/// JPEG → RGB888 via turbojpeg.
+/// What a colour image without alpha decodes to: RGB888, or RGBA8888 with an opaque alpha. A frame the viewer uploads
+/// is decoded to RGBA: a 3-byte frame has no texture format and would be expanded on the GUI thread at every upload.
+enum class ColorOutput { kRgb, kRgba };
+
+/// JPEG via turbojpeg.
 class JpegCodec : public CodecStage {
  public:
-  JpegCodec();
+  explicit JpegCodec(ColorOutput output = ColorOutput::kRgb);
   ~JpegCodec() override;
   JpegCodec(const JpegCodec&) = delete;
   JpegCodec& operator=(const JpegCodec&) = delete;
@@ -81,24 +77,27 @@ class JpegCodec : public CodecStage {
 
  private:
   void* tj_ = nullptr;
+  ColorOutput output_;
 };
 
-/// PNG → RGB888 (8-bit) or RGBA8888 (with alpha) or Mono16 (16-bit grayscale).
+/// PNG → RGBA8888 (with alpha, or by ColorOutput::kRgba), RGB888 (8-bit without alpha) or Mono16 (16-bit grayscale).
 /// Preserves Mono16 for downstream stages (e.g. Mono16ToGrayscale).
 class PngCodec : public CodecStage {
  public:
+  explicit PngCodec(ColorOutput output = ColorOutput::kRgb) : output_(output) {}
   Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
+
+ private:
+  ColorOutput output_;
 };
 
-/// Mono16 → RGB888 grayscale. Normalizes non-zero samples to [min, max].
-/// Zero samples are treated as invalid and remain black for all mono16 images.
-/// Input must be kMono16 with pixels->size() >= width*height*2.
+/// Mono16 → RGB888 grayscale, stretching the non-zero samples' [min, max]; zero is invalid and stays black.
 class Mono16ToGrayscale : public CodecStage {
  public:
   Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
 };
 
-/// Pass-through for display-ready frames, Mono16 → RGB888 grayscale when needed.
+/// Passes display-ready frames through; Mono16 becomes grayscale.
 class NormalizeMono16 : public CodecStage {
  public:
   Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
@@ -110,6 +109,7 @@ class NormalizeMono16 : public CodecStage {
 /// JPEG/PNG byte decoder cascade. The output may still be Mono16.
 class ImageDecodeCascade : public CodecStage {
  public:
+  explicit ImageDecodeCascade(ColorOutput output = ColorOutput::kRgb) : jpeg_(output), png_(output) {}
   Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
 
  private:
@@ -120,6 +120,7 @@ class ImageDecodeCascade : public CodecStage {
 /// JPEG/PNG auto-dispatch followed by Mono16 normalization when needed.
 class AutoImageCodec : public CodecStage {
  public:
+  explicit AutoImageCodec(ColorOutput output = ColorOutput::kRgb) : decode_(output) {}
   Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
 
  private:
@@ -135,10 +136,7 @@ enum class BayerPattern : uint8_t {
   kBGGR,
 };
 
-/// Bayer mosaic → RGB888 demosaic. Input must be a kMono8 frame whose pixels
-/// hold the raw CFA mosaic (one sample per pixel). The constructor selects the
-/// CFA pattern. Missing channels are filled by averaging the same-channel
-/// samples in the 3x3 neighbourhood (clamped at edges).
+/// kMono8 CFA mosaic → RGB888: each missing channel averages its samples in the 3x3 neighbourhood (edges clamped).
 class BayerDecode : public CodecStage {
  public:
   explicit BayerDecode(BayerPattern pattern) : pattern_(pattern) {}
@@ -149,31 +147,19 @@ class BayerDecode : public CodecStage {
   BayerPattern pattern_;
 };
 
-/// Mono8 class IDs → RGB888 false-color. Each class ID (0-255) maps to
-/// a distinct hue. Input must be kMono8 with pixels->size() >= width*height.
-/// Designed for the planned segmentation layer; not yet wired into any pipeline
-/// (no production constructor call).
+/// Mono8 class IDs → RGB888, a distinct hue per ID. No production pipeline uses it.
 class SegmentationPalette : public CodecStage {
  public:
   Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
 };
 
-// --- Pipeline builders ---
+std::unique_ptr<CodecPipeline> makeJpegPipeline();
 
-std::unique_ptr<CodecPipeline> makeJpegPipeline();  ///< JpegCodec only (raw JPEG input)
-
-/// Decode a PNG/JPEG-wrapped raw frame back to its flat sample bytes — the inverse
-/// of a transport that losslessly wraps a raw buffer in an image container (e.g.
-/// Mosaico's `serialization_format=image` wraps a 16UC1 depth frame as an 8-bit
-/// grayscale PNG of width=stride). Returns the decoded samples as ONE byte per
-/// sample (gray-expanded RGB is collapsed back to its luma byte; Mono16 keeps its
-/// two bytes per sample), so reinterpreting the result at the frame's logical
-/// encoding/geometry recovers the original buffer. Returns nullopt when `data` is
-/// not a decodable PNG/JPEG container — callers then treat the bytes as already
-/// raw. Use this before reading a raw-encoded image's bytes as raw, so a
-/// container-wrapped raw frame isn't mis-read as raw (the depth all-black bug).
-/// NOTE: pj_scene3D's DepthCloudLayer::toDepthView has a twin of this (QImage-based,
-/// since pj_scene3D cannot depend on pj_scene2d_core); keep the two in sync.
+/// Unwraps a raw buffer a transport wrapped losslessly in a PNG/JPEG (e.g. Mosaico's `serialization_format=image`
+/// stores a 16UC1 depth frame as an 8-bit grayscale PNG of width = stride): one byte per sample (gray RGB collapses
+/// to its luma; Mono16 keeps two), so reading it at the image's encoding and geometry gives the original buffer.
+/// nullopt when `data` is not a decodable container: the bytes are raw already. pj_scene3D's
+/// DepthCloudLayer::toDepthView has a QImage-based twin (pj_scene3D cannot depend on this module); keep them in sync.
 [[nodiscard]] std::optional<std::shared_ptr<std::vector<uint8_t>>> recoverContainerRawSamples(
     const uint8_t* data, size_t size);
 

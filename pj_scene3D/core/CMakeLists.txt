@@ -1,21 +1,19 @@
-# ---------------------------------------------------------------------------
-# pj_scene3d_core - geometry/scene core, no Qt or GL dependency. TF types
-# (Transform/TransformBuffer) come from the pj_tf leaf.
-# ---------------------------------------------------------------------------
+# pj_scene3d_core: geometry/scene core, no Qt or GL dependency. TF types (Transform/TransformBuffer) come from the
+# pj_tf leaf.
 
 find_package(glm REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
 if(EMSCRIPTEN)
-  # Expose only the backend-neutral slice used by the product QRhi view and its
-  # layers. Compressed canonical clouds add only the existing transcoder when
-  # their explicit browser dependency option is enabled. The native branch
-  # below is unchanged.
+  # Browser build: only the backend-neutral slice the QRhi view and its layers use. Compressed canonical clouds add
+  # the transcoder only when the explicit browser dependency option is enabled.
   set(_pj_scene3d_core_sources
     src/camera/camera.cpp
     src/camera/camera_math.cpp
     src/depth_backproject.cpp
     src/grid_map_view.cpp
+    src/mesh_map_reconstructor.cpp
+    src/mesh_map_view.cpp
     src/occupancy_grid_reconstructor.cpp
     src/pointcloud_convert.cpp
     src/poses_in_frame_render.cpp
@@ -56,7 +54,13 @@ endif()
 # an implementation detail of pj_scene3d_core, mirroring how pj_scene2d_core links
 # libjpeg-turbo / libpng PRIVATE for image decode.
 find_package(draco REQUIRED)
-find_package(cloudini REQUIRED)
+# Conan's cloudini package provides cloudini::cloudini; cloudini's upstream CMake
+# package (conda-forge's) is cloudini_lib with cloudini::cloudini_lib.
+find_package(cloudini CONFIG QUIET)
+if(NOT TARGET cloudini::cloudini)
+  find_package(cloudini_lib CONFIG REQUIRED)
+  add_library(cloudini::cloudini ALIAS cloudini::cloudini_lib)
+endif()
 
 add_library(pj_scene3d_core STATIC
   src/camera/camera.cpp
@@ -74,6 +78,8 @@ add_library(pj_scene3d_core STATIC
   src/trail_sampling.cpp
   src/version.cpp
   src/grid_map_view.cpp
+  src/mesh_map_reconstructor.cpp
+  src/mesh_map_view.cpp
   src/voxel_grid_view.cpp
   src/voxel_grid_value.cpp
 )
@@ -114,6 +120,8 @@ if(PJ_BUILD_TESTS)
     ../tests/object_placement_test.cpp
     ../tests/robot_model_bridges_test.cpp
     ../tests/grid_map_view_test.cpp
+    ../tests/mesh_map_reconstructor_test.cpp
+    ../tests/mesh_map_view_test.cpp
     ../tests/voxel_grid_view_test.cpp
     ../tests/voxel_grid_value_test.cpp
     ../tests/voxel_grid_budget_test.cpp
@@ -127,8 +135,7 @@ if(PJ_BUILD_TESTS)
     LIBS pj_scene3d_core draco::draco cloudini::cloudini glm::glm
   )
 
-  # Reproducibility helper for the checked browser MCAP. EXCLUDE_FROM_ALL keeps
-  # the native application and ordinary test build unchanged; W19a invokes this
+  # Reproducibility helper for the checked browser MCAP: EXCLUDE_FROM_ALL keeps it out of the ordinary build; run the
   # target explicitly before the Python ROS2 CDR/MCAP packager.
   add_executable(wasm_compressed_pointcloud_payload_generator EXCLUDE_FROM_ALL
     ../../tests/wasm/fixtures/generate_compressed_pointcloud_payloads.cpp)

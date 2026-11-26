@@ -30,6 +30,18 @@ against the index URL:
               "layout": "waveforms/layout.pj4.xml", "thumbnail": "waveforms/thumbnail.png"}]}
 ```
 
+Either may also be an absolute `https://` URL on a host that sends CORS headers,
+and then the tree needs no folder for that preset. The repository's samples work
+this way: `resources/wasm-presets/` holds only `index.json` and its README, and
+each sample's layout and thumbnail sit on the asset host beside its recording.
+`app.plotjuggler.io` does not package that index but serves an uploaded copy, so
+listing a sample there needs no deploy
+([`packaging/web/README.md`](../packaging/web/README.md#sample-index)).
+
+An entry with `"listed": false` gets no card in the presets dialog but still
+opens from its `?preset=<id>` link: a sample a web page links to without growing
+the dialog. A build that predates the key ignores it and lists the entry.
+
 The layout is what **File → Save Layout with sources** writes
 (`<root binding="source">`), with each data file beneath the layout's folder:
 
@@ -42,10 +54,15 @@ The layout is what **File → Save Layout with sources** writes
   pinned recording is also kept by each visitor's browser, so a revisit loads
   it without the network (`docs/WASM_DEPLOYMENT.md`); an unpinned one downloads
   on every visit.
+- `<sideFile filename="…" content_sha256="…">` — a file the source's plugin read
+  besides its data (a dictionary picked in its dialog), written by a browser
+  save ([`WASM_DEPLOYMENT.md`](./WASM_DEPLOYMENT.md#browser-local-state)). A preset
+  downloads it from beside its data file (`filename` is relative to the data
+  file's URL) and checks its fingerprint like a data file's.
 - `<plugin ID="…" manifest_id="…" filepath_mode="source">` — every replay rewrites
   the plugin configuration's `filepath` to the file it loads (here, the downloaded
-  file), so the same layout also opens on the desktop next to its data. The marker
-  itself exists for older 4.x builds, which rewrite only when it is present.
+  file), so the same layout also opens on the desktop next to its data. Earlier
+  4.x releases rewrite only when the marker is present.
 - A robot whose URDF arrives on a topic resolves `package://` meshes through
   `<robot_model package_url_roots='{"pkg":"rel/dir/"}'>`, relative to the
   layout, or an absolute `https://` root on an asset host. Keep each package's
@@ -77,7 +94,11 @@ serving meshes, needs CORS (`Access-Control-Allow-Origin`) on every file (see
 3. Add a thumbnail: a small PNG (the dialog shows 192x108; the samples use
    384x216, a few tens of KB), ideally a render of the loaded preset.
 4. Add the entry to `index.json`, package (below) and open it through the
-   reference server.
+   reference server. A sample of this repository goes to the asset host instead
+   of the tree: upload its layout and thumbnail under new names (a `v1/` file
+   never changes), point the entry at their URLs and list them in
+   `tests/wasm/fixtures/hosted_assets.json`. `app.plotjuggler.io` shows it once the
+   index is uploaded ([`packaging/web/README.md`](../packaging/web/README.md#sample-index)).
 
 Every path segment must match `[A-Za-z0-9_-][A-Za-z0-9._-]*`, and every file
 must have a deployable type (extension in any case): `.xml`, `.json`, `.csv`,
@@ -174,13 +195,15 @@ forwards `/bridge` on its own HTTPS origin, so `{"url":"${deployment.ws_origin}/
 works on every robot.
 
 In the browser build, **File → Save Layout with sources** writes one record per
-running stream (the desktop save writes none), with the template it started
+running stream, with the template it started
 from (an interactively started stream gets the configuration its dialog
 produced, under the id `stream`), its Source Timeline offset and slot, and
 `pj-stream://<id>` on everything drawn from it. The plain
 **Save Layout**, browser storage and undo/redo never contain stream records, and
-undo/redo never starts a stream. On the desktop, only a layout opened by URL
-starts its streams; a layout file opened from disk warns and ignores them.
+undo/redo never starts a stream. The desktop writes the same records when
+**Save Layout** keeps "Bind to this data source" checked, and starts them when it
+opens the file: see `pj_app/docs/ARCHITECTURE.md` "Streaming sources in a layout
+file".
 
 ## Packaging
 
@@ -209,9 +232,10 @@ The packager refuses, before writing anything:
 - an **unusable `index.json`** — missing, malformed, without a `presets` array,
   with an entry the browser rejects (which empties the whole welcome list: an
   entry that is not an object, a missing, empty or repeated `id`, no `layout`, or
-  an `id`/`title`/`description`/`layout`/`thumbnail` that is not a string), or
+  an `id`/`title`/`description`/`layout`/`thumbnail` that is not a string, or a
+  `listed` that is not a boolean), or
   naming a relative `layout`/`thumbnail` the tree does not deploy (absolute
-  http(s) references pass: they live elsewhere);
+  http(s) references pass: they live elsewhere; an empty thumbnail is none);
 - **symbolic links** — they can point outside the tree, to a relative `..` or
   an absolute target, so they are refused rather than followed;
 - **names outside the segment rule** — dotfiles and dot folders (`.git`,
@@ -227,14 +251,13 @@ declares, so a preset needs no server change.
 ## Testing
 
 `tests/wasm/package_wasm.test.mjs` covers the tree declaration, the refusals and
-determinism (`npm --prefix tests/wasm run test:package`). The production
-deployment contract checks every deployed preset file's bytes, MIME and cache
-policy and that the production build fetches `presets/index.json` at boot
-(`test:deployment` on a package built with `--presets`).
+determinism (`npm --prefix tests/wasm run test:package`, which also runs the
+tests of `packaging/web`). What the deployment contract checks of a package's
+presets is in [`WASM_DEPLOYMENT.md`](./WASM_DEPLOYMENT.md#local-serving-and-release-verification).
 
 The acceptance specs boot a package without presets, so no welcome dialog sits
 over their window. The sample cases in `tests/wasm/presets.spec.js` serve a
-second acceptance package that carries the samples, `build-wasm-probe/deploy-presets`
+second acceptance package that carries the samples' index, `build-wasm-probe/deploy-presets`
 (override with `PJ_WASM_PRESETS_PACKAGE_DIR`):
 
 ```bash
@@ -255,17 +278,25 @@ fake bridge behind Caddy and `docs/wasm/Caddyfile` (see
 
 They open every sample into its views (the ANYmal robot with all its meshes, its
 compressed lidar scan, its three camera views and its joint, IMU and speed plots;
-the self-driving car's camera, lidar following the car and motion plots; the
-built-in filters sample's raw and moving-average plots, its filter restored from
+the PandaSet car's six cameras with their 3D-box overlays, its two 3D views with
+its lidar and the boxes, and its yaw-rate and speed plots; the LILocBench robot's
+front camera, its two 3D views with the office map, both laser scans and, in the
+orbit view, the depth cloud, and its two plots; the UZH-FPV racing drone's
+fisheye and event cameras, its 3D view with the drone's trail, and its four plots;
+the Microduck biped with all its meshes, its two video cameras, its tilt plot and
+its two derived series (a number and a text state) restored from the layout;
+the built-in filters sample's raw and moving-average plots, its filter restored from
 the layout), check that seeking
-between two points inside the recording changes what the 3D view draws (a scene
-drawn once and then frozen fails), reopen ANYmal after switching sample while
-watching the page's longest frame gap, and make loads fail after staging
+between two points inside the recording changes what each 3D view draws (a scene
+drawn once and then frozen fails), reopen ANYmal and the PandaSet car after switching sample while
+bounding the page's longest main-thread task (Chromium; Firefox, which has no
+Long Tasks API, only logs its timings), and make loads fail after staging
 and after importing to check that the staged files are released and the open
 sample is left as it was. The suites never reach the network, so the samples get
-their hosted recordings and models from a local mirror of
-`https://assets.plotjuggler.io`: `npm --prefix tests/wasm run fetch:assets` fills
-`build-wasm-assets/` (`PJ_WASM_ASSETS_MIRROR` moves it), checking every file
+their hosted layouts, thumbnails, recordings and models from a local mirror of
+`https://assets.plotjuggler.io`, which serves the index and each layout with the
+asset host's origin replaced by its own: `npm --prefix tests/wasm run fetch:assets`
+fills `build-wasm-assets/` (`PJ_WASM_ASSETS_MIRROR` moves it), checking every file
 against `tests/wasm/fixtures/hosted_assets.json`; a hosted file a sample adds
 goes into that manifest.
 
@@ -283,15 +314,15 @@ The package is a static site with the response contract of
 `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy:
 require-corp`, `Cross-Origin-Resource-Policy: same-origin`, `nosniff`, the
 manifest's MIME types and cache classes, and ideally the precompressed `.br` /
-`.gz` representations chosen by `Accept-Encoding`. **No public host is selected**;
-account provisioning, DNS, credentials and publication are outside this feature. A robot
-serving the app beside its bridge uses the Caddy recipe in
-[`WASM_HOSTING.md`](./WASM_HOSTING.md).
+`.gz` representations chosen by `Accept-Encoding`. PlotJuggler's own deployment,
+`app.plotjuggler.io`, is a Cloudflare Worker serving the package from R2 and
+the samples' index from the asset host's bucket
+([`packaging/web/README.md`](../packaging/web/README.md)). A robot serving the app
+beside its bridge uses the Caddy recipe in [`WASM_HOSTING.md`](./WASM_HOSTING.md).
 
-### Cloudflare Pages (reference candidate)
+### Cloudflare Pages
 
-Cloudflare Pages is the reference candidate because it reads the generated
-`_headers`. Its published limits
+Cloudflare Pages reads the generated `_headers`. Its published limits
 ([Pages limits](https://developers.cloudflare.com/pages/platform/limits/),
 [headers](https://developers.cloudflare.com/pages/configuration/headers/); re-check
 them before publishing) are 25 MiB per file, 20,000 files per deployment on the
@@ -335,5 +366,5 @@ curl -fsSI "$BASE/presets/index.json" | grep -iE '^(cross-origin|cache-control|c
 curl -fsS "$BASE/presets/index.json" | node -e 'JSON.parse(require("fs").readFileSync(0))'
 ```
 
-Then open `$BASE/?preset=builtin_filters` in Chromium and Firefox: its two plots appear,
+Then open `$BASE/?preset=builtin_filters` in Chromium and Firefox: its three plots appear,
 and the browser console shows no errors.

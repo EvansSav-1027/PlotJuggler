@@ -39,17 +39,14 @@ class PointSeriesXY final : public QwtSeriesData<QPointF>, public RevisionedSeri
     return y_source_;
   }
 
-  /// Raw timestamp of sample `index` (the Y source's row time), in the domain of
-  /// TrackValueSeries::valueAtOrBefore(); 0 when out of range.
+  /// Raw timestamp of sample `index` (the Y source's row time), in the domain of TrackValueSeries::valueAtOrBefore();
+  /// 0 when out of range.
   [[nodiscard]] Timestamp timestamp(std::size_t index) const;
 
-  /// The (x,y) sample at-or-before `display_time_sec`, for the time-driven marker
-  /// that glides along an XY curve as the playback cursor moves (PlotWidget's XY
-  /// tracker). `display_time_sec` is the Qwt/playback display coordinate; it is
-  /// mapped back to a raw timestamp through the Y source's display offset (the
-  /// two axes share a time base) and matched against the time-ordered alignment
-  /// index. nullopt if there is no pair at-or-before that time (cursor before the
-  /// first sample) or the series is empty.
+  /// The (x, y) sample at or before `display_time_sec`, for the marker that follows the playback cursor along an XY
+  /// curve. The display time is mapped back to a raw timestamp through the Y source's display offset (both axes share
+  /// a time base) and matched against the time-ordered alignment index. nullopt when the series is empty or the
+  /// cursor is before the first sample.
   [[nodiscard]] std::optional<QPointF> sampleFromTime(double display_time_sec) const;
 
  private:

@@ -5,55 +5,23 @@
 #include <QComboBox>
 #include <QFormLayout>
 #include <QHBoxLayout>
-#include <QIcon>
-#include <QPalette>
 #include <QPushButton>
 #include <QSignalBlocker>
-#include <QSize>
 #include <algorithm>
-#include <cmath>
+#include <limits>
 #include <memory>
+#include <optional>
 
 #include "pj_plugins/sdk/message_parser_plugin_base.hpp"
 #include "pj_runtime/SessionManager.h"
+#include "pj_runtime/XmlStateOptions.h"
 #include "pj_scene2d_core/media_source.h"
 #include "pj_widgets/DoubleScrubber.h"
 #include "pj_widgets/FrameworkTokens.h"
+#include "pj_widgets/SvgButton.h"
 using namespace Qt::StringLiterals;
 
 namespace PJ {
-
-namespace {
-QString qssColor(const QColor& color) {
-  if (!color.isValid()) {
-    return QStringLiteral("transparent");
-  }
-  return QStringLiteral("rgba(%1, %2, %3, %4)")
-      .arg(color.red())
-      .arg(color.green())
-      .arg(color.blue())
-      .arg(color.alpha());
-}
-
-PJ::theme::Theme widgetTheme(const QWidget* widget) {
-  (void)widget;
-  return PJ::theme::appTheme();
-}
-
-QString toggleButtonQss(PJ::theme::Theme active_theme) {
-  // A button is the Secondary interaction fill per state — no border.
-  return QStringLiteral(
-             "QPushButton { border: none; border-radius: %1px; padding: %2px %3px; background-color: %4; }"
-             "QPushButton:hover { background-color: %5; }"
-             "QPushButton:checked { background-color: %6; }")
-      .arg(PJ::theme::radius(PJ::theme::Radius::Input, active_theme))
-      .arg(PJ::theme::space(PJ::theme::Space::Tight, active_theme))
-      .arg(PJ::theme::space(PJ::theme::Space::Comfortable, active_theme))
-      .arg(qssColor(PJ::theme::interaction(PJ::theme::Variant::Accent, PJ::theme::State::Nominal, active_theme)))
-      .arg(qssColor(PJ::theme::interaction(PJ::theme::Variant::Accent, PJ::theme::State::Hovered, active_theme)))
-      .arg(qssColor(PJ::theme::interaction(PJ::theme::Variant::Accent, PJ::theme::State::Checked, active_theme)));
-}
-}  // namespace
 
 DepthImageLayer::DepthImageLayer(
     ObjectTopicId topic_id, sdk::BuiltinObjectType object_type, const QString& display_name, QObject* parent)
@@ -78,18 +46,13 @@ QWidget* DepthImageLayer::createConfigWidget(QWidget* parent) {
   colormap->addItem(tr("Viridis"), static_cast<int>(Colormap::kViridis));
   colormap->addItem(tr("Plasma"), static_cast<int>(Colormap::kPlasma));
   colormap->addItem(tr("Grayscale"), static_cast<int>(Colormap::kGrayscale));
-  colormap->setCurrentIndex(colormap->findData(static_cast<int>(colormap_)));
+  colormap->setCurrentIndex(colormap->findData(static_cast<int>(options_.colormap)));
   colormap_row_layout->addWidget(colormap, 1);
 
-  auto* invert_btn = new QPushButton(colormap_row);
+  auto* invert_btn = new PJ::SvgButton(u":/resources/svg/invert.svg"_s, PJ::SvgButton::Size::kDefault, colormap_row);
   invert_btn->setCheckable(true);
-  invert_btn->setChecked(invert_);
-  invert_btn->setFocusPolicy(Qt::NoFocus);
-  invert_btn->setStyleSheet(toggleButtonQss(widgetTheme(widget)));
-  invert_btn->setIcon(QIcon(QStringLiteral(":/resources/svg/invert.svg")));
-  invert_btn->setIconSize(QSize(20, 20));
-  // Match the standard icon-button extent used across the app (icon 20 + padding 4).
-  invert_btn->setFixedSize(24, 24);
+  invert_btn->setChecked(options_.invert);
+  invert_btn->setExtent(24, 20);
   invert_btn->setToolTip(tr("Invert colormap"));
   colormap_row_layout->addWidget(invert_btn, 0);
 
@@ -100,7 +63,7 @@ QWidget* DepthImageLayer::createConfigWidget(QWidget* parent) {
   near_spin->setDecimals(3);
   near_spin->setSingleStep(0.1);
   near_spin->setSuffix(u" m"_s);
-  near_spin->setValue(near_m_);
+  near_spin->setValue(options_.near_m);
   layout->addRow(tr("Near"), near_spin);
 
   auto* far_spin = new PJ::DoubleScrubber(widget);
@@ -108,12 +71,10 @@ QWidget* DepthImageLayer::createConfigWidget(QWidget* parent) {
   far_spin->setDecimals(3);
   far_spin->setSingleStep(0.1);
   far_spin->setSuffix(u" m"_s);
-  far_spin->setValue(far_m_);
+  far_spin->setValue(options_.far_m);
   layout->addRow(tr("Far"), far_spin);
 
-  // On-demand range fit: snap near/far to the current frame's 2nd/98th depth
-  // percentiles. Manual remains the default (continuous auto flickered per frame);
-  // this is a one-shot the user triggers when the default range is unhelpful.
+  // One-shot fit to the current frame's depth percentiles; a continuous auto range flickered frame to frame.
   auto* autofit_btn = new QPushButton(tr("Auto-fit range"), widget);
   autofit_btn->setFocusPolicy(Qt::NoFocus);
   autofit_btn->setToolTip(tr("Set Near/Far from the current frame's depth distribution (2–98%)"));
@@ -122,7 +83,7 @@ QWidget* DepthImageLayer::createConfigWidget(QWidget* parent) {
   connect(colormap, &QComboBox::currentIndexChanged, this, [this, colormap](int) {
     setColormap(static_cast<Colormap>(colormap->currentData().toInt()));
   });
-  connect(invert_btn, &QPushButton::toggled, this, [this](bool on) { setInvert(on); });
+  connect(invert_btn, &PJ::SvgButton::toggled, this, [this](bool on) { setInvert(on); });
   connect(near_spin, &PJ::DoubleScrubber::valueChanged, this, [this, far_spin](double value) {
     setRange(static_cast<float>(value), static_cast<float>(far_spin->value()));
   });
@@ -157,8 +118,6 @@ std::unique_ptr<MediaSource> DepthImageLayer::createMediaSource(const SceneLayer
     return nullptr;
   }
 
-  // Real depth (e.g. ROS sensor_msgs/Image) is decoded via the topic's parser,
-  // exactly like ImageLayer; only canonical pj_image_v1 producers have no parser.
   const auto binding = session->parserBindingForObjectTopic(topicId());
   std::unique_ptr<DepthPipelineSource> source;
   if (binding.parser != nullptr) {
@@ -168,7 +127,6 @@ std::unique_ptr<MediaSource> DepthImageLayer::createMediaSource(const SceneLayer
   }
   depth_source_ = source.get();
   applyTo(*source);
-  // The decode runs on a worker thread now; repaint when a frame is ready.
   source->setFrameReadyCallback(makeQueuedRepaintCallback());
   return source;
 }
@@ -178,58 +136,72 @@ void DepthImageLayer::onBeforeDetach() {
 }
 
 void DepthImageLayer::applyTo(DepthPipelineSource& source) const {
-  source.setColormap(static_cast<uint8_t>(colormap_));  // core takes an opaque colormap id
-  source.setInvert(invert_);
-  source.setRange(near_m_, far_m_);  // manual default; Auto-fit updates near_m_/far_m_, then re-applies here
-  source.setOpacity(opacity_);
+  source.setColormap(static_cast<uint8_t>(options_.colormap));  // core takes an opaque colormap id
+  source.setInvert(options_.invert);
+  source.setRange(options_.near_m, options_.far_m);
+  source.setOpacity(options_.opacity);
 }
 
 void DepthImageLayer::saveOptions(QDomElement& element) const {
-  element.setAttribute(u"colormap"_s, colormapToken(colormap_));
-  element.setAttribute(u"invert"_s, invert_ ? u"true"_s : u"false"_s);
-  element.setAttribute(u"near_m"_s, QString::number(near_m_, 'g', 9));
-  element.setAttribute(u"far_m"_s, QString::number(far_m_, 'g', 9));
-  element.setAttribute(u"opacity"_s, QString::number(opacity_, 'g', 9));
+  element.setAttribute(u"colormap"_s, colormapToken(options_.colormap));
+  element.setAttribute(u"invert"_s, options_.invert ? u"true"_s : u"false"_s);
+  element.setAttribute(u"near_m"_s, QString::number(options_.near_m, 'g', 9));
+  element.setAttribute(u"far_m"_s, QString::number(options_.far_m, 'g', 9));
+  element.setAttribute(u"opacity"_s, QString::number(options_.opacity, 'g', 9));
+}
+
+std::optional<DepthImageLayer::Options> DepthImageLayer::parseOptions(
+    const QDomElement& element, const Options& current) {
+  Options parsed = current;
+
+  // Tolerated: an absent colormap keeps the current one; an empty or unknown token (e.g. "jet") reads as turbo.
+  const QString colormap_key = u"colormap"_s;
+  QString colormap = colormapToken(element.hasAttribute(colormap_key) ? Colormap::kTurbo : current.colormap);
+  (void)readXmlEnum(element, colormap_key, colormapTokens(), colormap, colormap, XmlBadValue::kTolerate);
+  parsed.colormap = parseColormap(colormap).value_or(Colormap::kTurbo);
+
+  constexpr float kLowest = std::numeric_limits<float>::lowest();
+  constexpr float kMax = std::numeric_limits<float>::max();
+  bool ok = readXmlBool(element, u"invert"_s, current.invert, parsed.invert);
+  ok = readXmlFloat(element, u"near_m"_s, current.near_m, kLowest, kMax, parsed.near_m) && ok;
+  ok = readXmlFloat(element, u"far_m"_s, current.far_m, kLowest, kMax, parsed.far_m) && ok;
+  const QString opacity_key = u"opacity"_s;
+  if (XmlOptionsRecorder::active()) {
+    // Reported with its [0, 1] bounds ahead of the unbounded read below: a finite value outside them is clamped, not
+    // refused.
+    const XmlOption opacity{
+        .attribute = opacity_key,
+        .type = u"float"_s,
+        .min = 0.0,
+        .max = 1.0,
+        .fallback = QString::number(current.opacity, 'g', 7)};
+    XmlOptionsRecorder::noteOption(element, opacity);
+    if (const QString problem =
+            element.hasAttribute(opacity_key) ? xmlValueProblem(opacity, element.attribute(opacity_key)) : QString();
+        !problem.isEmpty()) {
+      XmlOptionsRecorder::noteRejection(element, opacity_key, problem);
+    }
+  }
+  ok = readXmlFloat(element, opacity_key, current.opacity, kLowest, kMax, parsed.opacity) && ok;
+  if (!ok) {
+    return std::nullopt;
+  }
+  if (parsed.far_m < parsed.near_m) {
+    // Tolerated: the two swap.
+    XmlOptionsRecorder::noteRejection(element, u"far_m"_s, u"expected far_m >= near_m"_s);
+    std::swap(parsed.near_m, parsed.far_m);
+  }
+  parsed.opacity = std::clamp(parsed.opacity, 0.0f, 1.0f);
+  return parsed;
 }
 
 bool DepthImageLayer::loadOptions(const QDomElement& element) {
-  // Unknown tokens (including legacy "jet" layouts) restore the default.
-  const Colormap restored_colormap =
-      parseColormap(element.attribute(u"colormap"_s, colormapToken(colormap_))).value_or(Colormap::kTurbo);
-  const QString invert_text = element.attribute(u"invert"_s, invert_ ? u"true"_s : u"false"_s);
-  if (invert_text != u"true"_s && invert_text != u"false"_s) {
+  const std::optional<Options> restored = parseOptions(element, options_);
+  if (!restored.has_value()) {
     return false;
   }
-  const bool restored_invert = invert_text == u"true"_s;
-
-  const auto read_float = [&element](const QString& name, float fallback, float& output) {
-    if (!element.hasAttribute(name)) {
-      output = fallback;
-      return true;
-    }
-    bool ok = false;
-    output = element.attribute(name).toFloat(&ok);
-    return ok && std::isfinite(output);
-  };
-  float restored_near = near_m_;
-  float restored_far = far_m_;
-  float restored_opacity = opacity_;
-  if (!read_float(u"near_m"_s, near_m_, restored_near) || !read_float(u"far_m"_s, far_m_, restored_far) ||
-      !read_float(u"opacity"_s, opacity_, restored_opacity)) {
-    return false;
-  }
-  if (restored_far < restored_near) {
-    std::swap(restored_near, restored_far);
-  }
-  restored_opacity = std::clamp(restored_opacity, 0.0f, 1.0f);
-
-  const bool changed = colormap_ != restored_colormap || invert_ != restored_invert || near_m_ != restored_near ||
-                       far_m_ != restored_far || opacity_ != restored_opacity;
-  colormap_ = restored_colormap;
-  invert_ = restored_invert;
-  near_m_ = restored_near;
-  far_m_ = restored_far;
-  opacity_ = restored_opacity;
+  const bool changed = options_ != *restored;
+  options_ = *restored;
   if (changed) {
     applyOptions();
   }
@@ -241,10 +213,7 @@ void DepthImageLayer::applyOptions() {
     return;
   }
   applyTo(*depth_source_);
-  // Colormap/range/invert are GPU uniforms carried on the frame's DepthColorParams
-  // (not baked into the pixels). The setters above invalidate the worker so it
-  // re-emits a frame with the new params; re-apply the current tracker time so that
-  // re-emit happens now instead of on the next tick.
+  // The params travel on the frame: re-applying the tracker time re-emits it with them now.
   if (const auto ts = lastTrackerTimeNs(); ts.has_value()) {
     depth_source_->setTimestamp(*ts);
   }
@@ -252,19 +221,19 @@ void DepthImageLayer::applyOptions() {
 }
 
 void DepthImageLayer::setColormap(Colormap colormap) {
-  if (colormap_ == colormap) {
+  if (options_.colormap == colormap) {
     return;
   }
-  colormap_ = colormap;
+  options_.colormap = colormap;
   applyOptions();
   emit configurationChanged();
 }
 
 void DepthImageLayer::setInvert(bool invert) {
-  if (invert_ == invert) {
+  if (options_.invert == invert) {
     return;
   }
-  invert_ = invert;
+  options_.invert = invert;
   applyOptions();
   emit configurationChanged();
 }
@@ -273,11 +242,11 @@ void DepthImageLayer::setRange(float near_m, float far_m) {
   if (far_m < near_m) {
     std::swap(near_m, far_m);
   }
-  if (near_m_ == near_m && far_m_ == far_m) {
+  if (options_.near_m == near_m && options_.far_m == far_m) {
     return;
   }
-  near_m_ = near_m;
-  far_m_ = far_m;
+  options_.near_m = near_m;
+  options_.far_m = far_m;
   applyOptions();
   emit configurationChanged();
 }

@@ -5,17 +5,17 @@
 #include <QDomElement>
 #include <QWidget>
 #include <memory>
+#include <optional>
 
 #include "pj_scene2d_core/depth_pipeline_source.h"
 #include "pj_scene2d_widgets/layers/scene2d_layer.h"
-#include "pj_widgets/Colormap.h"  // shared Colormap enum
+#include "pj_widgets/Colormap.h"
 
 namespace PJ {
 
 class MediaSource;
 
-// Scene2DLayer for a DepthImage topic: contributes a depth-pipeline MediaSource
-// with per-layer colormap, near/far range (auto or manual), and opacity config.
+// A depth image topic (an Image with a depth encoding), colormapped on the GPU.
 class DepthImageLayer final : public Scene2DLayer {
   Q_OBJECT
  public:
@@ -24,6 +24,21 @@ class DepthImageLayer final : public Scene2DLayer {
       QObject* parent = nullptr);
 
   QWidget* createConfigWidget(QWidget* parent) override;
+
+  struct Options {
+    Colormap colormap = Colormap::kTurbo;
+    bool invert = false;
+    // Metres. Auto-fit sets it once from the current frame's percentiles.
+    float near_m = 0.0f;
+    float far_m = 4.0f;
+    // Restored from XML; there is no UI control.
+    float opacity = 1.0f;
+
+    friend bool operator==(const Options&, const Options&) = default;
+  };
+  /// The parse-only half of loadOptions(): the options `element` holds, `current` for an absent attribute; nullopt
+  /// rejects it. Reports through the active XmlOptionsRecorder.
+  [[nodiscard]] static std::optional<Options> parseOptions(const QDomElement& element, const Options& current);
 
  protected:
   [[nodiscard]] std::unique_ptr<MediaSource> createMediaSource(const SceneLayerContext& ctx) override;
@@ -38,14 +53,7 @@ class DepthImageLayer final : public Scene2DLayer {
   void setInvert(bool invert);
   void setRange(float near_m, float far_m);
 
-  Colormap colormap_ = Colormap::kTurbo;
-  bool invert_ = false;
-  // Near/far range in metres. Manual by default; the config's "Auto-fit" button sets
-  // it once from the current frame's depth percentiles (continuous auto flickered).
-  float near_m_ = 0.0f;
-  float far_m_ = 4.0f;
-  // Opacity is plumbed through to the source (kept at 1.0); no UI control yet.
-  float opacity_ = 1.0f;
+  Options options_;
   DepthPipelineSource* depth_source_ = nullptr;
 };
 

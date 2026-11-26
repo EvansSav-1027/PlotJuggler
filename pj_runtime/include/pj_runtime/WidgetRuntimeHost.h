@@ -10,6 +10,7 @@
 #include "pj_base/expected.hpp"
 #include "pj_datastore/object_store.hpp"
 #include "pj_plugins/host/widget_host_bridge.hpp"
+#include "pj_runtime/CanonicalObjectPayload.h"
 #include "pj_runtime/WireTarget.h"
 
 namespace PJ {
@@ -24,7 +25,8 @@ class ServiceRegistryBuilder;
 /// `query_history(input, slot, from, to, max)` into a read of that wire and hands each sample to the
 /// plugin's sink, in ascending time, converted to `PJ_widget_value_t` on the display time axis, and
 /// reports how many samples the range held before the cap (`out_total`).
-/// `inputs_changed` and `report_message` are forwarded to the callbacks given at construction.
+/// `inputs_changed`, `config_changed` and `report_message` are forwarded to the callbacks given at
+/// construction.
 ///
 /// The C-ABI skeleton (null context, exceptions at the noexcept boundary) is WidgetHostBridge's; this
 /// class only supplies the three behaviours. Every call is main-thread, like the rest of the widget
@@ -47,20 +49,29 @@ class WidgetRuntimeHost {
     /// The widget's inputs() changed; the dock re-reads inputs() and reconciles by name. Never
     /// delivered from inside on_update by contract, but the dock still defers it.
     std::function<void()> inputs_changed;
+    /// The user changed state the widget persists through save_config (a filter, a splitter) in the
+    /// widget's own UI. The host must not call save_config from inside this callback: it snapshots
+    /// later, from the event loop. Unset: ignored.
+    std::function<void()> config_changed;
     /// A diagnostic from the widget, for the host's message list.
     std::function<void(WidgetMessageLevel level, std::string_view message)> report_message;
   };
 
-  /// Samples delivered when the plugin passes `max_samples == 0`.
+  /// Samples delivered when the plugin passes `max_samples == 0`. An explicit `max_samples` is
+  /// honoured as asked: a widget that wants a whole history (a log) counts it first (`out_total`) and
+  /// asks for that many; the call then delivers every sample on the GUI thread.
   static constexpr uint32_t kDefaultMaxSamples = 10'000;
-  /// Hard cap on one call whatever the plugin asks for, so a widget cannot pull a whole dataset.
-  static constexpr uint32_t kMaxSamplesLimit = 100'000;
 
   /// @param reader   scalar data (must outlive this host).
   /// @param objects  object topics (must outlive this host).
   /// @param resolver wire lookup, called on the main thread inside each history call.
+  /// @param encoder  the bytes of each object sample delivered (canonicalObjectEncoder); an entry it
+  ///                 fails on is skipped like an evicted one. Empty: the stored bytes as they are, which
+  ///                 is wire bytes (e.g. ROS CDR) on a parser-bound topic; required so that no host
+  ///                 hands those to widgets by omission.
   WidgetRuntimeHost(
-      const DataReader& reader, const ObjectStore& objects, WireResolver resolver, Callbacks callbacks = {});
+      const DataReader& reader, const ObjectStore& objects, WireResolver resolver, Callbacks callbacks,
+      ObjectPayloadEncoder encoder);
 
   WidgetRuntimeHost(const WidgetRuntimeHost&) = delete;
   WidgetRuntimeHost& operator=(const WidgetRuntimeHost&) = delete;
@@ -77,18 +88,27 @@ class WidgetRuntimeHost {
 
  private:
   /// The samples of the range before decimation (the ABI's `out_total`), or an error before the sink ran.
-  /// A sink returning false ends the delivery; the total is still the range's.
+  /// A sink returning false ends the delivery; the total is still the range's. An object history counts
+  /// the entries it skipped (evicted, or not encoded) whether or not it decimates, so a one-sample probe
+  /// and a full read of the same range report the same total.
   Expected<uint32_t> history(const WidgetHistoryQuery& query, const WidgetValueSink& sink) const;
+  /// `range`: the stored instants the query covers (deliveredRange), never empty.
   Expected<uint32_t> historyNumber(
-      const WidgetHistoryQuery& query, const ResolvedWire& wire, const WidgetValueSink& sink) const;
+      const WidgetHistoryQuery& query, const ResolvedWire& wire, const Range<Timestamp>& range,
+      const WidgetValueSink& sink) const;
+  /// `range`: the stored instants the query covers (deliveredRange), never empty.
   Expected<uint32_t> historyText(
-      const WidgetHistoryQuery& query, const ResolvedWire& wire, const WidgetValueSink& sink) const;
+      const WidgetHistoryQuery& query, const ResolvedWire& wire, const Range<Timestamp>& range,
+      const WidgetValueSink& sink) const;
+  /// `range`: the stored instants the query covers (deliveredRange), never empty.
   Expected<uint32_t> historyObject(
-      const WidgetHistoryQuery& query, const ResolvedWire& wire, const WidgetValueSink& sink) const;
+      const WidgetHistoryQuery& query, const ResolvedWire& wire, const Range<Timestamp>& range,
+      const WidgetValueSink& sink) const;
 
   const DataReader& reader_;
   const ObjectStore& objects_;
   WireResolver resolver_;
+  ObjectPayloadEncoder encoder_;
   WidgetHostBridge bridge_;
 };
 

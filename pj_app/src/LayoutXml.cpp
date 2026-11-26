@@ -11,12 +11,14 @@
 #include <QSet>
 #include <algorithm>
 #include <array>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <span>
 #include <utility>
 #include <vector>
 
+#include "FanoutConfig.h"
 #include "LoadInput.h"
 #include "pj_plotting/PlotXml.h"
 #include "pj_runtime/HttpUrl.h"
@@ -32,9 +34,8 @@ constexpr QLatin1StringView kStreamingSourcesTag("previouslyLoaded_StreamingSour
 
 // A browser upload or stream-record identity: a token, never a filesystem path.
 bool isOpaqueSourceIdentity(const QString& value) {
-  // Keep this deliberately narrow. `:` is legal in POSIX path components, so a
-  // relative path such as logs/http://capture.mcap must retain the exact desktop
-  // filesystem behavior it had before browser identities existed.
+  // Keep it narrow: `:` is legal in POSIX path components, so a relative path such as logs/http://capture.mcap
+  // must stay a filesystem path.
   return isBrowserUploadIdentity(value) || isStreamIdentity(value);
 }
 
@@ -68,6 +69,17 @@ bool isCanonicalSha256(const QString& value) {
   }
   return std::all_of(
       value.cbegin(), value.cend(), [](QChar ch) { return (ch >= u'0' && ch <= u'9') || (ch >= u'a' && ch <= u'f'); });
+}
+
+// An element's optional content_sha256: only canonical lower-case SHA-256 is kept; any other non-empty value
+// leaves `sha256` empty and sets `malformed`.
+void readContentSha256(const QDomElement& element, QString& sha256, bool& malformed) {
+  const QString value = element.attribute(u"content_sha256"_s);
+  if (isCanonicalSha256(value)) {
+    sha256 = value;
+  } else {
+    malformed = !value.isEmpty();
+  }
 }
 
 }  // namespace
@@ -176,8 +188,8 @@ QList<StreamingSourceRef> extractStreamingSources(const QDomDocument& doc, QStri
       return fail(
           QCoreApplication::translate("LayoutXml", "Streaming source '%1' names more than one plugin.").arg(source.id));
     }
-    // Stream records exist only from this schema on, so their offset never takes the
-    // pre-v4 migration, also in a hand-written layout that omits pj4_version.
+    // Stream records exist only from schema 5, so their offset never takes the pre-v4 basis, even in a
+    // hand-written layout that omits pj4_version.
     if (const QDomElement dataset = stream_info.firstChildElement(u"dataset"_s); !dataset.isNull()) {
       source.dataset = readDatasetRef(dataset, kStreamingLayoutSchemaVersion);
     }
@@ -254,6 +266,13 @@ bool isSourceBoundLayout(const QDomDocument& doc) {
          (!root.firstChildElement(kStreamingSourcesTag).isNull() || !extractDataSource(doc, QDir()).isEmpty());
 }
 
+QString parseFailureMessage(const QString& name, const QDomDocument::ParseResult& result) {
+  return QCoreApplication::translate("LayoutXml", "'%1' is not a valid PJ4 layout: %2 (line %3, col %4)")
+      .arg(name, result.errorMessage)
+      .arg(result.errorLine)
+      .arg(result.errorColumn);
+}
+
 QString ensureLayoutExtension(const QString& path) {
   if (path.isEmpty() || !QFileInfo(path).suffix().isEmpty()) {
     return path;
@@ -265,20 +284,72 @@ bool containsEphemeralBrowserPath(const QByteArray& serialized) {
   return serialized.contains(kBrowserUploadScheme) || serialized.contains("/pj_uploads");
 }
 
-QList<DataSourceRef> extractDataSource(const QDomDocument& doc, const QDir& layout_dir) {
+std::optional<LogicalSideFiles> logicalBrowserSideFiles(
+    std::string_view config, const QString& data_path, const QString& data_logical_path,
+    const std::function<std::optional<StagedFileInfo>(const QString&)>& staged_file, QString* error) {
+  const auto fail = [error](const QString& reason) -> std::optional<LogicalSideFiles> {
+    if (error != nullptr) {
+      *error = reason;
+    }
+    return std::nullopt;
+  };
+  const QString data_dir = data_path.isEmpty() ? QString() : QFileInfo(data_path).path();
+  const QStringList values = detail::configStringValues(config);
+  QSet<QString> taken(values.cbegin(), values.cend());
+  taken.insert(data_logical_path);
+  QHash<QString, QString> replacements;
+  // One file picked twice is staged twice: its copies share a name and fingerprint, and one logical name.
+  QHash<QString, QString> logical_by_content;
+  LogicalSideFiles result;
+  for (const QString& value : values) {
+    if (value.isEmpty() || value == data_path) {
+      continue;
+    }
+    if (value == data_dir) {
+      replacements.insert(value, QString());
+      continue;
+    }
+    const std::optional<StagedFileInfo> staged = staged_file(value);
+    if (!staged.has_value()) {
+      continue;
+    }
+    if (staged->name.isEmpty() || !isCanonicalSha256(staged->content_sha256)) {
+      return fail(
+          QCoreApplication::translate(
+              "LayoutXml",
+              "'%1', which the source's plugin reads, has no content fingerprint: the file changed since it "
+              "was picked. Open the source again.")
+              .arg(staged->name));
+    }
+    const QString content_key = staged->name + u'\n' + staged->content_sha256;
+    if (const auto known = logical_by_content.constFind(content_key); known != logical_by_content.cend()) {
+      replacements.insert(value, *known);
+      continue;
+    }
+    QString logical = staged->name;
+    for (qsizetype n = result.side_files.size(); taken.contains(logical); ++n) {
+      logical = u"pj4-side/%1/%2"_s.arg(n).arg(staged->name);
+    }
+    taken.insert(logical);
+    logical_by_content.insert(content_key, logical);
+    replacements.insert(value, logical);
+    result.side_files.push_back({.filename = logical, .content_sha256 = staged->content_sha256});
+  }
+  result.config = replacements.isEmpty()
+                      ? std::string(config)
+                      : detail::replaceConfigStringValues(config, replacements).value_or(std::string(config));
+  return result;
+}
+
+QList<DataSourceRef> extractDataSource(const QDomDocument& doc, const std::optional<QDir>& layout_dir) {
   QList<DataSourceRef> sources;
   const QDomElement root = doc.documentElement();
-  // Schema <4 baked the global relative-time reference into every persisted
-  // display offset; v4+ persists the per-source alignment only. A missing/
-  // non-numeric version is treated as legacy (0), so an unversioned document
-  // migrates like v3.
+  // A missing or non-numeric pj4_version reads as 0, so an unversioned document takes the pre-v4 offset basis.
   const int schema_version = root.attribute(u"pj4_version"_s, u"0"_s).toInt();
   const QDomElement wrapper = root.firstChildElement(u"previouslyLoaded_Datafiles"_s);
   if (wrapper.isNull()) {
     return sources;
   }
-  // Walk every <fileInfo> sibling, not just the first: a multi-file session
-  // saves one per loaded data file (see MainWindow::appendDataSourceElement).
   for (QDomElement file_info = wrapper.firstChildElement(u"fileInfo"_s); !file_info.isNull();
        file_info = file_info.nextSiblingElement(u"fileInfo"_s)) {
     const QString filename = file_info.attribute(u"filename"_s);
@@ -287,28 +358,19 @@ QList<DataSourceRef> extractDataSource(const QDomDocument& doc, const QDir& layo
     }
     DataSourceRef info;
     info.serialized_path = filename;
-    // Browser upload identities are opaque, session-scoped URI tokens. Never
-    // reinterpret them as relative filesystem paths (which would silently turn
-    // pj-upload://... into <layout-dir>/pj-upload:/...).
+    // Anchoring an opaque identity would turn pj-upload://... into <layout-dir>/pj-upload:/...
     if (isOpaqueSourceIdentity(filename)) {
       info.resolved_path = filename;
     } else {
       const QFileInfo qfi(filename);
-      info.resolved_path = qfi.isAbsolute() ? qfi.absoluteFilePath() : layout_dir.absoluteFilePath(filename);
+      info.resolved_path = qfi.isAbsolute()         ? qfi.absoluteFilePath()
+                           : layout_dir.has_value() ? layout_dir->absoluteFilePath(filename)
+                                                    : QString();
     }
     info.prefix = file_info.attribute(u"prefix"_s);
-    const QString content_sha256 = file_info.attribute(u"content_sha256"_s);
-    if (isCanonicalSha256(content_sha256)) {
-      info.content_sha256 = content_sha256;
-    } else {
-      info.content_sha256_malformed = !content_sha256.isEmpty();
-    }
+    readContentSha256(file_info, info.content_sha256, info.content_sha256_malformed);
 
-    // Legacy single-track state on <fileInfo> (optional; absent in pre-v3
-    // layouts). A missing display_offset_ns leaves has_display_offset false so
-    // the reloaded dataset keeps its natural zero offset rather than being
-    // explicitly rewritten. It is consulted only when no <dataset> children are
-    // present (a <=v3 layout that could not describe fan-out tracks).
+    // Single-track state on <fileInfo>, consulted only when there are no <dataset> children.
     if (file_info.hasAttribute(u"display_offset_ns"_s)) {
       bool ok = false;
       info.display_offset_ns = file_info.attribute(u"display_offset_ns"_s).toLongLong(&ok);
@@ -321,27 +383,31 @@ QList<DataSourceRef> extractDataSource(const QDomDocument& doc, const QDir& layo
       info.timeline_order = -1;
     }
 
-    // Schema-v4 per-dataset children: one <dataset> per fan-out member, each
-    // keyed by (source_name, source_index) so identical display names still map
-    // to distinct tracks. Empty in a <=v3 layout (falls back to the flat state).
     for (QDomElement dataset = file_info.firstChildElement(u"dataset"_s); !dataset.isNull();
          dataset = dataset.nextSiblingElement(u"dataset"_s)) {
       info.datasets.push_back(readDatasetRef(dataset, schema_version));
+    }
+
+    for (QDomElement side = file_info.firstChildElement(u"sideFile"_s); !side.isNull();
+         side = side.nextSiblingElement(u"sideFile"_s)) {
+      SideFileRef side_file{.filename = side.attribute(u"filename"_s)};
+      if (side_file.filename.isEmpty()) {
+        continue;
+      }
+      readContentSha256(side, side_file.content_sha256, side_file.content_sha256_malformed);
+      info.side_files.push_back(std::move(side_file));
     }
 
     const QDomElement plugin = file_info.firstChildElement(u"plugin"_s);
     if (!plugin.isNull()) {
       info.plugin_id = plugin.attribute(u"ID"_s);
       info.plugin_manifest_id = plugin.attribute(u"manifest_id"_s);
-      // QDomElement::text() concatenates all child text/CDATA — exactly
-      // the round-trip of doc.createCDATASection above.
+      // text() joins the CDATA sections appendJsonAsCdata splits the JSON into.
       info.plugin_config_json = plugin.text();
     }
 
-    // Optional provider source record, a sibling of <plugin> (see
-    // DataSourceRef::materialize_*). Old layouts have no such child and parse
-    // exactly as before. directCdataText (not text()) reads the element's OWN
-    // CDATA only, so a future child element cannot leak into the descriptor.
+    // directCdataText, not text(): only the element's own CDATA, so a child element cannot leak into the
+    // descriptor.
     const QDomElement materialize = file_info.firstChildElement(u"materialize"_s);
     if (!materialize.isNull()) {
       info.materialize_provider = materialize.attribute(u"provider"_s);
@@ -361,10 +427,6 @@ QString SeriesPath::display() const {
 
 namespace {
 
-// Reads a (topic, field) attribute pair plus its dataset qualifiers off a curve
-// element into a SeriesPath. Returns nullopt when the topic attribute is absent
-// (e.g. a curve that carries no stable identity), so callers can skip it cleanly.
-// An out-of-range or non-numeric dataset id decays to 0 (unqualified).
 std::optional<SeriesPath> readPath(
     const QDomElement& curve, const QString& topic_attr, const QString& field_attr, const QString& dataset_id_attr,
     const QString& dataset_source_attr, const QString& dataset_path_attr) {
@@ -380,14 +442,12 @@ std::optional<SeriesPath> readPath(
       curve.attribute(dataset_path_attr)};
 }
 
-// Dedup key that distinguishes two SeriesPaths differing only by dataset
-// qualifier — two same-topic datasets must not collapse into one entry.
+// Includes the qualifiers: two same-topic datasets must not collapse into one entry.
 QString seriesPathDedupKey(const SeriesPath& path) {
   return QString::number(path.dataset_id) + QLatin1Char('\x1f') + path.dataset_source + QLatin1Char('\x1f') +
          path.dataset_path + QLatin1Char('\x1f') + path.topic + QLatin1Char('\x1f') + path.field;
 }
 
-// Visits every `tag` element that is a direct child of a <plot> element.
 template <typename Fn>
 void forEachPlotChild(const QDomDocument& doc, const QString& tag, Fn&& fn) {
   const QDomNodeList plot_nodes = doc.elementsByTagName(u"plot"_s);
@@ -407,7 +467,6 @@ void forEachPlotCurve(const QDomDocument& doc, Fn&& fn) {
   forEachPlotChild(doc, u"curve"_s, std::forward<Fn>(fn));
 }
 
-// A hidden-marker-scope entry carries the same dataset identity as its curves.
 template <typename Fn>
 void forEachMarkerScope(const QDomDocument& doc, Fn&& fn) {
   forEachPlotChild(doc, u"marker_scope"_s, std::forward<Fn>(fn));
@@ -462,11 +521,7 @@ std::vector<std::uint32_t> matchFanoutDatasets(
   };
 
   QSet<std::uint32_t> used;
-  // Resolve a saved child by its source_index against the live candidates: the
-  // index must be in range, its candidate not yet consumed, and its live
-  // source_name must agree with the saved name (an empty saved name matches
-  // any). Shared by both matcher arms — the index tiebreak in the unique-name
-  // arm and the shape-guarded index bind in the duplicate-name arm.
+  // An empty saved name matches any live name.
   const auto match_by_index = [&](const DataSourceDatasetRef& child) -> std::optional<std::uint32_t> {
     if (child.source_index < 0 || child.source_index >= static_cast<int>(candidates.size())) {
       return std::nullopt;
@@ -487,13 +542,10 @@ std::vector<std::uint32_t> matchFanoutDatasets(
 
     std::uint32_t matched = 0;
     if (name_is_duplicated) {
-      // Index-only, shape-guarded: bind to candidates[source_index] iff that
-      // candidate shares the name AND the same-named fan-out shape is preserved.
       if (named_candidate_count(child.source_name) == named_saved_count(child.source_name)) {
         matched = match_by_index(child).value_or(0);
       }
     } else {
-      // Name-unique child: match by name first, else by source_index.
       std::vector<std::uint32_t> source_matches;
       for (const std::uint32_t candidate : candidates) {
         if (used.contains(candidate)) {
@@ -573,30 +625,48 @@ QList<SeriesPath> rebindCurveKeys(QDomDocument& doc, const SeriesKeyResolver& re
 
 namespace {
 
-// An (id, source, path) attribute triple that carries a dataset qualifier.
+// An (id, source, path) attribute triple that carries a dataset qualifier, and the attributes naming the topic it
+// qualifies (`topic_name` is the scene spelling).
 struct DatasetIdentityAttributes {
   QString id;
   QString source;
   QString path;
+  QString topic;
+  QString topic_name;
 };
 
-// The five qualifier shapes, built once. kPlain: a time-series curve, a <transform> /
-// <on_demand> / <CustomWidget> <input>, a dataset-bound <generator> (an all_datasets one carries no
-// dataset_id and is skipped), a marker scope, a scene <layer> / <config_topic>. kX / kY:
-// the XY curve axes. kInput: a <processor>'s input, which rebinds on reload exactly like a
-// plotted curve. kSource: a scene <robot_model> / <trail>.
+// Persisted attribute prefixes. kPlain: a time-series curve, a <transform> / <on_demand> / <CustomWidget> <input>,
+// a dataset-bound <generator> (an all_datasets one has no dataset_id), a marker scope, a scene <layer> /
+// <config_topic>. kX / kY: the XY curve axes. kInput: a <processor>'s input. kSource: a scene <robot_model> /
+// <trail>.
 enum class Qualifier : std::uint8_t { kPlain, kX, kY, kInput, kSource };
 
 const std::array<DatasetIdentityAttributes, 5>& qualifierShapes() {
   static const std::array<DatasetIdentityAttributes, 5> shapes{{
-      {u"dataset_id"_s, u"dataset_source"_s, u"dataset_path"_s},
-      {u"x_dataset_id"_s, u"x_dataset_source"_s, u"x_dataset_path"_s},
-      {u"y_dataset_id"_s, u"y_dataset_source"_s, u"y_dataset_path"_s},
-      {u"input_dataset_id"_s, u"input_dataset_source"_s, u"input_dataset_path"_s},
-      {u"source_dataset_id"_s, u"source_dataset_source"_s, u"source_dataset_path"_s},
+      {u"dataset_id"_s, u"dataset_source"_s, u"dataset_path"_s, u"topic"_s, u"topic_name"_s},
+      {u"x_dataset_id"_s, u"x_dataset_source"_s, u"x_dataset_path"_s, u"x_topic"_s, u"x_topic_name"_s},
+      {u"y_dataset_id"_s, u"y_dataset_source"_s, u"y_dataset_path"_s, u"y_topic"_s, u"y_topic_name"_s},
+      {u"input_dataset_id"_s, u"input_dataset_source"_s, u"input_dataset_path"_s, u"input_topic"_s,
+       u"input_topic_name"_s},
+      {u"source_dataset_id"_s, u"source_dataset_source"_s, u"source_dataset_path"_s, u"source_topic"_s,
+       u"source_topic_name"_s},
   }};
   return shapes;
 }
+
+// The elements that read a dataset through the plain qualifier without naming a topic: a dataset-bound marker rule
+// (an all_datasets one reads every dataset), a marker scope, and a transform's or on-demand recipe's <input> (it may
+// name another node's output alone). `parent` empty: any.
+struct NamelessReader {
+  QLatin1StringView tag;
+  QLatin1StringView parent;
+};
+constexpr std::array<NamelessReader, 4> kNamelessReaders{{
+    {"generator"_L1, {}},
+    {"marker_scope"_L1, {}},
+    {"input"_L1, "transform"_L1},
+    {"input"_L1, "on_demand"_L1},
+}};
 
 const DatasetIdentityAttributes& qualifier(Qualifier shape) {
   return qualifierShapes()[static_cast<std::size_t>(shape)];
@@ -607,9 +677,9 @@ std::span<const DatasetIdentityAttributes, 3> curveQualifiers() {
   return std::span(qualifierShapes()).first<3>();
 }
 
-// Visits every `tag` element in the document.
+// QDom elements are shared handles: a const document still yields writable elements.
 template <typename Fn>
-void forEachTagged(QDomDocument& doc, const QString& tag, Fn&& fn) {
+void forEachTagged(const QDomDocument& doc, const QString& tag, Fn&& fn) {
   const QDomNodeList nodes = doc.elementsByTagName(tag);
   for (int index = 0; index < nodes.size(); ++index) {
     QDomElement element = nodes.at(index).toElement();
@@ -619,22 +689,18 @@ void forEachTagged(QDomDocument& doc, const QString& tag, Fn&& fn) {
   }
 }
 
-// Visits every <processor> that is a descendant of <data_processors>.
 template <typename Fn>
-void forEachProcessor(QDomDocument& doc, Fn&& fn) {
+void forEachProcessor(const QDomDocument& doc, Fn&& fn) {
   forEachTagged(doc, u"processor"_s, std::forward<Fn>(fn));
 }
 
-// Visits every marker <generator> that is a descendant of <data_processors>.
 template <typename Fn>
-void forEachGenerator(QDomDocument& doc, Fn&& fn) {
+void forEachGenerator(const QDomDocument& doc, Fn&& fn) {
   forEachTagged(doc, u"generator"_s, std::forward<Fn>(fn));
 }
 
-// Visits every <input> of a <transform> and of an <on_demand> recipe: both carry the same
-// dataset identity triple (Qualifier::kPlain).
 template <typename Fn>
-void forEachTransformInput(QDomDocument& doc, Fn&& fn) {
+void forEachTransformInput(const QDomDocument& doc, Fn&& fn) {
   for (const QString& tag : {u"transform"_s, u"on_demand"_s}) {
     const QDomNodeList processors = doc.elementsByTagName(tag);
     for (int index = 0; index < processors.size(); ++index) {
@@ -647,10 +713,9 @@ void forEachTransformInput(QDomDocument& doc, Fn&& fn) {
   }
 }
 
-// Visits every wire (<input>) of a <CustomWidget>. Selected through the parent: a marker rule's
-// <input> elements are not wires and carry no dataset qualifiers.
+// Selected through the parent: a marker rule's <input> elements are not wires and carry no qualifiers.
 template <typename Fn>
-void forEachCustomWidgetInput(QDomDocument& doc, Fn&& fn) {
+void forEachCustomWidgetInput(const QDomDocument& doc, Fn&& fn) {
   forEachTagged(doc, u"CustomWidget"_s, [&fn](QDomElement& widget) {
     for (QDomElement input = widget.firstChildElement(u"input"_s); !input.isNull();
          input = input.nextSiblingElement(u"input"_s)) {
@@ -659,43 +724,583 @@ void forEachCustomWidgetInput(QDomDocument& doc, Fn&& fn) {
   });
 }
 
-// Applies `visit` to the document element and every descendant, iteratively so a
-// deep layout never overflows the stack. Visitors see EVERY widget family's
-// elements, so a visitor must select by exact tagName (or touch only attributes
-// it owns) rather than assume the subtree it was written for.
+// Document order (matchDatasetsToFiles pairs by first appearance); iterative, so a deep layout cannot overflow the
+// stack. Visitors see every widget family's elements: select by exact tagName or touch only attributes you own.
 template <typename Fn>
-void forEachElement(QDomDocument& doc, Fn&& visit) {
+void forEachElementUnder(const QDomElement& root, Fn&& visit) {
   std::vector<QDomElement> pending;
-  pending.push_back(doc.documentElement());
+  pending.push_back(root);
   while (!pending.empty()) {
     QDomElement element = pending.back();
     pending.pop_back();
     visit(element);
-    for (QDomElement child = element.firstChildElement(); !child.isNull(); child = child.nextSiblingElement()) {
+    for (QDomElement child = element.lastChildElement(); !child.isNull(); child = child.previousSiblingElement()) {
       pending.push_back(child);
     }
   }
 }
 
+template <typename Fn>
+void forEachElement(const QDomDocument& doc, Fn&& visit) {
+  forEachElementUnder(doc.documentElement(), std::forward<Fn>(visit));
+}
+
+// Every distinct (path, source) pair the layout's qualifiers carry, in document order.
+QList<DatasetIdentity> qualifierPairs(const QDomDocument& doc) {
+  QList<DatasetIdentity> pairs;
+  forEachElement(doc, [&pairs](const QDomElement& element) {
+    for (const DatasetIdentityAttributes& shape : qualifierShapes()) {
+      DatasetIdentity pair{.path = element.attribute(shape.path), .source = element.attribute(shape.source)};
+      if ((!pair.path.isEmpty() || !pair.source.isEmpty()) && !pairs.contains(pair)) {
+        pairs.push_back(std::move(pair));
+      }
+    }
+  });
+  return pairs;
+}
+
 }  // namespace
 
-void removeDatasetQualifiersForGenericLayout(QDomDocument& doc) {
-  // Generic layouts bind structural identities to the unique matching dataset
-  // that is live when the layout is opened. Scene2D/Scene3D loaders and State Transitions rows
-  // implement the same unique-only fallback as plots and processors; keeping their upload path
-  // would both source-bind the layout and leak an ephemeral browser identity.
-  forEachElement(doc, [](QDomElement& element) {
+bool DatasetIdentity::isOpaque() const {
+  return isOpaqueSourceIdentity(path.isEmpty() ? source : path);
+}
+
+namespace {
+
+// The one entry of `files` whose file name is `name`, or empty when none or several are.
+QString uniqueFileNamed(const QStringList& files, const QString& name) {
+  QString found;
+  for (const QString& file : files) {
+    if (QFileInfo(file).fileName() == name) {
+      if (!found.isEmpty()) {
+        return {};
+      }
+      found = file;
+    }
+  }
+  return found;
+}
+
+// A qualifier's identity: its saved path, else its source label; empty when it has neither or an opaque path.
+QString qualifierIdentity(const QDomElement& element, const DatasetIdentityAttributes& shape) {
+  const QString path = element.attribute(shape.path);
+  if (path.isEmpty()) {
+    return element.attribute(shape.source);
+  }
+  return isOpaqueSourceIdentity(path) ? QString() : path;
+}
+
+// The label the loader gives `kept`'s dataset, when `saved_source` is the one it gave `saved_file`: the file name, or
+// "<complete base name>/<entry>" for a fan-out. Any other label (a plugin's display name) is kept as saved.
+QString keptSourceLabel(const QString& saved_source, const QString& saved_file, const QString& kept) {
+  const QFileInfo saved(saved_file);
+  const QFileInfo now(kept);
+  if (saved_source == saved.fileName()) {
+    return now.fileName();
+  }
+  if (const QString prefix = saved.completeBaseName() + u'/'; saved_source.startsWith(prefix)) {
+    return now.completeBaseName() + u'/' + saved_source.mid(prefix.size());
+  }
+  return saved_source;
+}
+
+}  // namespace
+
+QList<DatasetFileMatch> matchDatasetsToFiles(
+    const QDomDocument& doc, const QStringList& files, const QStringList& source_order) {
+  // Distinct identities (the saved path, else the label) in first-appearance order, each with the first label seen
+  // for it.
+  QList<DatasetFileMatch> saved;
+  for (const DatasetIdentity& pair : qualifierPairs(doc)) {
+    if (isOpaqueSourceIdentity(pair.path)) {
+      continue;
+    }
+    const QString identity = pair.path.isEmpty() ? pair.source : pair.path;
+    const auto it = std::find_if(saved.begin(), saved.end(), [&](const auto& s) { return s.identity == identity; });
+    if (it == saved.end()) {
+      saved.push_back({.identity = identity, .label = pair.source, .file = {}, .rule = DatasetFileMatch::Rule::kPath});
+    } else if (it->label.isEmpty()) {
+      it->label = pair.source;
+    }
+  }
+  const auto order = [&source_order](const DatasetFileMatch& entry) {
+    const auto it = std::find_if(source_order.begin(), source_order.end(), [&entry](const QString& path) {
+      return QDir::cleanPath(path) == entry.identity;
+    });
+    return it == source_order.end() ? source_order.size() : std::distance(source_order.begin(), it);
+  };
+  std::stable_sort(saved.begin(), saved.end(), [&order](const auto& a, const auto& b) { return order(a) < order(b); });
+
+  const auto has_path = [](const DatasetFileMatch& entry) { return QFileInfo(entry.identity).isAbsolute(); };
+  // A path-less label that some saved path also carries names that path's dataset: it follows that path's match.
+  QList<DatasetFileMatch> aliases;
+  QList<DatasetFileMatch> datasets;
+  for (const DatasetFileMatch& entry : saved) {
+    const bool alias = !has_path(entry) && std::any_of(saved.begin(), saved.end(), [&](const DatasetFileMatch& other) {
+      return has_path(other) && other.label == entry.identity;
+    });
+    (alias ? aliases : datasets).push_back(entry);
+  }
+
+  QStringList unclaimed = files;
+  QList<DatasetFileMatch> matched;
+  const auto take = [&](DatasetFileMatch entry, const QString& file, DatasetFileMatch::Rule rule) {
+    entry.file = file;
+    entry.rule = rule;
+    if (entry.label.isEmpty()) {
+      entry.label = QFileInfo(entry.identity).fileName();
+    }
+    unclaimed.removeAll(file);
+    matched.push_back(std::move(entry));
+  };
+  QList<DatasetFileMatch> left;
+  for (const DatasetFileMatch& entry : datasets) {
+    const auto same =
+        std::find_if(files.begin(), files.end(), [&entry](const QString& f) { return isSamePath(f, entry.identity); });
+    if (same != files.end()) {
+      take(entry, *same, DatasetFileMatch::Rule::kPath);
+    } else {
+      left.push_back(entry);
+    }
+  }
+  QList<DatasetFileMatch> unmatched;
+  for (const DatasetFileMatch& entry : left) {
+    const QString name = has_path(entry) ? QFileInfo(entry.identity).fileName() : entry.identity;
+    const QString file = uniqueFileNamed(unclaimed, name);
+    if (!file.isEmpty()) {
+      take(entry, file, DatasetFileMatch::Rule::kName);
+    } else if (has_path(entry)) {
+      unmatched.push_back(entry);  // a label alone (a toolbox's source) has no format to pair by
+    }
+  }
+  // Pairs only within one format: a recording and a CSV trading places would leave every curve unresolved.
+  const auto format = [](const QString& path) { return QFileInfo(path).suffix().toLower(); };
+  QSet<QString> formats;
+  for (const DatasetFileMatch& entry : unmatched) {
+    formats.insert(format(entry.identity));
+  }
+  for (const QString& suffix : formats) {
+    QList<DatasetFileMatch> datasets_of;
+    std::copy_if(unmatched.begin(), unmatched.end(), std::back_inserter(datasets_of), [&](const auto& entry) {
+      return format(entry.identity) == suffix;
+    });
+    QStringList files_of;
+    std::copy_if(unclaimed.begin(), unclaimed.end(), std::back_inserter(files_of), [&](const QString& file) {
+      return format(file) == suffix;
+    });
+    if (datasets_of.size() == files_of.size()) {
+      for (qsizetype i = 0; i < datasets_of.size(); ++i) {
+        take(datasets_of[i], files_of[i], DatasetFileMatch::Rule::kPosition);
+      }
+    }
+  }
+  for (const DatasetFileMatch& alias : aliases) {
+    const auto target = std::find_if(matched.begin(), matched.end(), [&alias](const DatasetFileMatch& m) {
+      return QFileInfo(m.identity).isAbsolute() && m.label == alias.identity;
+    });
+    if (target != matched.end()) {
+      const QString file = target->file;
+      take(alias, file, DatasetFileMatch::Rule::kAlias);
+    }
+  }
+  return matched;
+}
+
+void removeDatasetQualifiersForGenericLayout(QDomDocument& doc, const QList<DatasetFileMatch>& keep) {
+  // Keeping a scene's or Custom Widget's upload path would source-bind the layout and leak a page-lifetime browser
+  // identity.
+  forEachElement(doc, [&keep](QDomElement& element) {
     for (const DatasetIdentityAttributes& shape : qualifierShapes()) {
       element.removeAttribute(shape.id);
-      element.removeAttribute(shape.source);
-      element.removeAttribute(shape.path);
+      const QString identity = qualifierIdentity(element, shape);
+      const auto match = std::find_if(keep.begin(), keep.end(), [&](const auto& m) { return m.identity == identity; });
+      if (identity.isEmpty() || match == keep.end()) {
+        element.removeAttribute(shape.source);
+        element.removeAttribute(shape.path);
+        continue;
+      }
+      if (const QString source = element.attribute(shape.source); !source.isEmpty()) {
+        element.setAttribute(shape.source, keptSourceLabel(source, identity, match->file));
+      }
+      element.setAttribute(shape.path, match->file);
     }
   });
 }
 
 namespace {
 
-// Stamps the FileLoader-known full path next to `pair`'s numeric id on `element`.
+// The topic a series key ("<topic>/<field>", a marker rule's or on-demand recipe's input name) reads: the longest of
+// `known` (every loaded topic and every output of the layout's recipes) naming a prefix of it, empty when none does.
+QString keyTopic(const QString& key, const QSet<QString>& known) {
+  for (qsizetype end = key.size(); end > 0; end = key.lastIndexOf(u'/', end - 1)) {
+    if (QString candidate = key.left(end); known.contains(candidate)) {
+      return candidate;
+    }
+  }
+  return {};
+}
+
+// What `element` reads through `shape`, so a pinned layout gives it that qualifier: the topic it names under the shape
+// (curves, wires, recipe inputs, filters, scene layers and payloads), empty for a nameless reader, nullopt when it
+// reads nothing through it. A local scene layer names no topic and stays local. `known` resolves a series key.
+std::optional<QString> readsThrough(
+    const QDomElement& element, const DatasetIdentityAttributes& shape, const QSet<QString>& known) {
+  for (const QString& attribute : {shape.topic, shape.topic_name}) {
+    if (QString topic = element.attribute(attribute); !topic.isEmpty()) {
+      return topic;
+    }
+  }
+  if (shape.id != qualifier(Qualifier::kPlain).id || element.attribute(u"all_datasets"_s) == "1"_L1) {
+    return std::nullopt;
+  }
+  const QString tag = element.tagName();
+  const QString parent = element.parentNode().toElement().tagName();
+  // An on-demand <input name> is what its script reads: a topic (another node's "<owner>/<id>/<output>" included) or
+  // a series key, unless `topic`, read above, records the topic a qualified input read.
+  if (tag == "input"_L1 && parent == "on_demand"_L1) {
+    if (QString name = element.attribute(u"name"_s); !name.isEmpty()) {
+      QString topic = keyTopic(name, known);
+      return topic.isEmpty() ? name : topic;
+    }
+  }
+  const bool nameless = std::any_of(kNamelessReaders.begin(), kNamelessReaders.end(), [&](const NamelessReader& r) {
+    return tag == r.tag && (r.parent.isEmpty() || parent == r.parent);
+  });
+  return nameless ? std::optional<QString>(QString()) : std::nullopt;
+}
+
+template <typename Fn>
+void forEachRecipe(const QDomDocument& doc, Fn&& fn) {
+  for (const QString& tag : {u"processor"_s, u"transform"_s, u"on_demand"_s, u"generator"_s}) {
+    forEachTagged(doc, tag, fn);
+  }
+}
+
+// The topics `recipe` writes: a filter's output, the topic part of each <output> name of a transform or marker rule,
+// and "<owner>/<id>/<output>" for an on-demand recipe.
+QStringList recipeOutputs(const QDomElement& recipe) {
+  if (recipe.tagName() == "processor"_L1) {
+    return {recipe.attribute(u"output_name"_s)};
+  }
+  const QString prefix = recipe.tagName() == "on_demand"_L1
+                             ? recipe.attribute(u"owner_plugin"_s) + u'/' + recipe.attribute(u"id"_s) + u'/'
+                             : QString();
+  QStringList outputs;
+  for (QDomElement output = recipe.firstChildElement(u"output"_s); !output.isNull();
+       output = output.nextSiblingElement(u"output"_s)) {
+    outputs.push_back(prefix + output.attribute(u"name"_s).section(u':', 0, 0));
+  }
+  return outputs;
+}
+
+QSet<QString> producedTopics(const QDomDocument& doc) {
+  QSet<QString> produced;
+  forEachRecipe(doc, [&produced](const QDomElement& recipe) {
+    for (const QString& topic : recipeOutputs(recipe)) {
+      produced.insert(topic);
+    }
+  });
+  return produced;
+}
+
+// What one pin covers, over one document: `pinned` holds the topics the pin's dataset carries and the outputs of the
+// recipes reading them; `known` (every loaded topic and every output of the layout's recipes) resolves series keys.
+struct PinScope {
+  QSet<QString> pinned;
+  QSet<QString> known;
+};
+
+// The topics a marker rule's input keys read; an empty one for a key `known` resolves to no topic.
+QSet<QString> ruleTopics(const QDomElement& rule, const QSet<QString>& known) {
+  QSet<QString> topics;
+  for (QDomElement input = rule.firstChildElement(u"input"_s); !input.isNull();
+       input = input.nextSiblingElement(u"input"_s)) {
+    topics.insert(keyTopic(input.attribute(u"name"_s), known));
+  }
+  return topics;
+}
+
+// Whether a pin covers a marker rule: it reads every input from one dataset, so the pin must hold all its topics.
+bool ruleCovered(const QDomElement& rule, const PinScope& scope) {
+  const QSet<QString> topics = ruleTopics(rule, scope.known);
+  return !topics.isEmpty() && !topics.contains(QString()) && scope.pinned.contains(topics);
+}
+
+// Whether `recipe` reads what `scope` pins: a filter or transform or on-demand recipe one of its inputs, a marker rule
+// all of them.
+bool recipeReadsAny(const QDomElement& recipe, const PinScope& scope) {
+  if (recipe.tagName() == "processor"_L1) {
+    return scope.pinned.contains(recipe.attribute(u"input_topic"_s));
+  }
+  if (recipe.tagName() == "generator"_L1) {
+    return ruleCovered(recipe, scope);
+  }
+  for (QDomElement input = recipe.firstChildElement(u"input"_s); !input.isNull();
+       input = input.nextSiblingElement(u"input"_s)) {
+    if (const std::optional<QString> topic = readsThrough(input, qualifier(Qualifier::kPlain), scope.known);
+        topic.has_value() && scope.pinned.contains(*topic)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// What `pin` covers: the topics its dataset carries grown, through chains of recipes, by the outputs of every recipe
+// reading them, since a recipe pinned to a dataset writes there. `loaded_topics`: every loaded dataset's topics.
+PinScope scopeOf(const QDomDocument& doc, const DatasetPin& pin, const QSet<QString>& loaded_topics) {
+  PinScope scope{.pinned = pin.topics, .known = loaded_topics | producedTopics(doc)};
+  for (qsizetype size = -1; size != scope.pinned.size();) {
+    size = scope.pinned.size();
+    forEachRecipe(doc, [&scope](const QDomElement& recipe) {
+      if (recipeReadsAny(recipe, scope)) {
+        for (const QString& topic : recipeOutputs(recipe)) {
+          scope.pinned.insert(topic);
+        }
+      }
+    });
+  }
+  return scope;
+}
+
+// Removes every qualifier under `root`, then pins to `pin` the readers of a topic `scope` pins, the marker rules it
+// covers and the other nameless readers; the others bind by what they read.
+void pinQualifiers(const QDomElement& root, const DatasetPin& pin, const PinScope& scope) {
+  forEachElementUnder(root, [&pin, &scope](QDomElement& element) {
+    for (const DatasetIdentityAttributes& shape : qualifierShapes()) {
+      element.removeAttribute(shape.id);
+      element.removeAttribute(shape.source);
+      element.removeAttribute(shape.path);
+      const std::optional<QString> topic = readsThrough(element, shape, scope.known);
+      if (!topic.has_value()) {
+        continue;
+      }
+      const bool pinned = topic->isEmpty() ? element.tagName() != "generator"_L1 || ruleCovered(element, scope)
+                                           : scope.pinned.contains(*topic);
+      if (!pinned) {
+        continue;
+      }
+      if (pin.id != 0) {
+        element.setAttribute(shape.id, QString::number(pin.id));
+      }
+      element.setAttribute(shape.source, pin.source);
+      if (!pin.path.isEmpty()) {
+        element.setAttribute(shape.path, pin.path);
+      }
+    }
+  });
+}
+
+// A snapshot: elementsByTagName lists are live, so inserting while walking one revisits the inserted elements.
+std::vector<QDomElement> elementsTagged(const QDomDocument& doc, const QString& tag) {
+  std::vector<QDomElement> elements;
+  forEachTagged(doc, tag, [&elements](const QDomElement& element) { elements.push_back(element); });
+  return elements;
+}
+
+}  // namespace
+
+QList<DatasetIdentity> datasetIdentities(const QDomDocument& doc) {
+  const QList<DatasetIdentity> pairs = qualifierPairs(doc);
+  QList<DatasetIdentity> identities;
+  for (const DatasetIdentity& pair : pairs) {
+    const bool named_by_another = std::any_of(pairs.begin(), pairs.end(), [&pair](const DatasetIdentity& other) {
+      return other != pair && ((pair.source.isEmpty() && other.path == pair.path) ||
+                               (pair.path.isEmpty() && !other.path.isEmpty() && other.source == pair.source));
+    });
+    if (!named_by_another) {
+      identities.push_back(pair);
+    }
+  }
+  return identities;
+}
+
+QSet<QString> referencedTopics(const QDomDocument& doc, const QSet<QString>& loaded_topics) {
+  const QSet<QString> produced = producedTopics(doc);
+  const QSet<QString> known = loaded_topics | produced;
+  QSet<QString> topics;
+  forEachElement(doc, [&topics, &known](const QDomElement& element) {
+    for (const DatasetIdentityAttributes& shape : qualifierShapes()) {
+      if (const std::optional<QString> topic = readsThrough(element, shape, known);
+          topic.has_value() && !topic->isEmpty()) {
+        topics.insert(*topic);
+      }
+    }
+  });
+  forEachTagged(doc, u"generator"_s, [&topics, &known](const QDomElement& rule) {
+    if (rule.attribute(u"all_datasets"_s) != "1"_L1) {
+      topics |= ruleTopics(rule, known);
+    }
+  });
+  topics.remove(QString());
+  return topics - produced;
+}
+
+DatasetChoice planDatasetChoice(
+    const QDomDocument& doc, const std::optional<QList<DatasetIdentity>>& saved, const LoadedDatasets& loaded) {
+  const QList<DatasetIdentity> named = datasetIdentities(doc);
+  const QList<DatasetIdentity>& as_saved = saved.has_value() ? *saved : named;
+  const auto opaque = [](const DatasetIdentity& identity) { return identity.isOpaque(); };
+  if (as_saved.size() > 1 || named.size() > 1 || std::any_of(as_saved.begin(), as_saved.end(), opaque) ||
+      std::any_of(named.begin(), named.end(), opaque) || (named.size() == 1 && loaded.names_one(named.front()))) {
+    return {};
+  }
+  QSet<QString> loaded_topics;
+  for (const DatasetPin& pin : loaded.datasets) {
+    loaded_topics |= pin.topics;
+  }
+  const QSet<QString> topics = referencedTopics(doc, loaded_topics);
+  // A topic two or more datasets carry is shared: only those decide whether to choose.
+  QSet<QString> seen;
+  QSet<QString> shared;
+  for (const DatasetPin& pin : loaded.datasets) {
+    const QSet<QString> names = pin.topics & topics;
+    shared |= seen & names;
+    seen |= names;
+  }
+  if (shared.isEmpty()) {
+    // A layout made for a dataset that is not loaded binds like a generic one; with nothing loaded to bind to, its
+    // qualifiers stay, so the missing-data prompt names its dataset.
+    DatasetChoice keep;
+    keep.loaded_topics = std::move(loaded_topics);
+    if (named.size() == 1 && !seen.isEmpty()) {
+      keep.kind = DatasetChoice::Kind::kUnbind;
+    }
+    return keep;
+  }
+  // The shared topics a dataset carries, then all the layout's topics it carries to break a tie.
+  const auto fit = [&shared, &topics](const DatasetPin& pin) {
+    return std::pair{(pin.topics & shared).size(), (pin.topics & topics).size()};
+  };
+  std::pair<qsizetype, qsizetype> most{};
+  for (const DatasetPin& pin : loaded.datasets) {
+    most = std::max(most, fit(pin));
+  }
+  DatasetChoice choice;
+  choice.loaded_topics = std::move(loaded_topics);
+  for (const DatasetPin& pin : loaded.datasets) {
+    if (fit(pin) == most) {
+      choice.datasets.push_back(pin);
+    }
+  }
+  if (choice.datasets.size() == 1) {
+    choice.kind = DatasetChoice::Kind::kPin;
+  } else {
+    choice.kind = DatasetChoice::Kind::kAsk;
+    choice.blockers = duplicationBlockers(doc);
+  }
+  return choice;
+}
+
+QStringList duplicationBlockers(const QDomDocument& doc) {
+  QStringList blockers;
+  for (const QString& tag : {u"transform"_s, u"on_demand"_s}) {
+    forEachTagged(doc, tag, [&blockers](const QDomElement& recipe) {
+      blockers.push_back(recipe.attribute(u"owner_plugin"_s) + u'/' + recipe.attribute(u"id"_s));
+    });
+  }
+  return blockers;
+}
+
+void pinLayoutToDataset(QDomDocument& doc, const DatasetPin& pin, const QSet<QString>& loaded_topics) {
+  pinQualifiers(doc.documentElement(), pin, scopeOf(doc, pin, loaded_topics));
+}
+
+void pinLayoutToDatasets(
+    QDomDocument& doc, const QList<DatasetPin>& pins, const QSet<QString>& loaded_topics,
+    const RememberedCurveColor& remembered) {
+  if (pins.isEmpty()) {
+    return;
+  }
+  std::vector<PinScope> scopes;
+  for (const DatasetPin& pin : pins) {
+    scopes.push_back(scopeOf(doc, pin, loaded_topics));
+  }
+  // What the first dataset covers names it; each further copy is cloned from it and pinned again.
+  pinQualifiers(doc.documentElement(), pins.front(), scopes.front());
+  if (pins.size() == 1) {
+    return;
+  }
+  QDomElement processors = doc.documentElement().firstChildElement(u"data_processors"_s);
+  std::vector<QDomElement> recipes;
+  for (QDomElement recipe = processors.firstChildElement(); !recipe.isNull(); recipe = recipe.nextSiblingElement()) {
+    recipes.push_back(recipe);
+  }
+  const auto clone_for_pins = [&pins, &scopes](QDomElement& parent, const QDomElement& original, const auto& adapt) {
+    QDomNode after = original;
+    for (int copy = 1; copy < pins.size(); ++copy) {
+      QDomElement clone = original.cloneNode(true).toElement();
+      pinQualifiers(clone, pins[copy], scopes[copy]);
+      adapt(clone, copy);
+      after = parent.insertAfter(clone, after);
+    }
+  };
+  // A filter or dataset-bound marker rule runs once per dataset covering it, pinned there; one no chosen dataset
+  // covers stays single and unqualified. A copy for a dataset not covering it would bind where the first one does and
+  // write the same output twice.
+  for (QDomElement& recipe : recipes) {
+    const bool filter = recipe.tagName() == "processor"_L1;
+    const bool rule = recipe.tagName() == "generator"_L1 && recipe.attribute(u"all_datasets"_s) != "1"_L1;
+    if (!filter && !rule) {
+      continue;
+    }
+    std::vector<qsizetype> covering;
+    for (qsizetype index = 0; index < pins.size(); ++index) {
+      if (recipeReadsAny(recipe, scopes[index])) {
+        covering.push_back(index);
+      }
+    }
+    if (covering.empty()) {
+      continue;
+    }
+    pinQualifiers(recipe, pins[covering.front()], scopes[covering.front()]);
+    QDomNode after = recipe;
+    for (std::size_t next = 1; next < covering.size(); ++next) {
+      QDomElement clone = recipe.cloneNode(true).toElement();
+      pinQualifiers(clone, pins[covering[next]], scopes[covering[next]]);
+      after = processors.insertAfter(clone, after);
+    }
+  }
+
+  QSet<QString> ids;  // every tab, area and plot id: a copy takes one no element has
+  for (const QString& tag : {u"Tab"_s, u"DockArea"_s, u"plot"_s}) {
+    forEachTagged(doc, tag, [&ids](const QDomElement& element) { ids.insert(element.attribute(u"id"_s)); });
+  }
+  const auto new_id = [&ids](const QString& id) {
+    for (int n = 2;; ++n) {
+      if (QString candidate = u"%1~%2"_s.arg(id).arg(n); !ids.contains(candidate)) {
+        ids.insert(candidate);
+        return candidate;
+      }
+    }
+  };
+  for (QDomElement& area : elementsTagged(doc, u"tabbed_widget"_s)) {
+    std::vector<QDomElement> tabs;
+    for (QDomElement tab = area.firstChildElement(u"Tab"_s); !tab.isNull(); tab = tab.nextSiblingElement(u"Tab"_s)) {
+      tabs.push_back(tab);
+    }
+    for (std::size_t index = 0; index < tabs.size(); ++index) {
+      QDomElement& tab = tabs[index];
+      forEachElementUnder(tab, [&remembered](QDomElement& element) {
+        if (element.tagName() == "plot"_L1) {
+          plot_xml::fillMissingCurveColors(element, remembered);
+        }
+      });
+      const QString name = tab.attribute(u"tab_name"_s, u"tab%1"_s.arg(index + 1));
+      clone_for_pins(area, tab, [&](QDomElement& clone, int copy) {
+        plot_xml::prepareTabCopy(clone, new_id);
+        clone.setAttribute(u"tab_name"_s, u"%1 [%2]"_s.arg(name, pins[copy].label));
+      });
+      tab.setAttribute(u"tab_name"_s, u"%1 [%2]"_s.arg(name, pins.front().label));
+    }
+    QDomElement current = area.firstChildElement(u"currentTabIndex"_s);
+    if (!current.isNull()) {
+      current.setAttribute(u"index"_s, current.attribute(u"index"_s, u"0"_s).toInt() * static_cast<int>(pins.size()));
+    }
+  }
+}
+
+namespace {
+
 void stampIdentityPair(QDomElement& element, const DatasetIdentityAttributes& pair, const DatasetPathLookup& lookup) {
   if (!element.hasAttribute(pair.id)) {
     return;
@@ -711,11 +1316,9 @@ void stampIdentityPair(QDomElement& element, const DatasetIdentityAttributes& pa
   }
 }
 
-// Strips `pair`'s numeric id from `element` when it carries no full-path
-// qualifier (an unvalidated volatile hint that must not survive a file save).
 void stripUnvalidatedIdentityPair(QDomElement& element, const DatasetIdentityAttributes& pair) {
   if (!element.hasAttribute(pair.id) || !element.attribute(pair.path).isEmpty()) {
-    return;  // absent, or path-qualified (and thus validatable) — keep it.
+    return;
   }
   bool ok = false;
   const qulonglong id = element.attribute(pair.id).toULongLong(&ok);
@@ -762,13 +1365,23 @@ void removeUnvalidatedDatasetIds(QDomDocument& doc) {
       doc, [](QDomElement& input) { stripUnvalidatedIdentityPair(input, qualifier(Qualifier::kPlain)); });
 }
 
-void resolveDatasetSourcePaths(QDomDocument& doc, const QDir& layout_dir) {
-  remapDatasetSourcePaths(doc, [&layout_dir](const QString& saved_path) {
+QStringList resolveDatasetSourcePaths(QDomDocument& doc, const std::optional<QDir>& layout_dir) {
+  QStringList unresolved;
+  remapDatasetSourcePaths(doc, [&layout_dir, &unresolved](const QString& saved_path) {
     if (isOpaqueSourceIdentity(saved_path)) {
       return saved_path;
     }
-    return QDir::cleanPath(QFileInfo(saved_path).isAbsolute() ? saved_path : layout_dir.absoluteFilePath(saved_path));
+    if (QFileInfo(saved_path).isAbsolute()) {
+      return QDir::cleanPath(saved_path);
+    }
+    if (!layout_dir.has_value()) {
+      unresolved.push_back(saved_path);
+      return saved_path;
+    }
+    return QDir::cleanPath(layout_dir->absoluteFilePath(saved_path));
   });
+  unresolved.removeDuplicates();
+  return unresolved;
 }
 
 void remapDatasetSourcePaths(QDomDocument& doc, const DatasetPathRemapper& remap) {
@@ -862,8 +1475,7 @@ void remapFileInfoFilenames(QDomDocument& doc, const DatasetPathRemapper& remap)
   const QDomElement wrapper = doc.documentElement().firstChildElement(u"previouslyLoaded_Datafiles"_s);
   for (QDomElement file_info = wrapper.firstChildElement(u"fileInfo"_s); !file_info.isNull();
        file_info = file_info.nextSiblingElement(u"fileInfo"_s)) {
-    // Mirror extractDataSource's selection rule: entries with no filename are
-    // not sources and are never rewritten.
+    // extractDataSource's selection rule.
     const QString filename = file_info.attribute(u"filename"_s);
     if (filename.isEmpty()) {
       continue;
@@ -900,14 +1512,9 @@ void normalizePlotRangeBasis(QDomDocument& doc) {
       continue;
     }
     QDomElement range = plot.firstChildElement(u"range"_s);
-    // A range already carrying x_basis was written by a current build; leave it
-    // (keeps this migration idempotent). Only annotate the historical unmarked form.
     if (range.isNull() || range.hasAttribute(plot_xml::kXBasisAttribute)) {
       continue;
     }
-    // No numeric values change. XY plots stored a raw data value; time-series plots
-    // have always stored ABSOLUTE seconds (the v3 writer added the display offset),
-    // so the pre-marker form maps directly onto today's two bases.
     const bool is_xy = plot.attribute(u"mode"_s) == u"XYPlot"_s;
     range.setAttribute(plot_xml::kXBasisAttribute, is_xy ? plot_xml::kXBasisValue : plot_xml::kXBasisAbsolute);
   }
@@ -916,7 +1523,7 @@ void normalizePlotRangeBasis(QDomDocument& doc) {
 QDomElement writeSourceTimelineViewState(QDomDocument& doc, const SourceTimelineViewState& state) {
   QDomElement element = doc.createElement(u"source_timeline"_s);
   if (state.zoom) {
-    // High-precision 'g' so the tiny pixels-per-ns zoom (~1e-7) round-trips exactly.
+    // 17 significant digits: the ~1e-7 zoom must round-trip exactly.
     element.setAttribute(u"zoom"_s, QString::number(*state.zoom, 'g', 17));
   }
   if (state.scroll_left_ns) {
@@ -981,10 +1588,7 @@ bool isSamePath(const QString& a, const QString& b) {
   }
   const QString canon_a = QFileInfo(a).canonicalFilePath();
   const QString canon_b = QFileInfo(b).canonicalFilePath();
-  // QFileInfo::canonicalFilePath() returns empty for non-existent paths.
-  // Two missing files shouldn't be treated as "the same" — fall back to
-  // a literal comparison only when both inputs resolved to the same
-  // non-empty canonical form.
+  // canonicalFilePath() is empty for a missing file: two missing files are not the same.
   if (canon_a.isEmpty() || canon_b.isEmpty()) {
     return false;
   }

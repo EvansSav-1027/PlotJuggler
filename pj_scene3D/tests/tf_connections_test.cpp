@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "pj_scene3d_core/tf/view_sampling.h"
 #include "pj_tf/tf_buffer.h"
 #include "pj_tf/transform.h"
 
@@ -32,7 +33,6 @@ StampedTransform stamped(const std::string& parent, const std::string& child, Ti
   return StampedTransform{stamp, parent, child, tf};
 }
 
-// First segment whose child endpoint matches `c` (within tolerance), or nullptr.
 const TfConnectionSegment* findByChild(const std::vector<TfConnectionSegment>& segs, const glm::vec3& c) {
   constexpr float kTol = 1e-4f;
   for (const auto& seg : segs) {
@@ -43,9 +43,10 @@ const TfConnectionSegment* findByChild(const std::vector<TfConnectionSegment>& s
   return nullptr;
 }
 
-// TF R6: the lines join the triads at the cursor, in the entry clock. The 200 ns
+// The lines join the triads at the cursor, in the entry clock. The 200 ns
 // sample (x = 2) is logged at 300 ns, so at 250 ns the line still ends at x = 1.
 TEST(TfConnectionsTest, SegmentsReadTheEntryClock) {
+  setViewSampling(pj::tf::Sampling::kHold);  // reads between two TF samples: which one each clock holds
   TransformBuffer tf(TransformBuffer::kKeepAll);
   ASSERT_TRUE(tf.setTransform(stamped("world", "a", tp(100ns), translation(1, 0, 0)), tp(100ns)).has_value());
   ASSERT_TRUE(tf.setTransform(stamped("world", "a", tp(200ns), translation(2, 0, 0)), tp(300ns)).has_value());
@@ -63,7 +64,6 @@ TEST(TfConnectionsTest, OneSegmentPerNonRootFrameToParentOrigin) {
 
   const auto segs = buildTfConnectionSegments(tf, "world", tp(100ns));
 
-  // a, b, c each yield one segment; world is a root and yields none.
   ASSERT_EQ(segs.size(), 3u);
 
   const auto* sa = findByChild(segs, {1, 0, 0});
@@ -74,7 +74,6 @@ TEST(TfConnectionsTest, OneSegmentPerNonRootFrameToParentOrigin) {
   ASSERT_NE(sb, nullptr);
   EXPECT_NEAR(glm::length(sb->parent - glm::vec3(0, 0, 0)), 0.0f, 1e-4f);
 
-  // c sits at world (1,0,3); its parent a sits at world (1,0,0).
   const auto* sc = findByChild(segs, {1, 0, 3});
   ASSERT_NE(sc, nullptr);
   EXPECT_NEAR(glm::length(sc->parent - glm::vec3(1, 0, 0)), 0.0f, 1e-4f);
@@ -87,7 +86,6 @@ TEST(TfConnectionsTest, RootFrameProducesNoSegment) {
   const auto segs = buildTfConnectionSegments(tf, "world", tp(100ns));
 
   ASSERT_EQ(segs.size(), 1u);
-  // The only segment is for "a"; none originates at the world root.
   EXPECT_EQ(findByChild(segs, {0, 0, 0}), nullptr);
 }
 

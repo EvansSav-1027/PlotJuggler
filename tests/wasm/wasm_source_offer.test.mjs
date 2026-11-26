@@ -29,7 +29,8 @@ test('FFmpeg is the tarball cmake/PjWasmFfmpeg.cmake compiles', async () => {
 
 test('the Qt sources are the PJ_QT_VERSION modules the notices attribute, each with a pinned hash', async () => {
   const version = await readVersion('PJ_QT_VERSION');
-  const modules = (await read('cmake/PjWasmNotices.cmake')).match(/foreach\(module IN ITEMS ([^)]+)\)/)[1].split(' ');
+  const modules = (await read('cmake/PjWasmNotices.cmake'))
+    .match(/"\$\{_PJ_QT_NOTICE_PACKAGES\}" ([^)]+)\)/)[1].split(' ');
   const qt = (await planSourceOffer()).archives.filter(archive => modules.includes(archive.dependency));
   assert.deepEqual(
     qt.map(archive => archive.name), modules.map(module => `${module}-everywhere-src-${version}.tar.xz`));
@@ -111,7 +112,7 @@ test('SOURCE-OFFER.txt names each archive with its hash, and what rebuilds the m
   for (const archive of plan.archives.filter(entry => entry.repository)) {
     assert.ok(text.includes(archive.commit), `${archive.name} names its commit`);
   }
-  for (const input of ['versions.env', 'wasm-ci.yml', 'package_wasm.mjs', 'github.com/PlotJuggler/PJ4/issues',
+  for (const input of ['versions.env', 'wasm-ci.yml', 'package_wasm.mjs', 'github.com/PlotJuggler/PlotJuggler/issues',
     'conveyed under the GNU General Public License version 3', 'the desktop application remains MPL-2.0']) {
     assert.ok(text.replace(/\s+/g, ' ').includes(input), `names ${input}`);
   }
@@ -172,5 +173,5 @@ test('the notices state the bundle licence, and carry the GPL text it names', as
   const notices = await read('cmake/PjWasmNotices.cmake');
   assert.ok(notices.includes('conveyed under the GNU General Public License version 3'), 'the bundle licence');
   assert.ok(notices.includes('GPL-3.0-only entry of the Qt section'), 'where its text is');
-  await access(path.join(ROOT, 'cmake', 'wasm_notices', 'GPL-3.0-only.txt'));
+  await access(path.join(ROOT, 'cmake', 'notices', 'GPL-3.0-only.txt'));
 });

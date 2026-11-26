@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include <gtest/gtest.h>
+#include <qwt_plot.h>
 #include <qwt_plot_curve.h>
 
 #include <QApplication>
@@ -11,11 +12,14 @@
 #include <QHash>
 #include <QPen>
 #include <QSet>
+#include <QSignalSpy>
+#include <QStringList>
 #include <QTemporaryDir>
 #include <QtGlobal>
 #include <algorithm>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "LayoutXml.h"
@@ -48,9 +52,8 @@ QDomElement addPlot(QDomDocument& doc, const QString& id, const QString& mode) {
   return plot;
 }
 
-// Writes a SeriesPath's dataset qualifiers onto a curve element, using the given
-// attribute-name prefix ("" for time series, "x_"/"y_" for XY axes). Only set
-// qualifiers are written so an unqualified path leaves a clean element.
+// Writes a SeriesPath's dataset qualifiers onto a curve element under the attribute-name prefix ("" for time series,
+// "x_"/"y_" for XY axes). Only set qualifiers are written, so an unqualified path leaves a clean element.
 void writeDatasetQualifiers(QDomElement& curve, const QString& prefix, const SeriesPath& path) {
   if (path.dataset_id != 0) {
     curve.setAttribute(prefix + u"dataset_id"_s, QString::number(path.dataset_id));
@@ -84,9 +87,7 @@ QDomElement addXyCurve(QDomDocument& doc, QDomElement& plot, const SeriesPath& x
   return curve;
 }
 
-// Resolves a SeriesPath to the DatasetId of the concrete curve it binds to, or
-// nullopt when unresolvable/ambiguous. The identity assertion most resolver tests
-// need.
+// The DatasetId of the concrete curve a SeriesPath binds to, or nullopt when unresolvable/ambiguous.
 std::optional<PJ::DatasetId> resolvedDataset(PJ::CatalogModel& catalog, const SeriesPath& path) {
   const auto key = catalog.resolveCurveKey(path);
   if (!key.has_value()) {
@@ -102,6 +103,37 @@ void rebindAgainstCatalog(QDomDocument& doc, PJ::CatalogModel& catalog) {
   (void)unresolved;
 }
 
+// A saved absolute time window, both as seconds and as the authoritative ns edges.
+void addRange(QDomDocument& doc, QDomElement& plot, PJ::Timestamp left_ns, PJ::Timestamp right_ns) {
+  QDomElement range = doc.createElement(u"range"_s);
+  range.setAttribute(u"bottom"_s, u"0"_s);
+  range.setAttribute(u"top"_s, u"3"_s);
+  range.setAttribute(u"left"_s, QString::number(static_cast<double>(left_ns) / 1e9, 'f', 6));
+  range.setAttribute(u"right"_s, QString::number(static_cast<double>(right_ns) / 1e9, 'f', 6));
+  range.setAttribute(u"left_ns"_s, QString::number(left_ns));
+  range.setAttribute(u"right_ns"_s, QString::number(right_ns));
+  range.setAttribute(u"x_basis"_s, u"absolute"_s);
+  plot.appendChild(range);
+}
+
+std::vector<std::string> curveOrder(const PJ::PlotWidget& plot) {
+  std::vector<std::string> order;
+  for (const PJ::PlotWidget::CurveInfo& info : plot.curveList()) {
+    order.push_back(info.source_name.toStdString());
+  }
+  return order;
+}
+
+std::string keyOf(PJ::CatalogModel& catalog, const SeriesPath& path) {
+  return catalog.resolveCurveKey(path).value_or(QString()).toStdString();
+}
+
+// Exposes the Qwt plot: its attach order is the draw and legend order.
+struct InspectablePlot : PJ::PlotWidget {
+  using PJ::PlotWidget::PlotWidget;
+  using PJ::PlotWidgetBase::qwtPlot;
+};
+
 QHash<QString, PJ::PlotWidget*> indexByStateId(PJ::PlotWidget& plot) {
   QHash<QString, PJ::PlotWidget*> plots;
   plots.insert(plot.stateId(), &plot);
@@ -116,8 +148,8 @@ TEST(PendingDisplayBinderTest, RestoredEntryReleasesItsReferenceWhenThePlotDies)
   PJ::TopicDemandTracker tracker;
   PJ::PendingDisplayBinder binder(app_session.catalogModel(), &tracker);
 
-  // The topic is advertised (nameable) but has no data — a layout restore over
-  // a live demand stream stages a pending curve holding a demand reference.
+  // The topic is advertised (nameable) but has no data: a layout restore over a live demand stream stages a pending
+  // curve holding a demand reference.
   app_session.catalogModel().setAdvertisedTopics(
       dataset_id, {PJ::AdvertisedTopic{u"/speed"_s, PJ::sdk::BuiltinObjectType::kNone}});
   QDomDocument doc;
@@ -129,9 +161,8 @@ TEST(PendingDisplayBinderTest, RestoredEntryReleasesItsReferenceWhenThePlotDies)
   const auto held = tracker.activeTopics(dataset_id);
   ASSERT_NE(std::find(held.begin(), held.end(), u"/speed"_s), held.end());
 
-  // The plot dies before the topic ever materializes: the reference must
-  // release AT destruction — on a quiet stream no later flush ever runs, and a
-  // lazy release would keep the topic subscribed forever.
+  // The plot dies before the topic materializes: the reference must release at destruction, since on a quiet stream
+  // no later flush runs and a lazy release would keep the topic subscribed forever.
   plot.reset();
   const auto after = tracker.activeTopics(dataset_id);
   EXPECT_EQ(std::find(after.begin(), after.end(), u"/speed"_s), after.end());
@@ -145,11 +176,9 @@ TEST(PendingDisplayBinderTest, DuplicatePlaceholderDropStagesOneEntry) {
   PJ::PendingDisplayBinder binder(app_session.catalogModel(), &tracker);
   PJ::PlotWidget plot(&app_session.sessionManager(), &app_session.catalogModel());
 
-  // Double-dropping the same placeholder on the same plot must not stage a
-  // second intent: on promotion the first entry binds every field, the
-  // duplicate's addCurve() calls all return null, and it would sit forever
-  // holding its demand reference (and re-add ghost curves after a manual
-  // curve delete on a later flush).
+  // Double-dropping the same placeholder on the same plot must not stage a second intent: on promotion the first
+  // entry binds every field, the duplicate's addCurve() calls all return null, and it would sit forever holding its
+  // demand reference (and re-add ghost curves after a manual curve delete on a later flush).
   binder.addPendingCurve(&plot, SeriesPath{u"/speed"_s, QString()}, dataset_id);
   binder.addPendingCurve(&plot, SeriesPath{u"/speed"_s, QString()}, dataset_id);
   EXPECT_EQ(binder.size(), 1);
@@ -308,8 +337,8 @@ TEST(PendingDisplayBinderTest, LateXyHalvesKeepTheirIndependentDatasetIdentities
   ASSERT_NE(addScalarTopic(app_session, *dataset_a, "/x"), 0U);
   ASSERT_NE(addScalarTopic(app_session, *dataset_a, "/y"), 0U);
 
-  // x is qualified to dataset A, y to dataset B (both share the raw source
-  // label "same.mcap"): y is not materialized yet, so the curve waits.
+  // x is qualified to dataset A, y to dataset B (both share the raw source label "same.mcap"): y is not materialized
+  // yet, so the curve waits.
   const SeriesPath x_path{u"/x"_s, u"value"_s, *dataset_a, u"same.mcap"_s};
   const SeriesPath y_path{u"/y"_s, u"value"_s, *dataset_b, u"same.mcap"_s};
   QDomDocument doc;
@@ -348,8 +377,7 @@ TEST(PendingDisplayBinderTest, CollectsUnresolvedCurvesAndBindsThemWhenTopicArri
 
   QDomDocument doc;
   QDomElement plot_element = addPlot(doc, u"plot_ts"_s, u"TimeSeries"_s);
-  // Style and line width are plot-level (every curve inherits them); colour and
-  // visibility are per-curve.
+  // Style and line width are plot-level (every curve inherits them); colour and visibility are per-curve.
   plot_element.setAttribute(u"style"_s, u"Dots"_s);
   plot_element.setAttribute(u"line_width"_s, u"3.0"_s);
   addTimeSeriesCurve(doc, plot_element, ready);
@@ -381,7 +409,6 @@ TEST(PendingDisplayBinderTest, CollectsUnresolvedCurvesAndBindsThemWhenTopicArri
   ASSERT_NE(info, nullptr);
   ASSERT_NE(info->curve, nullptr);
   EXPECT_EQ(info->curve->pen().color(), QColor(u"#123456"_s));
-  // Style and width are inherited from the plot (Dots at the plot's line width).
   EXPECT_EQ(info->curve->style(), QwtPlotCurve::Dots);
   EXPECT_DOUBLE_EQ(info->curve->pen().widthF(), PJ::dotWidthValue(PJ::LineWidth::kPoints30));
   EXPECT_FALSE(info->curve->isVisible());
@@ -390,10 +417,161 @@ TEST(PendingDisplayBinderTest, CollectsUnresolvedCurvesAndBindsThemWhenTopicArri
   EXPECT_EQ(plot.curveList().size(), 2U);
 }
 
-// Progressive restore: a hidden marker scope saved under a dataset id that is
-// reminted on reload must follow the dataset its pending curves bind to. DISABLED:
-// documents a known gap (the binder rebinds curves only; an unresolved scope keeps
-// its saved id) pending the retained-identity fix in PlotWidget/PendingDisplayBinder.
+// Two datasets, both loading after the layout (`-l`): the second curve's dataset loads first, yet the plot keeps the
+// saved order, and with it the saved window, which converts through the first curve's display offset.
+TEST(PendingDisplayBinderTest, CurvesBindingOutOfOrderKeepTheSavedOrderAndWindow) {
+  QTemporaryDir extensions_dir;
+  ASSERT_TRUE(extensions_dir.isValid());
+  PJ::AppSession app_session(extensions_dir.path());
+  PJ::CatalogModel& catalog = app_session.catalogModel();
+  constexpr PJ::Timestamp kSecond = 1'000'000'000;
+  const PJ::DatasetId dataset_a = createDataset(app_session, "a.mcap", /*own_time_domain=*/true);
+  const PJ::DatasetId dataset_b = createDataset(app_session, "b.csv", /*own_time_domain=*/true);
+  ASSERT_NE(dataset_a, 0U);
+  ASSERT_NE(dataset_b, 0U);
+  // A starts at 100 s and its display frame starts there ("Align starts"); B is already relative.
+  app_session.sessionManager().setDisplayOffset(dataset_a, PJ::DisplayOffset{PJ::Duration{100 * kSecond}});
+
+  const SeriesPath first{u"/first"_s, u"value"_s, dataset_a, u"a.mcap"_s};
+  const SeriesPath second{u"/second"_s, u"value"_s, dataset_b, u"b.csv"_s};
+  QDomDocument doc;
+  InspectablePlot plot(&app_session.sessionManager(), &catalog);
+  QDomElement plot_element = addPlot(doc, plot.stateId(), u"TimeSeries"_s);
+  addRange(doc, plot_element, 110 * kSecond, 190 * kSecond);
+  addTimeSeriesCurve(doc, plot_element, first);
+  addTimeSeriesCurve(doc, plot_element, second);
+  rebindAgainstCatalog(doc, catalog);
+
+  ASSERT_TRUE(plot.xmlLoadState(plot_element));
+  ASSERT_TRUE(plot.curveList().empty());
+  PJ::PendingDisplayBinder binder(catalog);
+  binder.collect(doc, indexByStateId(plot));
+  ASSERT_EQ(binder.size(), 2);
+
+  ASSERT_NE(addScalarTopic(app_session, dataset_b, "/second", 0, 10 * kSecond), 0U);
+  ASSERT_EQ(binder.flush(QSet<QString>{second.topic}), 1);
+  ASSERT_NE(addScalarTopic(app_session, dataset_a, "/first", 100 * kSecond, 300 * kSecond), 0U);
+  ASSERT_EQ(binder.flush(QSet<QString>{first.topic}), 1);
+
+  const std::string first_key = keyOf(catalog, first);
+  const std::string second_key = keyOf(catalog, second);
+  ASSERT_FALSE(first_key.empty());
+  ASSERT_FALSE(second_key.empty());
+  EXPECT_EQ(curveOrder(plot), (std::vector<std::string>{first_key, second_key}));
+  const QwtPlotItemList attached = plot.qwtPlot()->itemList(QwtPlotItem::Rtti_PlotCurve);
+  ASSERT_EQ(attached.size(), 2);
+  EXPECT_EQ(attached.front(), plot.curveList().front().curve);
+  EXPECT_EQ(attached.back(), plot.curveList().back().curve);
+  // flush reordered before re-applying the window: the saved window, in /first's display frame, before any drain.
+  EXPECT_NEAR(plot.currentBoundingRect().left(), 10.0, 1e-6);
+  EXPECT_NEAR(plot.currentBoundingRect().right(), 90.0, 1e-6);
+
+  plot.applySavedViewportOrZoom(/*clear_after=*/true);
+  EXPECT_NEAR(plot.currentBoundingRect().left(), 10.0, 1e-6);
+  EXPECT_NEAR(plot.currentBoundingRect().right(), 90.0, 1e-6);
+
+  // A restore is not a user edit: one curveListChanged when the order changes, none when it does not, never an undo
+  // step.
+  QSignalSpy list_changed(&plot, &PJ::PlotWidgetBase::curveListChanged);
+  QSignalSpy undoable(&plot, &PJ::PlotWidget::undoableChange);
+  EXPECT_FALSE(plot.restoreCurveOrder({QString::fromStdString(first_key), QString::fromStdString(second_key)}));
+  EXPECT_EQ(list_changed.count(), 0);
+  EXPECT_TRUE(plot.restoreCurveOrder({QString::fromStdString(second_key), QString::fromStdString(first_key)}));
+  EXPECT_EQ(list_changed.count(), 1);
+  EXPECT_EQ(undoable.count(), 0);
+  EXPECT_EQ(curveOrder(plot), (std::vector<std::string>{second_key, first_key}));
+}
+
+// The first saved curve binds only after the restore settled (a retained intent): it appends, so the plot keeps the
+// dataset its window was applied in, and a save writes back the window it loaded.
+TEST(PendingDisplayBinderTest, FirstCurveBindingAfterTheRestoreSettledKeepsTheAppliedWindow) {
+  QTemporaryDir extensions_dir;
+  ASSERT_TRUE(extensions_dir.isValid());
+  PJ::AppSession app_session(extensions_dir.path());
+  PJ::CatalogModel& catalog = app_session.catalogModel();
+  constexpr PJ::Timestamp kSecond = 1'000'000'000;
+  const PJ::DatasetId dataset_a = createDataset(app_session, "a.mcap", /*own_time_domain=*/true);
+  const PJ::DatasetId dataset_b = createDataset(app_session, "b.csv", /*own_time_domain=*/true);
+  app_session.sessionManager().setDisplayOffset(dataset_a, PJ::DisplayOffset{PJ::Duration{100 * kSecond}});
+
+  const SeriesPath first{u"/first"_s, u"value"_s, dataset_a, u"a.mcap"_s};
+  const SeriesPath second{u"/second"_s, u"value"_s, dataset_b, u"b.csv"_s};
+  QDomDocument doc;
+  PJ::PlotWidget plot(&app_session.sessionManager(), &catalog);
+  QDomElement plot_element = addPlot(doc, plot.stateId(), u"TimeSeries"_s);
+  addRange(doc, plot_element, 110 * kSecond, 190 * kSecond);
+  addTimeSeriesCurve(doc, plot_element, first);
+  addTimeSeriesCurve(doc, plot_element, second);
+  rebindAgainstCatalog(doc, catalog);
+  ASSERT_TRUE(plot.xmlLoadState(plot_element));
+  PJ::PendingDisplayBinder binder(catalog);
+  binder.collect(doc, indexByStateId(plot));
+  ASSERT_EQ(binder.size(), 2);
+
+  ASSERT_NE(addScalarTopic(app_session, dataset_b, "/second", 0, 200 * kSecond), 0U);
+  ASSERT_EQ(binder.flush(QSet<QString>{second.topic}), 1);
+  // The drain: the window is applied for good through /second's offset (0).
+  plot.applySavedViewportOrZoom(/*clear_after=*/true);
+  const QRectF applied = plot.currentBoundingRect();
+  EXPECT_NEAR(applied.left(), 110.0, 1e-6);
+
+  ASSERT_NE(addScalarTopic(app_session, dataset_a, "/first", 100 * kSecond, 300 * kSecond), 0U);
+  ASSERT_EQ(binder.flush(QSet<QString>{first.topic}), 1);
+
+  EXPECT_EQ(curveOrder(plot), (std::vector<std::string>{keyOf(catalog, second), keyOf(catalog, first)}));
+  EXPECT_EQ(plot.currentBoundingRect(), applied);
+  QDomDocument saved;
+  const QDomElement range = plot.xmlSaveState(saved).firstChildElement(u"range"_s);
+  ASSERT_FALSE(range.isNull());
+  EXPECT_EQ(range.attribute(u"left_ns"_s).toLongLong(), 110 * kSecond);
+  EXPECT_EQ(range.attribute(u"right_ns"_s).toLongLong(), 190 * kSecond);
+}
+
+// After the restore settled the curve list is the user's: a retained curve binding later appends instead of putting
+// back the order captured at load.
+TEST(PendingDisplayBinderTest, RetainedCurveBindingAfterAUserReorderKeepsTheUserOrder) {
+  QTemporaryDir extensions_dir;
+  ASSERT_TRUE(extensions_dir.isValid());
+  PJ::AppSession app_session(extensions_dir.path());
+  PJ::CatalogModel& catalog = app_session.catalogModel();
+  constexpr PJ::Timestamp kSecond = 1'000'000'000;
+  const PJ::DatasetId dataset_id = createDataset(app_session, "d.csv", /*own_time_domain=*/true);
+  const SeriesPath a{u"/a"_s, u"value"_s, dataset_id, u"d.csv"_s};
+  const SeriesPath b{u"/b"_s, u"value"_s, dataset_id, u"d.csv"_s};
+  const SeriesPath c{u"/c"_s, u"value"_s, dataset_id, u"d.csv"_s};
+  QDomDocument doc;
+  PJ::PlotWidget plot(&app_session.sessionManager(), &catalog);
+  QDomElement plot_element = addPlot(doc, plot.stateId(), u"TimeSeries"_s);
+  addRange(doc, plot_element, 0, 10 * kSecond);
+  for (const SeriesPath& path : {a, b, c}) {
+    addTimeSeriesCurve(doc, plot_element, path);
+  }
+  rebindAgainstCatalog(doc, catalog);
+  ASSERT_TRUE(plot.xmlLoadState(plot_element));
+  PJ::PendingDisplayBinder binder(catalog);
+  binder.collect(doc, indexByStateId(plot));
+  ASSERT_EQ(binder.size(), 3);
+
+  ASSERT_NE(addScalarTopic(app_session, dataset_id, "/b", 0, 10 * kSecond), 0U);
+  ASSERT_NE(addScalarTopic(app_session, dataset_id, "/c", 0, 10 * kSecond), 0U);
+  ASSERT_EQ(binder.flush(QSet<QString>{b.topic, c.topic}), 2);
+  plot.applySavedViewportOrZoom(/*clear_after=*/true);
+  const std::string key_b = keyOf(catalog, b);
+  const std::string key_c = keyOf(catalog, c);
+  ASSERT_EQ(curveOrder(plot), (std::vector<std::string>{key_b, key_c}));
+
+  // The user removes /b and drops it back: it is now last.
+  plot.removeCurve(QString::fromStdString(key_b));
+  ASSERT_NE(plot.addCurve(QString::fromStdString(key_b)), nullptr);
+  ASSERT_EQ(curveOrder(plot), (std::vector<std::string>{key_c, key_b}));
+
+  ASSERT_NE(addScalarTopic(app_session, dataset_id, "/a", 0, 10 * kSecond), 0U);
+  ASSERT_EQ(binder.flush(QSet<QString>{a.topic}), 1);
+  EXPECT_EQ(curveOrder(plot), (std::vector<std::string>{key_c, key_b, keyOf(catalog, a)}));
+}
+
+// Progressive restore: a hidden marker scope saved under a dataset id that is reminted on reload follows the dataset
+// its pending curves bind to (flush calls PlotWidget::resolvePendingMarkerScopes).
 TEST(PendingDisplayBinderTest, HiddenMarkerScopeFollowsTheRemintedDatasetOfItsPendingCurves) {
   QTemporaryDir extensions_dir;
   ASSERT_TRUE(extensions_dir.isValid());
@@ -427,10 +605,9 @@ TEST(PendingDisplayBinderTest, HiddenMarkerScopeFollowsTheRemintedDatasetOfItsPe
       << "the hidden scope followed the dataset its curve bound to";
 }
 
-// A snapshot taken while the dataset is still loading (undo/redo mid-restore)
-// must carry the unresolved <marker_scope> with its identity next to the
-// persistent curve intent, and a plot restored from that snapshot still hides
-// the scope once the curve binds.
+// A snapshot taken while the dataset is still loading (undo/redo mid-restore) carries the unresolved <marker_scope>
+// with its identity next to the persistent curve intent, and a plot restored from that snapshot still hides the scope
+// once the curve binds.
 TEST(PendingDisplayBinderTest, PendingHiddenMarkerScopeSurvivesAnIntermediateSnapshot) {
   QTemporaryDir extensions_dir;
   ASSERT_TRUE(extensions_dir.isValid());
@@ -511,7 +688,7 @@ TEST(PendingDisplayBinderTest, XyCurveWaitsForBothHalvesBeforeBinding) {
   PJ::PendingDisplayBinder binder(app_session.catalogModel());
   binder.collect(doc, indexByStateId(plot));
   ASSERT_EQ(binder.size(), 1);
-  // x is already in the catalog, so only the missing half (y) is reported.
+  // x is already in the catalog: only y is reported.
   const QList<SeriesPath> unresolved = binder.unresolved();
   ASSERT_EQ(unresolved.size(), 1);
   EXPECT_EQ(unresolved[0], y_path);
@@ -528,8 +705,6 @@ TEST(PendingDisplayBinderTest, XyCurveWaitsForBothHalvesBeforeBinding) {
   EXPECT_EQ(binder.flush({}), 0);
   EXPECT_EQ(plot.curveList().size(), 1U);
 }
-
-// ---------- strict reject-ambiguity resolver -------------------------------
 
 TEST(ResolveSeriesPathTest, UnqualifiedUniquePathBinds) {
   PJ::AppSession app_session;
@@ -586,10 +761,9 @@ TEST(ResolveSeriesPathTest, IntendedDatasetMissingSeriesNeverStealsSibling) {
       << "the intended dataset exists but lacks the series - never steal dataset A's field";
 }
 
-// FIX B: a data-processor recipe saved from dataset 2 must restore its input onto
-// dataset 2, never dataset 1's same-named field. restoreDataProcessors resolves the
-// input through the same resolveCurveKey that a plotted curve uses, keyed by the
-// saved input_dataset_id/source; this pins the three cases MainWindow relies on.
+// A data-processor recipe saved from dataset 2 restores its input onto dataset 2, never dataset 1's same-named
+// field: restoreDataProcessors resolves the input through the same resolveCurveKey as a plotted curve, keyed by the
+// saved input_dataset_id/source.
 TEST(ResolveSeriesPathTest, ProcessorInputQualifierBindsToItsOwnDataset) {
   PJ::AppSession app_session;
   auto& engine = app_session.sessionManager().dataEngine();
@@ -600,12 +774,11 @@ TEST(ResolveSeriesPathTest, ProcessorInputQualifierBindsToItsOwnDataset) {
   ASSERT_NE(addScalarTopic(app_session, *dataset1, "/imu"), 0U);
   ASSERT_NE(addScalarTopic(app_session, *dataset2, "/imu"), 0U);
 
-  // Recipe saved from dataset 2 restores onto dataset 2 (not dataset 1's /imu).
   const SeriesPath saved_input2{u"/imu"_s, u"value"_s, *dataset2, u"run2.mcap"_s};
   EXPECT_EQ(resolvedDataset(app_session.catalogModel(), saved_input2), *dataset2)
       << "the processor input qualifier must bind dataset 2, not dataset 1's same-topic field";
 
-  // Legacy (qualifiers stripped) with BOTH datasets loaded: ambiguous -> no restore.
+  // Legacy (qualifiers stripped) with both datasets loaded: ambiguous, so no restore.
   const SeriesPath legacy{u"/imu"_s, u"value"_s};
   EXPECT_FALSE(app_session.catalogModel().resolveCurveKey(legacy).has_value())
       << "a legacy unqualified processor input must not first-match onto either dataset";
@@ -616,25 +789,23 @@ TEST(ResolveSeriesPathTest, ProcessorInputLegacyUnqualifiedBindsWhenSingleDatase
   const PJ::DatasetId only = createDataset(app_session);
   ASSERT_NE(addScalarTopic(app_session, only, "/imu"), 0U);
 
-  // With only one dataset present the unqualified input has a unique candidate,
-  // so a legacy layout still restores its filter.
+  // One dataset present: the unqualified input has a unique candidate, so a legacy layout still restores its filter.
   const SeriesPath legacy{u"/imu"_s, u"value"_s};
   EXPECT_EQ(resolvedDataset(app_session.catalogModel(), legacy), only)
       << "an unqualified processor input binds when it is the sole candidate";
 }
 
-// FIX D: a dataset whose source file is deleted from disk after loading must still
-// resolve by its full path. isSamePath()/canonicalFilePath() return empty for a
-// missing file, so both resolveCurveKey's path scan and SessionManager's
-// path_matches now short-circuit on normalized-string equality first.
+// A dataset whose source file is deleted after loading still resolves by its full path: resolveCurveKey's path scan
+// and SessionManager::resolveDatasetIdentity compare through normalizedSourcePath, which resolves a missing file via
+// its folder (canonicalFilePath alone is empty for a missing file).
 TEST(ResolveSeriesPathTest, DeletedSourceFileStillResolvesByPath) {
   QTemporaryDir dir;
   ASSERT_TRUE(dir.isValid());
   PJ::AppSession app_session;
   auto& session = app_session.sessionManager();
   auto& engine = session.dataEngine();
-  // Two same-basename datasets so only the full path disambiguates; the exact id
-  // is deliberately reminted (points at the wrong dataset) to force the path leg.
+  // Two same-basename datasets so only the full path disambiguates; the exact id deliberately names the wrong
+  // dataset to force the path leg.
   const auto reminted_collision = engine.createDataset(PJ::DatasetDescriptor{.source_name = "run.mcap"});
   const auto intended = engine.createDataset(PJ::DatasetDescriptor{.source_name = "run.mcap"});
   ASSERT_TRUE(reminted_collision.has_value());
@@ -647,8 +818,7 @@ TEST(ResolveSeriesPathTest, DeletedSourceFileStillResolvesByPath) {
     ASSERT_TRUE(file.open(QIODevice::WriteOnly));
     file.write("mcap");
   }
-  // Register the path WHILE the file exists (stored as its canonical form), then
-  // delete it — the pre-fix canonical-based comparison would now fail to match.
+  // Register the path while the file exists (stored in its canonical form), then delete it.
   session.setDatasetSourcePath(*intended, intended_path);
   session.setDatasetSourcePath(*reminted_collision, dir.filePath(u"other/run.mcap"_s));
   ASSERT_TRUE(QFile::remove(intended_path));
@@ -662,17 +832,16 @@ TEST(ResolveSeriesPathTest, DeletedSourceFileStillResolvesByPath) {
       << "a deleted-on-disk source must still resolve by its registered full path";
 }
 
-// FIX D, binder path-scan leg: after a fan-out reload the saved raw source label no
-// longer names any dataset, so resolveDatasetIdentity returns nullopt and
-// resolveCurveKey falls to its own physical-path scan. That scan used isSamePath,
-// which fails on a deleted file; the normalized-equality short-circuit rescues it.
+// Path-scan leg: after a fan-out reload the saved raw source label no longer names any dataset, so
+// resolveDatasetIdentity returns nullopt and resolveCurveKey falls to its own physical-path scan, which must also
+// match a deleted file.
 TEST(ResolveSeriesPathTest, DeletedSourceFileResolvesThroughBinderPathScan) {
   QTemporaryDir dir;
   ASSERT_TRUE(dir.isValid());
   PJ::AppSession app_session;
   auto& session = app_session.sessionManager();
   auto& engine = session.dataEngine();
-  // Both datasets carry NEW fan-out labels; the saved label ("old_run.mcap") is gone.
+  // Both datasets carry fan-out labels; the saved label ("old_run.mcap") names neither.
   const auto sibling = engine.createDataset(PJ::DatasetDescriptor{.source_name = "run_0.mcap"});
   const auto intended = engine.createDataset(PJ::DatasetDescriptor{.source_name = "run_1.mcap"});
   ASSERT_TRUE(sibling.has_value());
@@ -692,8 +861,8 @@ TEST(ResolveSeriesPathTest, DeletedSourceFileResolvesThroughBinderPathScan) {
   ASSERT_NE(addScalarTopic(app_session, *sibling, "/speed"), 0U);
   ASSERT_NE(addScalarTopic(app_session, *intended, "/speed"), 0U);
 
-  // id=0 (stripped), source no longer exists -> identity resolver returns nullopt,
-  // exercising resolveCurveKey's own path-scan leg, which must match by path.
+  // id=0 (stripped), source label names no dataset: the identity resolver returns nullopt, so resolveCurveKey's own
+  // path-scan leg must match by path.
   const SeriesPath by_path{u"/speed"_s, u"value"_s, 0, u"old_run.mcap"_s, intended_path};
   EXPECT_EQ(resolvedDataset(app_session.catalogModel(), by_path), *intended)
       << "the binder path scan must match a deleted-on-disk source by normalized-path equality";
@@ -709,9 +878,8 @@ TEST(ResolveSeriesPathTest, RemintedIdFallsBackToUniqueRawSourceIdentity) {
   ASSERT_NE(addScalarTopic(app_session, *reminted_collision, "/speed"), 0U);
   ASSERT_NE(addScalarTopic(app_session, *intended, "/speed"), 0U);
 
-  // The UI label is deliberately unrelated to the raw source identity. The saved
-  // id now names other.mcap (as can happen in a fresh session), so the resolver
-  // must reject that collision and find the single raw-source match.
+  // The UI label is deliberately unrelated to the raw source identity. The saved id names other.mcap (as can happen
+  // in a fresh session), so the resolver must reject that collision and find the single raw-source match.
   app_session.catalogModel().setDatasetDisplayName(*intended, u"Pretty recording"_s);
   const SeriesPath portable{u"/speed"_s, u"value"_s, *reminted_collision, u"logs/drive.mcap"_s};
   EXPECT_EQ(resolvedDataset(app_session.catalogModel(), portable), *intended);
@@ -726,8 +894,8 @@ TEST(ResolveSeriesPathTest, DuplicateRawSourceFallbackIsAmbiguousBeforePathLooku
   ASSERT_TRUE(second.has_value());
   ASSERT_NE(addScalarTopic(app_session, *first, "/speed"), 0U);
 
-  // External XML strips the unvalidated id (id=0); its duplicate source-only
-  // fallback must remain unresolved rather than pick the first named match.
+  // External XML strips the unvalidated id (id=0): the duplicate source-only fallback stays unresolved rather than
+  // picking the first named match.
   const SeriesPath portable{u"/speed"_s, u"value"_s, 0, u"same.mcap"_s};
   EXPECT_FALSE(app_session.catalogModel().resolveCurveKey(portable).has_value());
 }
@@ -800,8 +968,8 @@ TEST(PendingDisplayBinderTest, LateDuplicatePathBindsToSavedDatasetId) {
   ASSERT_TRUE(dataset_b.has_value());
   ASSERT_NE(addScalarTopic(app_session, *dataset_a, "/speed"), 0U);
 
-  // The saved curve names dataset B, which has not materialized /speed yet, so
-  // the entry stays pending instead of stealing dataset A's field.
+  // The saved curve names dataset B, which has not materialized /speed yet: the entry stays pending instead of
+  // stealing dataset A's field.
   const SeriesPath saved{u"/speed"_s, u"value"_s, *dataset_b, u"same.mcap"_s};
   QDomDocument doc;
   QDomElement plot_element = addPlot(doc, u"plot_ts"_s, u"TimeSeries"_s);

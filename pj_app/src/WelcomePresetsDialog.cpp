@@ -33,6 +33,7 @@ constexpr int kThumbnailAllocationLimitMb = 64;
 // The bar's resolution while a download's size is known: a tenth of a percent.
 constexpr int kProgressSteps = 1000;
 constexpr qint64 kBytesPerMb = 1'000'000;
+constexpr QSize kListSize{720, 460};
 
 }  // namespace
 
@@ -43,9 +44,14 @@ WelcomePresetsDialog::WelcomePresetsDialog(QList<PresetEntry> entries, QWidget* 
   ui_->setupUi(body);
   contentLayout()->addWidget(body);
 
-  entry_widgets_.reserve(entries_.size());
-  for (int index = 0; index < entries_.size(); ++index) {
-    addEntryCard(entries_[index], index);
+  for (const PresetEntry& entry : entries_) {
+    if (entry.listed) {
+      listed_.append(entry);
+    }
+  }
+  entry_widgets_.reserve(static_cast<std::size_t>(listed_.size()));
+  for (int index = 0; index < listed_.size(); ++index) {
+    addEntryCard(listed_[index], index);
   }
   ui_->gridPresets->setRowStretch(ui_->gridPresets->rowCount(), 1);  // cards pack at the top
   connect(ui_->buttonCancel, &QPushButton::clicked, this, &WelcomePresetsDialog::cancelRequested);
@@ -57,7 +63,7 @@ WelcomePresetsDialog::WelcomePresetsDialog(QList<PresetEntry> entries, QWidget* 
     close();
     emit uploadRequested();
   });
-  resize(720, 460);
+  resize(kListSize);
   updateControls();
   fetchThumbnails(0);
 }
@@ -79,6 +85,14 @@ void WelcomePresetsDialog::selectPreset(const QString& id) {
   emit presetSelected(id, selected->layout_url);
 }
 
+void WelcomePresetsDialog::openDeepLink(const QString& id) {
+  if (findPreset(entries_, id) == nullptr || !loading_id_.isEmpty()) {
+    return;
+  }
+  load_only_ = true;
+  selectPreset(id);
+}
+
 void WelcomePresetsDialog::showError(const QString& message) {
   retry_id_.clear();
   ui_->labelStatus->setText(message);
@@ -91,6 +105,7 @@ void WelcomePresetsDialog::layoutLoadFinished(const QUrl& url, bool ok, const QS
     return;
   }
   loading_id_.clear();
+  load_only_ = false;
   if (ok || reason == "cancelled"_L1) {
     ui_->labelStatus->clear();
   } else {
@@ -154,7 +169,7 @@ void WelcomePresetsDialog::addEntryCard(const PresetEntry& preset, int index) {
   title->setObjectName(u"labelPresetTitle"_s);
   title->setTextFormat(Qt::PlainText);
   QFont title_font = title->font();
-  title_font.setBold(true);
+  title_font.setWeight(QFont::DemiBold);
   title->setFont(title_font);
   auto* description = new QLabel(preset.description, card);
   description->setObjectName(u"labelPresetDescription"_s);
@@ -180,14 +195,14 @@ void WelcomePresetsDialog::addEntryCard(const PresetEntry& preset, int index) {
 
 void WelcomePresetsDialog::fetchThumbnails(int index) {
   // One at a time: a new download() cancels the one in flight.
-  while (index < entries_.size() && entries_[index].thumbnail_url.isEmpty()) {
+  while (index < listed_.size() && listed_[index].thumbnail_url.isEmpty()) {
     ++index;
   }
-  if (index >= entries_.size()) {
+  if (index >= listed_.size()) {
     return;
   }
   thumbnails_.download(
-      entries_[index].thumbnail_url, [this, index](const QByteArray& bytes, const QUrl&, const QString&) {
+      listed_[index].thumbnail_url, [this, index](const QByteArray& bytes, const QUrl&, const QString&) {
         setThumbnail(index, bytes);  // empty on failure
         fetchThumbnails(index + 1);
       });
@@ -223,6 +238,13 @@ void WelcomePresetsDialog::updateControls() {
   ui_->buttonCancel->setVisible(loading);
   ui_->buttonRetry->setVisible(!retry_id_.isEmpty());
   ui_->labelStatus->setVisible(!ui_->labelStatus->text().isEmpty());
+  const bool list_was_hidden = ui_->scrollPresets->isHidden();
+  ui_->labelIntro->setHidden(load_only_);
+  ui_->scrollPresets->setHidden(load_only_);
+  ui_->buttonUpload->setHidden(load_only_);
+  if (load_only_ != list_was_hidden) {
+    resize(kListSize.width(), load_only_ ? minimumSizeHint().height() : kListSize.height());
+  }
 }
 
 }  // namespace PJ

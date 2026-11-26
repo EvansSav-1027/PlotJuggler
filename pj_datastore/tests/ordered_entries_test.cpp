@@ -1,12 +1,8 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 
-// Focused unit tests for the OrderedEntries value type: they exercise the
-// ordering invariants (timestamp-ascending storage + a uid_order side index that
-// is a strictly-ascending-by-UID permutation) DIRECTLY through the encapsulated
-// API, across in-order and out-of-order pushes, eviction, re-UID, rebuild, shift,
-// and the cross-series bulk ops. The ObjectStore black-box tests cover the same
-// behavior end to end; these pin the invariant at the value-type boundary.
+// OrderedEntries value type, through its own API: entries are stored timestamp-ascending, with a uid_order side
+// index that is a strictly-ascending-by-UID permutation of them.
 
 #include "pj_datastore/ordered_entries.hpp"
 
@@ -23,8 +19,7 @@
 namespace PJ {
 namespace {
 
-// Build an entry at `ts` with a freshly minted (globally increasing) UID, exactly
-// as ObjectStore's push paths do. The payload is left default (irrelevant here).
+// Builds an entry at `ts` with a freshly minted (globally increasing) UID, as ObjectStore's push paths do.
 ObjectEntry makeEntry(Timestamp ts, SequentialUID* out_uid = nullptr) {
   ObjectEntry entry;
   entry.timestamp = ts;
@@ -533,7 +528,34 @@ TEST(OrderedEntriesTest, BulkEvictFrontMovesOnlyTheContentRevision) {
   oe.evictFront(2, removed);
   EXPECT_NE(oe.contentIdentity().content, before.content);
   EXPECT_EQ(oe.contentIdentity().rewrite, before.rewrite);
+  EXPECT_EQ(oe.contentIdentity().removal, before.removal);
   EXPECT_EQ(stamps(oe), (std::vector<Timestamp>{30}));
+}
+
+// A flush only adds entries, under fresh UIDs a cursor walks: it rewrites the time order but removes nothing. A shift
+// or a re-UID changes entries a reader already holds.
+TEST(OrderedEntriesTest, RemovalMovesWhenHeldEntriesChange) {
+  OrderedEntries oe;
+  oe.push(makeEntry(10));
+  oe.push(makeEntry(30));
+  OrderedEntries src;
+  src.push(makeEntry(20));
+  const auto before = oe.contentIdentity();
+  const auto src_before = src.contentIdentity();
+  oe.appendReuidFrom(src);
+  EXPECT_NE(oe.contentIdentity().rewrite, before.rewrite);
+  EXPECT_EQ(oe.contentIdentity().removal, before.removal);
+  EXPECT_NE(src.contentIdentity().removal, src_before.removal) << "the emptied source lost its entries";
+
+  auto previous = oe.contentIdentity();
+  ASSERT_TRUE(oe.shift(5));
+  EXPECT_NE(oe.contentIdentity().removal, previous.removal);
+  previous = oe.contentIdentity();
+  oe.reuidAll();
+  EXPECT_NE(oe.contentIdentity().removal, previous.removal);
+  previous = oe.contentIdentity();
+  oe.clear();
+  EXPECT_NE(oe.contentIdentity().removal, previous.removal);
 }
 
 }  // namespace

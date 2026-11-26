@@ -3,9 +3,9 @@
 # Build a relocatable PlotJuggler 4 AppImage.
 #
 # Bundles the plotjuggler4 shell and its Qt 6 + Conan runtime into a single
-# self-contained AppImage. Unlike PJ3 (system Qt 5), PJ4 links Qt from ./.qt and
-# most external deps from Conan, so linuxdeploy must be pointed at both — that is
-# the bulk of the env setup here.
+# self-contained AppImage. PJ4 links Qt from ./.qt and most external deps from
+# Conan, so linuxdeploy must be pointed at both — that is the bulk of the env
+# setup here.
 #
 # Prerequisites (run these first, they are NOT done here):
 #   ./scripts/install_qt6.sh      # Qt into ./.qt/<ver>/gcc_64
@@ -104,8 +104,8 @@ REGISTRY_URL="https://raw.githubusercontent.com/PlotJuggler/pj-plugin-registry/r
 # packaging/installer/build_windows_installer.ps1 (same set, plus the Linux-only
 # ros2-topic-subscriber and toolbox-assistant-agent: the assistant's CLI
 # backends are POSIX-only, so it ships in the AppImage/.deb but not in the
-# Windows installer). Excluded by request: toolbox-colormap,
-# toolbox-reactive-scripts-editor.
+# Windows installer). It includes every plugin of the browser build
+# (cmake/PjWasmOfficialPlugins.cmake).
 BUNDLE_IDS=(
   csv-loader
   mcap-loader
@@ -125,6 +125,16 @@ BUNDLE_IDS=(
   toolbox-transform-editor
   toolbox-mosaico
   arrow-parser
+  # Also in the browser build (cmake/PjWasmOfficialPlugins.cmake): the desktop
+  # bundles carry every plugin the browser app has.
+  toolbox-fft
+  toolbox-anomaly-detector
+  toolbox-data-exporter
+  influx-parser
+  navmap-parser
+  candump-loader
+  blf-loader
+  mf4-loader
   # LLM assistant (spawns the user's claude/codex CLI; POSIX-only backends,
   # so bundled on Linux only — deliberately absent from the Windows list).
   toolbox-assistant-agent
@@ -171,8 +181,8 @@ done
 
 # Keep -asan BEFORE the architecture: the baked container entrypoint chowns
 # PlotJuggler-*-${PJ_APPIMAGE_ARCH}.AppImage; a trailing -asan would miss that glob
-# and leave the artifact root-owned on the host. For ASan, keep the optional CI
-# hash with the version too; normal artifacts retain their existing hash naming.
+# and leave the artifact root-owned on the host. For ASan, the optional CI hash
+# also goes with the version; normal artifacts keep <version>-<arch>.<hash>.
 if [[ "${PJ_SANITIZE}" == asan ]]; then
   OUTPUT_NAME="PlotJuggler-${VERSION}${COMMIT_HASH:+.${COMMIT_HASH}}${SANITIZE_INFIX}-${ARCH}.AppImage"
 else
@@ -291,17 +301,16 @@ collect_plugins_registry() {
 
   local id url checksum want got zip dest
   for id in "${BUNDLE_IDS[@]}"; do
-    # Resolve this extension's url + checksum for our platform from the registry.
+    # Resolve this extension's url + checksum for our platform from the registry. The registry
+    # keeps older releases of an id for older hosts, so take the newest one that ships our platform.
     read -r url checksum < <(python3 - "${registry_json}" "${id}" "${PLATFORM}" <<'PY'
 import json, sys
 reg, want_id, plat = sys.argv[1], sys.argv[2], sys.argv[3]
 data = json.load(open(reg))
-for ext in data.get("extensions", []):
-    if ext.get("id") == want_id:
-        p = ext.get("platforms", {}).get(plat)
-        if p:
-            print(p.get("url", ""), p.get("checksum", ""))
-        break
+found = [e for e in data.get("extensions", []) if e.get("id") == want_id and plat in e.get("platforms", {})]
+if found:
+    p = max(found, key=lambda e: tuple(int(x) for x in e["version"].split(".")))["platforms"][plat]
+    print(p.get("url", ""), p.get("checksum", ""))
 PY
 )
     [[ -n "${url}" ]] || { echo "ERROR: registry has no '${id}' for ${PLATFORM}"; exit 1; }
@@ -347,6 +356,12 @@ export QMAKE="${QT_DIR}/bin/qmake6"
 export PATH="${QT_DIR}/bin:${PATH}"
 export LD_LIBRARY_PATH="${QT_DIR}/lib:${LD_LIBRARY_PATH:-}"
 
+[[ -f "${QT_DIR}/plugins/platforms/libqwayland.so" ]] || {
+  echo "ERROR: Qt Wayland platform plugin is missing from ${QT_DIR}" >&2
+  exit 1
+}
+export EXTRA_PLATFORM_PLUGINS="${EXTRA_PLATFORM_PLUGINS:+${EXTRA_PLATFORM_PLUGINS};}libqwayland.so"
+
 # ---------------------------------------------------------------------------
 # 5. Deploy, then bundle plugins, then package — in that order.
 #
@@ -374,22 +389,50 @@ fi
   --plugin qt \
   "${SANITIZER_LIBRARY_ARGS[@]}"
 
+deployed_app="${APPDIR}/usr/bin/plotjuggler4"
+
+# Put the build executable back over the copy linuxdeploy deployed (and possibly
+# stripped), keeping the RPATH/RUNPATH linuxdeploy set on it.
+restore_build_executable() {
+  command -v patchelf >/dev/null || {
+    echo "ERROR: patchelf is required to restore the build executable while preserving its deployed RPATH" >&2
+    exit 1
+  }
+  local deployed_rpath
+  deployed_rpath="$(patchelf --print-rpath "${deployed_app}")"
+  local rpath_args=(--set-rpath "${deployed_rpath}")
+  # Preserve DT_RPATH versus DT_RUNPATH semantics as well as the path value.
+  if LC_ALL=C readelf -d "${deployed_app}" | grep -F '(RPATH)' >/dev/null; then
+    rpath_args+=(--force-rpath)
+  fi
+  install -m 0755 "${BUILD}/pj_app/plotjuggler4" "${deployed_app}"
+  patchelf "${rpath_args[@]}" "${deployed_app}"
+  echo "Restored the build executable with the deployed RPATH/RUNPATH: ${deployed_rpath}"
+}
+
+# The Qt deployer follows the platform plugin's ELF dependencies and copies its
+# decoration/shell plugins. Graphics integrations are discovered dynamically, so
+# deploy their dependency closure explicitly, before adding PJ extensions whose
+# external ROS dependencies must remain outside the bundle.
+wayland_src="${QT_DIR}/plugins/wayland-graphics-integration-client"
+wayland_dst="${APPDIR}/usr/plugins/wayland-graphics-integration-client"
+mkdir -p "${wayland_dst}"
+install -m 755 "${wayland_src}"/*.so "${wayland_dst}/"
+"./${LD}" --appdir "${APPDIR}" --deploy-deps-only "${wayland_dst}"
+# Qt only warns when a shell or EGL integration fails to load, so a missing one
+# could still pass the render check: require them here.
+for wayland_plugin in platforms/libqwayland.so wayland-shell-integration/libxdg-shell.so \
+    wayland-graphics-integration-client/libqt-plugin-wayland-egl.so; do
+  [[ -f "${APPDIR}/usr/plugins/${wayland_plugin}" ]] || {
+    echo "ERROR: ${wayland_plugin} was not deployed into the AppDir" >&2
+    exit 1
+  }
+done
+
 if [[ "${PJ_SANITIZE}" == asan ]]; then
-  deployed_app="${APPDIR}/usr/bin/plotjuggler4"
   if ! has_debug_lines "${deployed_app}"; then
-    command -v patchelf >/dev/null || {
-      echo "ERROR: linuxdeploy stripped .debug_line despite NO_STRIP=1; patchelf is required to restore the executable while preserving its deployed RPATH" >&2
-      exit 1
-    }
-    deployed_rpath="$(patchelf --print-rpath "${deployed_app}")"
-    rpath_args=(--set-rpath "${deployed_rpath}")
-    # Preserve DT_RPATH versus DT_RUNPATH semantics as well as the path value.
-    if LC_ALL=C readelf -d "${deployed_app}" | grep -F '(RPATH)' >/dev/null; then
-      rpath_args+=(--force-rpath)
-    fi
-    install -m 0755 "${BUILD}/pj_app/plotjuggler4" "${deployed_app}"
-    patchelf "${rpath_args[@]}" "${deployed_app}"
-    echo "Sanitizers: linuxdeploy stripped .debug_line despite NO_STRIP=1; restored the unstripped build executable and reapplied the deployed RPATH/RUNPATH: ${deployed_rpath}"
+    echo "Sanitizers: linuxdeploy stripped .debug_line despite NO_STRIP=1"
+    restore_build_executable
   fi
   has_debug_lines "${deployed_app}" || {
     echo "ERROR: deployed ${deployed_app} lacks .debug_line; refusing to package an instrumented AppImage without file/line information" >&2
@@ -397,8 +440,7 @@ if [[ "${PJ_SANITIZE}" == asan ]]; then
   }
   echo "Sanitizers: verified .debug_line in deployed usr/bin/plotjuggler4"
 
-  # linuxdeploy-plugin-qt deploys only the platform plugin the app actually used
-  # at deploy time, which is xcb. Running this artifact headlessly
+  # The bundled platform plugins (xcb, wayland) all need a display. Running this artifact headlessly
   # with no display — in CI and on a developer machine where starting an X server
   # is not an option — so add Qt's offscreen platform plugin. Instrumented builds
   # ONLY: the shipped release artifact is deliberately left byte-identical.
@@ -409,6 +451,16 @@ if [[ "${PJ_SANITIZE}" == asan ]]; then
   else
     echo "WARNING: ${offscreen_src} not found; running this artifact will require a display" >&2
   fi
+else
+  # linuxdeploy's strip also drops the symbol table, which leaves crash
+  # backtraces with no names for PlotJuggler's own frames. Ship the executable
+  # with its symbol table and without DWARF (about 1 MB more, compressed).
+  restore_build_executable
+  strip --strip-debug "${deployed_app}"
+  LC_ALL=C readelf -SW "${deployed_app}" | grep -E '[[:space:]]\.symtab[[:space:]]' >/dev/null || {
+    echo "ERROR: deployed ${deployed_app} lacks .symtab" >&2
+    exit 1
+  }
 fi
 
 # Scalable icon next to the 256px raster, so HiDPI docks and app grids render
@@ -416,6 +468,28 @@ fi
 # Icon= key like the PNG.
 install -Dm644 "${ROOT}/resources/svg/plotjuggler.svg" \
   "${APPDIR}/usr/share/icons/hicolor/scalable/apps/plotjuggler4.svg"
+
+# Licences. PlotJuggler's own and the third-party notices the build wrote (cmake/PjNotices.cmake) go to
+# share/doc/plotjuggler4; linuxdeploy has put the copyright files of the distribution libraries it bundled in
+# share/doc/<package>. It looks a library up in dpkg by the path it resolved, which on merged-/usr systems
+# (Ubuntu 22.04: /lib -> usr/lib) misses the packages dpkg lists under /lib, so those are added here.
+# DISTRIBUTION-PACKAGES.txt records each one's exact version: the written source offer covers them.
+DOC_DIR="${APPDIR}/usr/share/doc/plotjuggler4"
+install -Dm644 "${ROOT}/LICENSE" "${DOC_DIR}/LICENSE"
+install -Dm644 "${BUILD}/pj_app/THIRD_PARTY_NOTICES.txt" "${DOC_DIR}/THIRD_PARTY_NOTICES.txt"
+if command -v dpkg-query >/dev/null; then
+  for lib in "${APPDIR}"/usr/lib/*.so*; do
+    [[ -L "${lib}" ]] && continue
+    pkg="$(dpkg -S "*/$(basename "${lib}")" 2>/dev/null | head -n1 | cut -d: -f1)" || true
+    [[ -n "${pkg}" && -f "/usr/share/doc/${pkg}/copyright" && ! -f "${APPDIR}/usr/share/doc/${pkg}/copyright" ]] || continue
+    install -Dm644 "/usr/share/doc/${pkg}/copyright" "${APPDIR}/usr/share/doc/${pkg}/copyright"
+  done
+  for dir in "${APPDIR}"/usr/share/doc/*/; do
+    pkg="$(basename "${dir}")"
+    [[ "${pkg}" == plotjuggler4 ]] && continue
+    dpkg-query -W -f='${binary:Package} ${Version}\n' "${pkg}" 2>/dev/null || echo "${pkg} (version not recorded)"
+  done > "${DOC_DIR}/DISTRIBUTION-PACKAGES.txt"
+fi
 
 # Registry first, local folder second, so a local plugin overrides a registry
 # one with the same id.
@@ -426,7 +500,7 @@ if [[ "${PLUGINS_FROM_REGISTRY}" == 0 && -z "${PLUGINS_LOCAL_DIR}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5a-bis. Plugin-admission helper.
+# 5a. Plugin-admission helper.
 #     The marketplace runs the first dlopen of a downloaded plugin inside
 #     pj-plugin-check instead of the application process. ExtensionManager fails
 #     closed when the helper cannot be started, so a bundle without it rejects

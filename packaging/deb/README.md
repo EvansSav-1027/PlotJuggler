@@ -46,7 +46,9 @@ jammy container the release build runs in.
                                 plotjuggler/plugins/<id>/ (bundled extensions)
 /opt/plotjuggler4/plugins/      Qt platform + imageformat plugins
 /opt/plotjuggler4/translations/ Qt translations
-/opt/plotjuggler4/share/doc/    licenses of the bundled libraries
+/opt/plotjuggler4/share/doc/    plotjuggler4/: LICENSE, THIRD_PARTY_NOTICES.txt,
+                                DISTRIBUTION-PACKAGES.txt; <package>/copyright of
+                                the bundled distribution libraries
 /usr/bin/plotjuggler4           launcher (packaging/deb/plotjuggler4.wrapper.in)
 /usr/share/applications/        desktop entry
 /usr/share/icons/hicolor/…      icons (256px PNG + scalable SVG)
@@ -61,7 +63,7 @@ uninstall keep working against a root-owned, read-only `/opt`.
 linuxdeploy fills `AppDir/usr/share/doc/<distro-pkg>/` with the copyright file
 of every bundled system library; inside an AppImage those paths are private, but
 in a `.deb` they would collide with the real `libglib2.0-0t64`,
-`libkrb5support0` and ~36 other packages. They stay under `/opt`.
+`libkrb5support0` and dozens of other packages. They stay under `/opt`.
 
 ## Bundled plugins (seeding)
 
@@ -122,11 +124,11 @@ every shipped ELF *before* Xvfb is installed, so the linkable closure is proven
 against the declared `Depends` alone (Xvfb pulls X11 libraries that would
 otherwise mask a missing GUI dependency); runs `--selftest-python`
 (display-free, and proves the wrapper's `PYTHONHOME` reaches the bundled
-stdlib); and finally a real GUI startup under Xvfb — the bundled Qt ships only
-the `xcb` platform plugin, so an X server is required, and this phase is what
-covers `dlopen`'d libraries that `ldd` cannot see. Last, the render check
-(`packaging/smoke/render_check.sh`, see [`packaging/README.md`](../README.md#render-check))
-proves the plots, the Scene3D view and the media viewer draw through QRhi.
+stdlib); then a real GUI startup under Xvfb covers `dlopen`'d libraries that
+`ldd` cannot see. Render checks prove the plots, Scene3D and media viewer draw
+through QRhi on X11 and native Wayland (headless Weston with `DISPLAY` unset).
+Both Qt platform plugins ship in the package; `libwayland-client0` is a declared
+runtime dependency. See [`packaging/README.md`](../README.md#render-check).
 
 Release CI runs it on `ubuntu:22.04` and `ubuntu:24.04`, and the `.deb` is
 attached to a GitHub Release only after it passes. The same container then

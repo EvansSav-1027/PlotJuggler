@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { brotliDecompressSync, gunzipSync } from 'node:zlib';
 
-import { CONTENT_TYPES, packageWasm } from '../../scripts/package_wasm.mjs';
+import { CONTENT_TYPES, packageWasm, validatePresetCatalog } from '../../scripts/package_wasm.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -135,6 +135,56 @@ test('packages the third-party notices precompressed, and refuses a build withou
   );
 });
 
+// The module names the stdlib it downloads (python_sandbox.cpp): a build with Python has both.
+const PYTHON_JS = 'var PThread = { unusedWorkers: [] }; const memory = {"shared": true}; locateFile("python_stdlib.zip");\n';
+
+test('packages the Python stdlib in the bundle when the build has it, outside the startup budget', async t => {
+  const { root, source } = await fixture(t);
+  const without = await packageWasm({ source, output: path.join(root, 'without'), version: 'test' });
+  assert.ok(!without.files.some(file => file.path.endsWith('/python_stdlib.zip')));
+
+  const stdlib = Buffer.alloc(4096, 'pyc');
+  await writeFile(path.join(source, 'plotjuggler4.js'), PYTHON_JS);
+  await writeFile(path.join(source, 'python_stdlib.zip'), stdlib);
+  const output = path.join(root, 'with');
+  const manifest = await packageWasm({ source, output, version: 'test' });
+  // In the content-addressed bundle, beside the module whose worker fetches it by that relative name.
+  assert.notEqual(manifest.bundleId, without.bundleId);
+  const zip = manifest.files.find(file => file.path === `assets/${manifest.bundleId}/python_stdlib.zip`);
+  assert.ok(zip, 'the stdlib is packaged');
+  assert.equal(zip.contentType, 'application/zip');
+  assert.equal(zip.cache, 'immutable');
+  assert.ok(zip.representations.br, 'the stdlib is precompressed');
+  assert.deepEqual(await readFile(path.join(output, zip.path)), stdlib);
+
+  const budget = async manifestPath => (await execFileAsync(
+    process.execPath, [path.join(ROOT, 'scripts', 'wasm_size_budget.mjs'), manifestPath, '1000000000'])).stdout;
+  const startup = async manifestPath => Number((await budget(manifestPath)).match(/download: (\d+) B/)[1]);
+  const js = file => file.path.endsWith('/plotjuggler4.js');
+  const jsBytes = m => (m.files.find(js).representations.br ?? m.files.find(js).representations.identity).bytes;
+  assert.equal(
+    await startup(path.join(output, 'manifest.json')) - jsBytes(manifest),
+    await startup(path.join(root, 'without', 'manifest.json')) - jsBytes(without),
+    'the stdlib is not part of the startup download',
+  );
+});
+
+test('refuses a module that downloads the stdlib without it, and a stdlib no module downloads', async t => {
+  const missing = await fixture(t);
+  await writeFile(path.join(missing.source, 'plotjuggler4.js'), PYTHON_JS);
+  await assert.rejects(
+    packageWasm({ source: missing.source, output: path.join(missing.root, 'out'), version: 'test' }),
+    /downloads python_stdlib\.zip, which the build does not have/,
+  );
+
+  const stray = await fixture(t);
+  await writeFile(path.join(stray.source, 'python_stdlib.zip'), Buffer.alloc(16));
+  await assert.rejects(
+    packageWasm({ source: stray.source, output: path.join(stray.root, 'out'), version: 'test' }),
+    /python_stdlib\.zip is left over from another build: plotjuggler4\.js does not download it/,
+  );
+});
+
 test('serves the notices at a stable root URL, revalidated, beside the immutable copy', async t => {
   const { root, source } = await fixture(t);
   const output = path.join(root, 'stable');
@@ -224,8 +274,8 @@ test('the robot Caddyfile repeats every deployable type and forwards to the stoc
   assert.match(caddyfile, /reverse_proxy \{\$PJ_BRIDGE_UPSTREAM:127\.0\.0\.1:9090\}/);
 });
 
-// A preset tree shaped like resources/wasm-presets: nested folders, data, a
-// model package with an extensionless license, and the index beside them. The
+// A preset tree with nested folders, data, a model package with an
+// extensionless license, and the index beside them. The
 // large files are over the size floor below which nothing is precompressed.
 const MCAP_MAGIC = Buffer.from([0x89, 0x4d, 0x43, 0x41, 0x50, 0x30, 0x0d, 0x0a]);
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -411,6 +461,7 @@ test('a preset index must list only deployed files', async t => {
     ['a numeric layout', { 'index.json': index([{ ...fr3, layout: 7 }]) }, /#1 has a field that is not a string/],
     ['a boolean thumbnail', { 'index.json': index([{ ...fr3, thumbnail: true }]) },
       /#1 has a field that is not a string/],
+    ['a string listed', { 'index.json': index([{ ...fr3, listed: 'no' }]) }, /#1 has a listed that is not true or false/],
     ['an entry that is not an object', { 'index.json': index([fr3, 'nav']) }, /#2 is not an object/],
     ['a null entry', { 'index.json': index([null]) }, /#1 is not an object/],
   ];
@@ -432,6 +483,17 @@ test('a preset index must list only deployed files', async t => {
   });
   const manifest = await packageWasm({ source, output: path.join(root, 'deploy-remote'), version: 'test', presets });
   assert.ok(manifest.files.some(file => file.path === 'presets/index.json'));
+});
+
+test('a catalog with no file beside it: absolute references, an empty thumbnail, errors that name no tree', () => {
+  const entry = { id: 'a', title: 'A', layout: 'https://assets.example/a.pj4.xml' };
+  // An empty thumbnail is none, as null is.
+  for (const thumbnail of [undefined, null, '', 'https://assets.example/a.png']) {
+    validatePresetCatalog({ presets: [{ ...entry, thumbnail }] }, []);
+  }
+  assert.throws(() => validatePresetCatalog({ presets: [{ ...entry, layout: 'a.xml' }] }, []),
+    error => /"a\.xml"/.test(error.message) && !/tree/.test(error.message));
+  assert.throws(() => validatePresetCatalog({ presets: {} }, []), /presets array/);
 });
 
 test('packaging remains deterministic', async t => {

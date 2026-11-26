@@ -5,6 +5,7 @@
 
 #include <QByteArrayView>
 #include <QCryptographicHash>
+#include <fstream>
 #include <limits>
 #include <mcap/reader.hpp>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "pj_marketplace/utf8_path.hpp"
 #include "pj_runtime/DataSourceRuntimeHost.h"
 #include "pj_runtime/McapRecordingWriter.h"
 #include "pj_runtime/Recorder.h"
@@ -49,11 +51,21 @@ std::string sourceCacheIdentityDigest(std::string_view provider_id, std::string_
 
 namespace {
 
-/// Coverage ledger shared between the counting tap (push threads) and
-/// finalize (owner thread, after producers quiesced). Keyed by binding id so
-/// the per-message path is an integer hash increment — the topic string is
-/// captured once, on the binding's first message (binding ids are stable per
-/// host, the same fact the recorder's channel table relies on).
+/// Opens `path` for `reader` through `stream`, which must outlive the reader's use of it.
+/// Not reader.open(path.string()): mcap's filename overload calls std::fopen on a narrow
+/// string, which on Windows goes through the active code page and cannot name every file.
+mcap::Status openMcap(mcap::McapReader& reader, std::ifstream& stream, const fs::path& path) {
+  stream.open(path, std::ios::binary);
+  if (!stream) {
+    return mcap::Status{mcap::StatusCode::OpenFailed, "failed to open \"" + pathToUtf8(path) + "\""};
+  }
+  return reader.open(stream);
+}
+
+/// Coverage ledger shared between the counting tap (push threads) and finalize (owner thread, after producers
+/// quiesced). Keyed by binding id so the per-message path is an integer hash increment; the topic string is captured
+/// once, on the binding's first message (binding ids are stable per host, the fact the recorder's channel table also
+/// relies on).
 struct CaptureLedger {
   std::mutex mu;
   std::unordered_map<uint32_t, uint64_t> messages_by_binding;
@@ -72,9 +84,8 @@ struct CaptureLedger {
   }
 };
 
-/// Counts coverage, then forwards to the recorder's tap. Counting first means
-/// a message the recorder later fails on is still "seen" — the recorder's own
-/// truncation verdict vetoes publication anyway.
+/// Counts coverage, then forwards to the recorder's tap. Counting first means a message the recorder later fails on is
+/// still "seen"; the recorder's own truncation verdict vetoes publication anyway.
 class CountingTap final : public RecordTap {
  public:
   CountingTap(std::shared_ptr<CaptureLedger> ledger, std::shared_ptr<RecordTap> inner)
@@ -287,7 +298,6 @@ SourceCaptureService::FinalizeResult SourceCaptureService::finalize(
   std::lock_guard<std::mutex> lock(impl->mu);
   impl->finalized = true;
 
-  // ---- the publication gate ------------------------------------------------
   auto refuse = [&](std::string why) {
     result.reason = std::move(why);
     impl->disarmLocked();
@@ -362,7 +372,6 @@ SourceCaptureService::FinalizeResult SourceCaptureService::finalize(
     }
   }
 
-  // ---- finalize the file with the manifest inside --------------------------
   impl->recorder->setExtraMetadata(std::string(kCaptureMetadataName), manifestJson(manifest));
   const RecordingSummary summary = impl->recorder->stop(std::string(kTerminalCauseStopped));
   if (summary.truncated) {
@@ -378,7 +387,6 @@ SourceCaptureService::FinalizeResult SourceCaptureService::finalize(
     return refuse("the recorder wrote fewer messages than the capture observed");
   }
 
-  // ---- publish -------------------------------------------------------------
   auto published = store_.publish(impl->identity, std::move(*impl->txn));
   impl->txn.reset();
   impl->recorder.reset();
@@ -403,8 +411,8 @@ std::optional<SourceCaptureService::Resolved> SourceCaptureService::resolve(
     return std::nullopt;
   }
 
-  // Every quarantine below is a verification failure of OUR pinned artifact —
-  // an absent-style miss (provider fallback is the heal), never contended.
+  // Every quarantine below is a verification failure of OUR pinned artifact: an absent-style miss (provider fallback is
+  // the heal), never contended.
   auto quarantine = [&](const std::string& why) {
     pinned.reset();  // release our pin before quarantining
     std::string refusal;
@@ -426,16 +434,15 @@ std::optional<SourceCaptureService::Resolved> SourceCaptureService::resolve(
     return quarantine("manifest provider mismatch");
   }
 
-  // Strict completeness: the file's own statistics must agree with the
-  // manifest, channel by channel — a partially recovered or tampered
-  // artifact must never become a transparent hit. The verdict is computed in
-  // the reader's own scope and quarantine runs strictly AFTER it: the open
-  // McapReader handle would block the quarantine rename on Windows (a
+  // Strict completeness: the file's own statistics must agree with the manifest, channel by channel, so a partially
+  // recovered or tampered artifact never becomes a transparent hit. The verdict is computed in the reader's own scope
+  // and quarantine runs strictly AFTER it: the open McapReader handle would block the quarantine rename on Windows (a
   // sharing violation Linux does not surface).
   std::string mismatch;
   {
+    std::ifstream stream;  // declared first: outlives the reader that reads through it
     mcap::McapReader reader;
-    if (const auto opened = reader.open(pinned->path.string()); !opened.ok()) {
+    if (const auto opened = openMcap(reader, stream, pinned->path); !opened.ok()) {
       mismatch = "artifact unreadable: " + opened.message;
     } else if (const auto summary = reader.readSummary(mcap::ReadSummaryMethod::AllowFallbackScan); !summary.ok()) {
       mismatch = "artifact summary unreadable: " + summary.message;
@@ -474,8 +481,9 @@ std::optional<SourceCaptureService::Resolved> SourceCaptureService::resolve(
 }
 
 Expected<CaptureManifest> SourceCaptureService::readManifest(const std::filesystem::path& artifact) {
+  std::ifstream stream;  // declared first: outlives the reader that reads through it
   mcap::McapReader reader;
-  if (const auto opened = reader.open(artifact.string()); !opened.ok()) {
+  if (const auto opened = openMcap(reader, stream, artifact); !opened.ok()) {
     return unexpected("cannot open the artifact: " + opened.message);
   }
   if (const auto summary = reader.readSummary(mcap::ReadSummaryMethod::AllowFallbackScan); !summary.ok()) {

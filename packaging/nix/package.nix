@@ -14,7 +14,6 @@
   robin-map,
   glm,
   nlohmann_json,
-  kissfft,
   python312,
   python312Packages,
   fast-float,
@@ -43,7 +42,7 @@ let
   );
   dependencies = callPackage ./dependencies.nix { };
   sdkVersion = builtins.head (
-    builtins.match ".*\nplotjuggler_sdk/([0-9.]+)\n.*" (builtins.readFile ../../conanfile.txt)
+    builtins.match ".*\nplotjuggler_sdk/([0-9][0-9A-Za-z.-]*)\n.*" (builtins.readFile ../../conanfile.txt)
   );
   sdkArchive = fetchurl {
     url = "https://github.com/PlotJuggler/plotjuggler_sdk/archive/refs/tags/v${sdkVersion}.tar.gz";
@@ -56,6 +55,19 @@ let
   sdkSource = runCommand "plotjuggler-sdk-${sdkVersion}-source" { } ''
     mkdir "$out"
     tar -xf ${sdkArchive} --strip-components=1 -C "$out"
+  '';
+  # Nixpkgs' nanoarrow (0.8, Meson) has no CMake package and no IPC: PJ's own CMake
+  # falls back to building its pinned source, served from the Nix store the same way.
+  nanoarrowPin = builtins.match ".*\n +URL (https://[^\n]+)\n +URL_HASH SHA256=([0-9a-f]+)[)].*" (
+    builtins.readFile ../../pj_datastore/cmake/PjNanoarrow.cmake
+  );
+  nanoarrowArchive = fetchurl {
+    url = builtins.elemAt nanoarrowPin 0;
+    sha256 = builtins.elemAt nanoarrowPin 1;
+  };
+  nanoarrowSource = runCommand "nanoarrow-source" { } ''
+    mkdir "$out"
+    tar -xf ${nanoarrowArchive} --strip-components=1 -C "$out"
   '';
 in
 assert lib.assertMsg (
@@ -82,10 +94,6 @@ stdenv.mkDerivation {
     robin-map
     glm
     nlohmann_json
-    (kissfft.override {
-      datatype = "float";
-      enableStatic = true;
-    })
     python312
     python312Packages.pybind11
     fast-float
@@ -98,14 +106,14 @@ stdenv.mkDerivation {
     elfutils
     libGL
     dependencies.luau
-    dependencies.nanoarrow
     dependencies.cloudini
     dependencies.mcap
+    dependencies.pocketfft
     dependencies.ffmpeg
   ];
 
   cmakeFlags = [
-    # kissfft's installed config still declares a pre-3.5 CMake policy version.
+    # Some dependency configs still declare a pre-3.5 CMake policy version.
     "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
     "-DPJ_BUILD_TESTS=OFF"
     "-DPJ_BUILD_DEMOS=OFF"
@@ -113,24 +121,17 @@ stdenv.mkDerivation {
     "-DPJ_DEBUG_INFO=none"
     "-DPJ_SDK_FORCE_SOURCE=ON"
     "-DFETCHCONTENT_SOURCE_DIR_PLOTJUGGLER_SDK=${sdkSource}"
+    "-DFETCHCONTENT_SOURCE_DIR_NANOARROW=${nanoarrowSource}"
     "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"
     "-DPJ_SYSTEM_QWT=ON"
     "-DPython_EXECUTABLE=${python312}/bin/python3"
+    # The install phase installs what the build phase built (pj_app), not `all`.
+    "-DCMAKE_SKIP_INSTALL_ALL_DEPENDENCY=ON"
   ];
+  # The default install phase runs the app's install rules: plotjuggler4 and
+  # the pj-plugin-check helper it looks up beside itself in bin/, the desktop
+  # entry and the icons.
   ninjaFlags = [ "pj_app" ];
-
-  # PJ4's other packagers stage these two binaries directly; there is no app
-  # install target. Keep the admission helper beside the executable for lookup.
-  installPhase = ''
-    runHook preInstall
-    install -Dm755 pj_app/plotjuggler4 "$out/bin/plotjuggler4"
-    install -Dm755 pj_app/pj-plugin-check "$out/bin/pj-plugin-check"
-    install -Dm644 ../packaging/appimage/plotjuggler4.desktop \
-      "$out/share/applications/plotjuggler4.desktop"
-    install -Dm644 ../resources/svg/plotjuggler.svg \
-      "$out/share/icons/hicolor/scalable/apps/plotjuggler4.svg"
-    runHook postInstall
-  '';
   qtWrapperArgs = [
     "--unset"
     "QT_IM_MODULE"

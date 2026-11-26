@@ -61,21 +61,17 @@ AppSession::AppSession(QString extensions_dir, DiagnosticSink sink, StaticPlugin
   // A transform replay that fails after its create returned reports here, the
   // same notifications the create error itself would have reached.
   session_manager_->dataProcessorService().setDiagnosticSink(sink);
-  // Forget remembered curve colors whenever the catalog empties (data cleared
-  // or replaced), matching PJ3's per-PlotData COLOR_HINT lifetime so reopening
-  // fresh data restarts palette rotation from the first color. The registry is
-  // owned by SessionManager; AppSession just wires its session-scoped clear.
-  // Collapse the transport to the empty state on a full clear: stop playback and
-  // reset the range/cursor (resetPlaybackToEmpty also re-arms the first-seed
-  // snap, so the next load starts fresh — range AND playhead snap to new data).
+  // Forget remembered curve colors whenever the catalog empties (data cleared or replaced), so fresh data restarts
+  // palette rotation; the registry is SessionManager's, AppSession wires the session-scoped clear. Also collapse the
+  // transport to the empty state: resetPlaybackToEmpty re-arms the first-seed snap, so the next load snaps range AND
+  // playhead to the new data.
   QObject::connect(catalog_model_.get(), &CatalogModel::cleared, this, [this]() {
     session_manager_->curveColorRegistry().clear();
     resetPlaybackToEmpty();
   });
-  // Marker generators read their inputs through the catalog. This is session state,
-  // not panel state: a layout restores generators before any toolbox exists. A key
-  // names a series the way the producer and the overlay do (markerSeriesKey), so a
-  // generator yields the same markers in the GUI and headless.
+  // Marker generators read their inputs through the catalog: session state, not panel state (a layout restores
+  // generators before any toolbox exists). A key names a series the way the producer and the overlay do
+  // (markerSeriesKey), so a generator yields the same markers in the GUI and headless.
   BatchEngine& batch_engine = session_manager_->batchEngine();
   // A marker rule's scheduled run that fails reaches the same notifications.
   batch_engine.setDiagnosticSink(std::move(sink));
@@ -114,7 +110,7 @@ AppSession::AppSession(QString extensions_dir, DiagnosticSink sink, StaticPlugin
       topic_demand_tracker_.get(), &TopicDemandTracker::activeTopicsChanged, &batch_engine,
       &BatchEngine::demandChanged);
 
-  // On-demand recipes (docs/derived_objects/ARCHITECTURE.md §8) read scalar series, strings included (D4), through the
+  // On-demand recipes read scalar series, strings included, through the
   // catalog, follow the playhead while something displays one of their outputs, and are requested where the cursor is
   // parked when they are installed or become displayed; a finding, at its pin, once per install. Connected before the
   // scene docks' own slots, so a request precedes the docks' read of the same tick.
@@ -153,6 +149,21 @@ AppSession::AppSession(QString extensions_dir, DiagnosticSink sink, StaticPlugin
         service.restartLiveEdge(dataset);
       }
     }
+  });
+  // A nested refill starts over partial data: only the first one's extent is what the timeline showed.
+  QObject::connect(session_manager_.get(), &SessionManager::refillStarting, this, [this](DatasetId dataset) {
+    if (session_manager_->refillOpen(dataset)) {
+      return;
+    }
+    if (const auto range = datasetRawTimeRange(dataset)) {
+      refill_held_raw_ranges_[dataset] = *range;
+    } else {
+      refill_held_raw_ranges_.erase(dataset);
+    }
+  });
+  QObject::connect(session_manager_.get(), &SessionManager::refillClosed, this, [this](DatasetId dataset) {
+    refill_held_raw_ranges_.erase(dataset);
+    recomputeRange();
   });
   // An offset change at a parked playhead moves the raw time the demanded recipes are requested at.
   QObject::connect(
@@ -254,13 +265,9 @@ void AppSession::forEachVisibleRawRange(
   const DataReader reader = session_manager_->createReader();
   const ObjectStore& object_store = session_manager_->objectStore();
 
-  // Bounds come from the CATALOG-VISIBLE items at per-topic granularity: the
-  // engine retains removed/trashed topics' data (append-only tombstones), and
-  // a hidden topic must not stretch the timeline even while sibling topics
-  // keep its dataset visible.
-  //
-  // Multi-field topics surface one catalog item per field; bound each
-  // underlying topic once.
+  // Bounds come from the CATALOG-VISIBLE items per topic: the engine retains removed/trashed topics' data (append-only
+  // tombstones), and a hidden topic must not stretch the timeline even while sibling topics keep its dataset visible.
+  // Multi-field topics surface one catalog item per field; each underlying topic is bounded once.
   std::unordered_set<TopicId> seen_topics;
   std::unordered_set<uint32_t> seen_object_topics;
   std::unordered_map<DatasetId, bool> static_references;
@@ -303,8 +310,7 @@ void AppSession::forEachVisibleRawRange(
 }
 
 std::optional<PJ::Range<PJ::Timestamp>> AppSession::datasetRawTimeRange(DatasetId dataset_id) const {
-  // RAW (pre-offset) union over THIS dataset's catalog-visible topics. The
-  // caller applies the display offset; the Timeline bars want raw bounds.
+  // RAW (pre-offset) union over THIS dataset's catalog-visible topics; the caller applies the display offset.
   std::optional<Timestamp> raw_min;
   std::optional<Timestamp> raw_max;
   forEachVisibleRawRange([&](DatasetId item_dataset, Timestamp topic_min, Timestamp topic_max) {
@@ -321,40 +327,47 @@ std::optional<PJ::Range<PJ::Timestamp>> AppSession::datasetRawTimeRange(DatasetI
 }
 
 std::optional<DisplaySeconds> AppSession::recomputeRange() {
-  // While actively following a live stream (streaming + playing), scope the range to
-  // that dataset's tip ONLY — exactly as the live-ingest path does. Unioning in
-  // far-away file datasets would push range_max past the live edge; the cursor is
-  // pinned to range_max (onTick), so that would jolt the handle/needle off the tip and
-  // back (the jitter). When paused, fall through to the full union so the user can
-  // scrub/align against ALL loaded data.
+  // While following a live stream (streaming + playing), scope the range to that dataset's tip ONLY, as the live-ingest
+  // path does: unioning in far-away file datasets would push range_max past the live edge and, the cursor being pinned
+  // to range_max (onTick), jolt the needle off the tip and back. When paused, fall through to the full union so the
+  // user can scrub against ALL loaded data.
   if (active_streaming_dataset_id_ != 0 && playback_engine_->isPlaying()) {
     if (const auto range = session_manager_->datasetDisplayRange(active_streaming_dataset_id_); range.has_value()) {
       playback_engine_->setRange(*range);
       return range->min;
     }
-    // Live-follow that hasn't produced its first sample yet: leave the transport
-    // alone rather than collapsing a running stream to the empty state below.
+    // Live-follow without a first sample yet: leave the transport alone rather than collapse a running stream to the
+    // empty state below.
     return std::nullopt;
   }
-  // Union the bounds in DISPLAY-relative seconds, converting each item with
-  // its dataset's OWN offset, so the playback axis matches what the plots
-  // render (display_time = raw_time - offset) rather than the absolute epoch.
-  // Range only — never currentTime, never playback_seeded_ — for the live
-  // Timeline drag path. setRange re-clamps the playhead; an in-range scrub
-  // position is preserved.
+  // Union the bounds in DISPLAY-relative seconds, each item converted with its own dataset's offset, so the axis
+  // matches what the plots render (display_time = raw_time - offset). Range only: never currentTime or
+  // seeded_datasets_. setRange re-clamps the playhead; an in-range scrub position survives.
   std::optional<DisplaySeconds> new_min;
   std::optional<DisplaySeconds> new_max;
   forEachVisibleRawRange([&](DatasetId dataset_id, Timestamp raw_min, Timestamp raw_max) {
     const DisplayOffset offset = session_manager_->displayOffset(dataset_id);
-    const DisplaySeconds ds_min = rawToDisplaySeconds(raw_min, offset);
-    const DisplaySeconds ds_max = rawToDisplaySeconds(raw_max, offset);
+    const DisplaySeconds ds_min = rawToDisplaySecondsAtOrAfter(raw_min, offset);
+    const DisplaySeconds ds_max = rawToDisplaySecondsAtOrAfter(raw_max, offset);
     new_min = new_min ? std::min(*new_min, ds_min) : ds_min;
     new_max = new_max ? std::max(*new_max, ds_max) : ds_max;
   });
+  // A reloading dataset is empty until its refill closes: without its held extent the range would shrink to the other
+  // datasets and clamp the playhead there for good. One removed or merged away meanwhile no longer counts.
+  const std::vector<DatasetId> shown = catalog_model_->datasetIds();
+  for (const auto& [dataset_id, raw] : refill_held_raw_ranges_) {
+    if (!session_manager_->refillOpen(dataset_id) || std::find(shown.begin(), shown.end(), dataset_id) == shown.end()) {
+      continue;
+    }
+    const DisplayOffset offset = session_manager_->displayOffset(dataset_id);
+    const DisplaySeconds ds_min = rawToDisplaySecondsAtOrAfter(raw.min, offset);
+    const DisplaySeconds ds_max = rawToDisplaySecondsAtOrAfter(raw.max, offset);
+    new_min = new_min ? std::min(*new_min, ds_min) : ds_min;
+    new_max = new_max ? std::max(*new_max, ds_max) : ds_max;
+  }
   if (!new_min) {
-    // Static references alone have no transport. Otherwise preserve the range
-    // across a transient empty while a replacing reload detaches its chunks,
-    // so playback does not pause or flicker mid-load.
+    // Static references alone have no transport. Otherwise keep the range across a transient empty while a replacing
+    // reload detaches its chunks, so playback does not pause or flicker mid-load.
     const auto items = catalog_model_->items();
     const bool only_references =
         !items.empty() && std::all_of(items.begin(), items.end(), [&](const CatalogItem& item) {
@@ -376,7 +389,7 @@ void AppSession::resetPlaybackToEmpty() {
   playback_engine_->pause();
   playback_engine_->setHoldAtRangeMax(false);
   playback_engine_->setRangeAndCurrentTime(DisplayRange{DisplaySeconds{0.0}, DisplaySeconds{0.0}}, DisplaySeconds{0.0});
-  playback_seeded_ = false;
+  seeded_datasets_.clear();
 }
 
 std::optional<AppSession::MergePlan> AppSession::planMerge(const std::vector<DatasetId>& selected) const {
@@ -384,9 +397,8 @@ std::optional<AppSession::MergePlan> AppSession::planMerge(const std::vector<Dat
     return std::nullopt;
   }
 
-  // Anchor = the dataset whose DISPLAYED start is earliest (leftmost on the
-  // timeline): min(raw_min - displayOffset). Datasets with no time-bearing data
-  // can't be positioned, so they're ignored for the anchor choice.
+  // Anchor = the dataset whose DISPLAYED start is earliest: min(raw_min - displayOffset). Datasets without
+  // time-bearing data cannot be positioned and are ignored.
   std::optional<DatasetId> anchor;
   std::optional<DisplaySeconds> anchor_display_min;
   for (const DatasetId id : selected) {
@@ -394,8 +406,7 @@ std::optional<AppSession::MergePlan> AppSession::planMerge(const std::vector<Dat
     if (!raw.has_value()) {
       continue;
     }
-    // Compare displayed starts through the canonical display seam (raw - offset),
-    // matching recomputeRange rather than hand-subtracting bare ns.
+    // Compared through the display seam (raw - offset), matching recomputeRange.
     const DisplaySeconds display_min = rawToDisplaySeconds(raw->min, session_manager_->displayOffset(id));
     if (!anchor.has_value() || display_min < *anchor_display_min) {
       anchor = id;
@@ -406,10 +417,9 @@ std::optional<AppSession::MergePlan> AppSession::planMerge(const std::vector<Dat
     return std::nullopt;  // none of the selected datasets carry data
   }
 
-  // Every other selected dataset shifts into the anchor's raw frame by the
-  // relative display offset, so it lands where the user arranged it while the
-  // merged dataset keeps the anchor's absolute clock. The shift is a Duration
-  // difference of the two offsets; lower it to int64 ns only at the engine seam.
+  // Every other selected dataset shifts into the anchor's raw frame by the relative display offset, so it lands where
+  // the user arranged it while the merged dataset keeps the anchor's absolute clock. The shift is a Duration
+  // difference of the two offsets, lowered to int64 ns only at the engine seam.
   const Duration anchor_offset = session_manager_->displayOffset(*anchor).value;
   std::vector<DatasetMergeSource> sources;
   for (const DatasetId id : selected) {
@@ -434,17 +444,16 @@ std::vector<ObjectMergeConflict> AppSession::objectMergeConflicts(const std::vec
   }
 
   const ObjectStore& object_store = session_manager_->objectStore();
-  // Mirror ObjectStore::mergeDatasets' grouping so the gate catches EVERY type clash, not just
-  // source-vs-anchor: the established type for a name is the anchor's, or — when the anchor lacks it —
-  // the FIRST source (in plan order) to contribute that name, which becomes the fuse destination. A
-  // later contributor with the same name but a different canonical type is the conflict, whether it
-  // disagrees with the anchor or with an earlier source-only contributor. The payload format must
-  // match as well: the fused entries are all decoded by the destination topic's parser.
+  // Mirror ObjectStore::mergeDatasets' grouping so the gate catches EVERY type clash: the established type for a name
+  // is the anchor's or, when the anchor lacks it, the FIRST source (in plan order) contributing it, which becomes the
+  // fuse destination. A later contributor with a different canonical type conflicts, whether with the anchor or an
+  // earlier source-only contributor. The payload format must match too: the destination topic's parser decodes every
+  // fused entry.
   struct Kind {
     sdk::BuiltinObjectType type{};
     std::string format;
-    // Merged marker sets keep the anchor's description, so it must match too (the
-    // description only: direct writes may carry custom metadata fields).
+    // Merged marker sets keep the anchor's description, so it must match too (the description only: direct writes may
+    // carry custom metadata fields).
     std::optional<MarkerTopicInfo> marker;
   };
   const auto kindOf = [](const ObjectTopicDescriptor& descriptor) {
@@ -500,26 +509,21 @@ DatasetId AppSession::mergeDatasets(const std::vector<DatasetId>& selected) {
     return 0;
   }
 
-  // Engine mutation + adapter invalidation + re-index live in SessionManager.
-  // nullopt means the engine rejected the merge and left the store untouched —
-  // bail BEFORE mutating the catalog, or the sources would vanish from the UI
-  // while their data still lives in the store (catalog/store desync).
+  // Engine mutation, adapter invalidation and re-index live in SessionManager. nullopt means the engine rejected the
+  // merge and left the store untouched: bail BEFORE mutating the catalog, or the sources would vanish from the UI
+  // while their data still lives in the store.
   if (!session_manager_->mergeDatasets(plan->anchor, plan->sources).has_value()) {
     return 0;
   }
 
   // Catalog: relabel the anchor "<name>_merged" and drop the consumed pieces.
-  QString anchor_label;
-  for (const auto& [id, label] : catalog_model_->datasets()) {
-    if (id == plan->anchor) {
-      anchor_label = label;
-      break;
-    }
-  }
-  if (!anchor_label.isEmpty()) {
-    catalog_model_->setDatasetDisplayName(plan->anchor, anchor_label + u"_merged"_s);
+  if (const std::optional<QString> anchor_label = catalog_model_->datasetLabel(plan->anchor)) {
+    catalog_model_->setDatasetDisplayName(plan->anchor, *anchor_label + u"_merged"_s);
   }
   for (const auto& source : plan->sources) {
+    if (seeded_datasets_.contains(source.dataset_id)) {
+      seeded_datasets_.insert(plan->anchor);
+    }
     catalog_model_->removeDataset(source.dataset_id);
   }
   catalog_model_->rebuildFromDatastore();
@@ -536,23 +540,26 @@ DatasetId AppSession::mergeDatasets(const std::vector<DatasetId>& selected) {
 }
 
 bool AppSession::seedPlaybackFromSession() {
-  // The range update AND the display-min for the first-seed snap come from the
-  // single shared scan in recomputeRange (it can grow on an additional file or
-  // shrink on a removed/trashed/shorter reload) — no second forEachVisibleRawRange
-  // pass to keep in lockstep. recomputeRange never touches currentTime; the
-  // first-seed snap below is the only place that does.
+  // Range and the first-seed display-min both come from the one scan in recomputeRange (it grows on an additional
+  // file, shrinks on a removed/trashed/shorter reload). recomputeRange never touches currentTime; the first-seed snap
+  // below is the only place that does.
   const std::optional<DisplaySeconds> new_min = recomputeRange();
   if (!new_min) {
-    // No visible data: recomputeRange already collapsed the transport to the
-    // empty state (paused, [0,0], cursor 0). Nothing left to snap.
+    // No visible data: recomputeRange already collapsed the transport to the empty state. Nothing to snap.
     return false;
   }
 
-  if (!playback_seeded_) {
-    // First load (or first after the catalog emptied): also snap currentTime to
-    // the data minimum so the user lands at the start of the data.
+  const std::vector<DatasetId> shown = catalog_model_->datasetIds();
+  // A followed stream joins the seed set when it starts, before its first sample: it holds the playhead only once it
+  // has data, so a stream that never received any cannot keep stale seeding alive.
+  const bool seed_left = std::any_of(shown.begin(), shown.end(), [this](DatasetId id) {
+    return seeded_datasets_.contains(id) &&
+           (id != active_streaming_dataset_id_ || session_manager_->datasetDisplayRange(id).has_value());
+  });
+  if (!seed_left) {
     playback_engine_->setCurrentTime(*new_min);
-    playback_seeded_ = true;
+    seeded_datasets_.clear();
+    forEachVisibleRawRange([this](DatasetId dataset_id, Timestamp, Timestamp) { seeded_datasets_.insert(dataset_id); });
   }
   return true;
 }
@@ -564,19 +571,16 @@ bool AppSession::focusPlaybackOnDatasets(const std::vector<DatasetId>& datasets)
   const DataReader reader = session_manager_->createReader();
   const ObjectStore& object_store = session_manager_->objectStore();
 
-  // Scalar series first: receive-time stamped, they ARE the user-visible
-  // window of an import. Object topics (tf, markers, pointclouds) often carry
-  // payload-embedded stamps that legitimately predate the import window
-  // (tf_static = node start, latched markers = creation time), so they only
-  // define the range when the import contains no scalar data at all. Bounds
-  // are tracked in DISPLAY-relative seconds, converting each item with its
-  // dataset's own offset (display_time = raw_time - offset) so the focused
-  // range matches the rendered axis — same boundary contract as
-  // seedPlaybackFromSession.
+  // Scalar series first: receive-time stamped, they ARE the user-visible window of an import. Object topics (tf,
+  // markers, pointclouds) often carry payload-embedded stamps that predate the import (tf_static = node start, latched
+  // markers = creation time), so they define the range only when the import has no scalar data at all. Bounds are in
+  // DISPLAY-relative seconds, each item converted with its dataset's own offset, so the focused range matches the
+  // rendered axis (the boundary contract of seedPlaybackFromSession).
   std::optional<DisplaySeconds> scalar_min;
   std::optional<DisplaySeconds> scalar_max;
   std::optional<DisplaySeconds> object_min;
   std::optional<DisplaySeconds> object_max;
+  std::set<DatasetId> bounded;
 
   for (const DatasetId dataset_id : datasets) {
     if (session_manager_->isStaticReferenceDataset(dataset_id)) {
@@ -588,10 +592,11 @@ bool AppSession::focusPlaybackOnDatasets(const std::vector<DatasetId>& datasets)
       if (!metadata.has_value() || metadata->total_row_count == 0) {
         continue;
       }
-      const DisplaySeconds ds_min = rawToDisplaySeconds(metadata->time_range_min, offset);
-      const DisplaySeconds ds_max = rawToDisplaySeconds(metadata->time_range_max, offset);
+      const DisplaySeconds ds_min = rawToDisplaySecondsAtOrAfter(metadata->time_range_min, offset);
+      const DisplaySeconds ds_max = rawToDisplaySecondsAtOrAfter(metadata->time_range_max, offset);
       scalar_min = scalar_min ? std::min(*scalar_min, ds_min) : ds_min;
       scalar_max = scalar_max ? std::max(*scalar_max, ds_max) : ds_max;
+      bounded.insert(dataset_id);
     }
     for (const ObjectTopicId object_topic_id : object_store.listTopics(dataset_id)) {
       if (isOffClockTopic(object_store.descriptor(object_topic_id))) {
@@ -601,10 +606,11 @@ bool AppSession::focusPlaybackOnDatasets(const std::vector<DatasetId>& datasets)
         continue;
       }
       const auto [o_min, o_max] = object_store.timeRange(object_topic_id);
-      const DisplaySeconds ds_min = rawToDisplaySeconds(o_min, offset);
-      const DisplaySeconds ds_max = rawToDisplaySeconds(o_max, offset);
+      const DisplaySeconds ds_min = rawToDisplaySecondsAtOrAfter(o_min, offset);
+      const DisplaySeconds ds_max = rawToDisplaySecondsAtOrAfter(o_max, offset);
       object_min = object_min ? std::min(*object_min, ds_min) : ds_min;
       object_max = object_max ? std::max(*object_max, ds_max) : ds_max;
+      bounded.insert(dataset_id);
     }
   }
 
@@ -613,16 +619,19 @@ bool AppSession::focusPlaybackOnDatasets(const std::vector<DatasetId>& datasets)
   if (!t_min) {
     return false;
   }
-  playback_engine_->setRange(DisplayRange{*t_min, *t_max});
-  // Snap the cursor only on the first focus or when it fell outside the new
-  // range. A progressive import re-focuses on every notify as it grows — the
-  // range must follow, but yanking a cursor the user scrubbed/played back to
-  // the import's start on each tick would fight them.
+  // Snap the cursor to the start on the first focus, or when a focus on new datasets finds it outside their range. A
+  // progressive import re-focuses on every notify as it grows, and between notifies the range is the union of all data:
+  // a cursor scrubbed past the import's tip is then only clamped, never yanked back to the start. The cursor is read
+  // before setRange, which clamps it into the range.
   const DisplaySeconds cursor = playback_engine_->currentTime();
-  if (!playback_seeded_ || cursor < *t_min || cursor > *t_max) {
-    playback_engine_->setCurrentTime(*t_min);
+  const bool refocus = std::ranges::all_of(bounded, [this](DatasetId id) { return seeded_datasets_.contains(id); });
+  if (seeded_datasets_.empty() || (!refocus && (cursor < *t_min || cursor > *t_max))) {
+    playback_engine_->setRangeAndCurrentTime(DisplayRange{*t_min, *t_max}, *t_min);
+    seeded_datasets_.clear();
+  } else {
+    playback_engine_->setRange(DisplayRange{*t_min, *t_max});
   }
-  playback_seeded_ = true;
+  seeded_datasets_.insert(bounded.begin(), bounded.end());
   return true;
 }
 

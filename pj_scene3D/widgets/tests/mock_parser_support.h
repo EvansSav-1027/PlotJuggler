@@ -2,11 +2,9 @@
 // SPDX-License-Identifier: MPL-2.0
 #pragma once
 
-// Shared scaffolding for the scene3D layer/reconstructor tests that drive a real
-// SessionManager + ObjectStore through a mock object parser. Collapses the
-// per-file copies of: the MessageParserHandle/vtable/bindSchema boilerplate
-// (makeBoundHandle), the per-parse-counting mock parser (CountingObjectParser),
-// topic registration (registerObjectTopic), and the async-decode event pump
+// Shared scaffolding for the scene3D layer/reconstructor tests that drive a real SessionManager + ObjectStore through a
+// mock object parser: the MessageParserHandle/vtable/bindSchema boilerplate (makeBoundHandle), the per-parse-counting
+// mock parser (CountingObjectParser), topic registration (registerObjectTopic) and the async-decode event pump
 // (pumpUntil). Header-only; consumers already link pj_scene3d_widgets + GTest.
 
 #include <gtest/gtest.h>
@@ -18,6 +16,7 @@
 #include <QHash>
 #include <QHostAddress>
 #include <QObject>
+#include <QSettings>
 #include <QString>
 #include <QStringList>
 #include <QTcpServer>
@@ -28,6 +27,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -42,12 +42,10 @@
 
 namespace pj::scene3d::test {
 
-// A MessageParserPluginBase mock registering ONE schema handler that delegates to
-// a caller-supplied `emit` (the genuinely test-specific object construction —
-// SAME signature as SchemaHandler::parse_object) and, when `counter` is non-null,
-// bumps it once per parse so a rebind/coalescing test can tell which parser
-// instance a decode reached. `emit` and `counter` are typically file-scope (a
-// free function + a global atomic) because vtableWithCreate's create_fn must be
+// A MessageParserPluginBase mock registering ONE schema handler that delegates to a caller-supplied `emit` (the
+// test-specific object construction, SAME signature as SchemaHandler::parse_object) and, when `counter` is non-null,
+// bumps it once per parse so a rebind/coalescing test can tell which parser instance a decode reached. `emit` and
+// `counter` are typically file-scope (a free function + a global atomic) because vtableWithCreate's create_fn must be
 // captureless.
 template <typename EmitFn>
 class CountingObjectParser : public PJ::MessageParserPluginBase {
@@ -102,8 +100,7 @@ inline void pushLazyCounting(
                   .has_value());
 }
 
-// Register one ObjectStore topic (dataset_id default 1) and return its id. EXPECT
-// (not ASSERT — this returns a value) flags a registration failure.
+// Registers one ObjectStore topic (dataset_id default 1). EXPECT, not ASSERT (this returns a value), flags a failure.
 inline PJ::ObjectTopicId registerObjectTopic(
     PJ::SessionManager& session, const std::string& topic_name, uint32_t dataset_id = 1) {
   const auto topic = session.objectStore().registerTopic(
@@ -112,9 +109,8 @@ inline PJ::ObjectTopicId registerObjectTopic(
   return topic.has_value() ? topic.value() : PJ::ObjectTopicId{};
 }
 
-// Pump the Qt event loop until `predicate()` holds or `timeout` elapses — drains
-// a QtConcurrent + QFutureWatcher async decode onto the GUI thread. Returns the
-// final predicate value so the caller can assert with its own message.
+// Pumps the Qt event loop until `predicate()` holds or `timeout` elapses, draining a QtConcurrent + QFutureWatcher
+// async decode onto the GUI thread. Returns the final predicate value so the caller asserts with its own message.
 template <typename Predicate>
 bool pumpUntil(Predicate predicate, std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -143,6 +139,29 @@ inline std::vector<QString> cubeCopies(const QTemporaryDir& dir, int count) {
   return paths;
 }
 
+// Points the default-constructed QSettings (read by the layers' remote-fetch gate) at a throwaway INI file, so tests
+// neither read nor pollute the developer's settings.
+inline void isolateSettings() {
+  static QTemporaryDir settings_dir;
+  ASSERT_TRUE(settings_dir.isValid());
+  QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settings_dir.path());
+  QSettings::setDefaultFormat(QSettings::IniFormat);
+  QCoreApplication::setOrganizationName(QStringLiteral("pj_scene3d_tests"));
+  QCoreApplication::setApplicationName(QStringLiteral("pj_scene3d_fixture_tests"));
+}
+
+// Sets pj_scene3d/allow_remote_model_fetch in isolated settings; nullopt leaves the built-in default.
+inline void setRemoteModelFetch(std::optional<bool> allowed) {
+  isolateSettings();
+  QSettings settings;
+  if (allowed.has_value()) {
+    settings.setValue(QStringLiteral("pj_scene3d/allow_remote_model_fetch"), *allowed);
+  } else {
+    settings.remove(QStringLiteral("pj_scene3d/allow_remote_model_fetch"));
+  }
+  settings.sync();
+}
+
 // The bytes of tests/fixtures/meshes/`name`; a missing fixture fails the test.
 inline QByteArray readFixtureBytes(const char* name) {
   QFile file(QStringLiteral(PJ_SCENE3D_FIXTURES_DIR "/meshes/") + QLatin1String(name));
@@ -150,17 +169,39 @@ inline QByteArray readFixtureBytes(const char* name) {
   return file.readAll();
 }
 
-// Serves `files` over HTTP on localhost by request path (404 for any other) and
-// records every requested path.
+// The textured_quad fixture written to `dir` with its texture ref replaced by `texture_ref`; returns the file's path.
+inline QString writeQuadReferencing(const QTemporaryDir& dir, const QString& texture_ref) {
+  QByteArray dae = readFixtureBytes("textured_quad.dae");
+  dae.replace("red_4x4.png", texture_ref.toUtf8());
+  const QString path = dir.filePath(QStringLiteral("quad.dae"));
+  QFile file(path);
+  EXPECT_TRUE(file.open(QIODevice::WriteOnly) && file.write(dae) == dae.size());
+  return path;
+}
+
+// Serves `files` over HTTP on localhost by request path, answers a path in `redirects` with a 302 to its absolute
+// URL (with a short body and `redirect_cache_control`), 404 for any other, and records every requested path.
 class FileHttpServer {
  public:
-  explicit FileHttpServer(QHash<QString, QByteArray> files) : files_(std::move(files)) {
+  explicit FileHttpServer(
+      QHash<QString, QByteArray> files, QHash<QString, QString> redirects = {},
+      QByteArray redirect_cache_control = "no-store")
+      : files_(std::move(files)),
+        redirects_(std::move(redirects)),
+        redirect_cache_control_(std::move(redirect_cache_control)) {
     EXPECT_TRUE(server_.listen(QHostAddress::LocalHost, 0));
     QObject::connect(&server_, &QTcpServer::newConnection, &server_, [this]() {
       QTcpSocket* socket = server_.nextPendingConnection();
       QObject::connect(socket, &QTcpSocket::readyRead, socket, [this, socket]() {
         const QString path = QString::fromLatin1(socket->readAll().split(' ').value(1));
         paths_.push_back(path);
+        if (const auto target = redirects_.constFind(path); target != redirects_.cend()) {
+          socket->write(
+              "HTTP/1.1 302 Found\r\nConnection: close\r\nCache-Control: " + redirect_cache_control_ +
+              "\r\nContent-Length: 5\r\nLocation: " + target->toUtf8() + "\r\n\r\nmoved");
+          socket->disconnectFromHost();
+          return;
+        }
         const auto file = files_.constFind(path);
         const bool found = file != files_.cend();
         const QByteArray body = found ? *file : QByteArray();
@@ -175,12 +216,18 @@ class FileHttpServer {
   [[nodiscard]] QString url(const QString& path) const {
     return QStringLiteral("http://127.0.0.1:%1%2").arg(server_.serverPort()).arg(path);
   }
+  // For a body that names this server's own port.
+  void serve(const QString& path, QByteArray bytes) {
+    files_.insert(path, std::move(bytes));
+  }
   [[nodiscard]] const QStringList& paths() const {
     return paths_;
   }
 
  private:
   QHash<QString, QByteArray> files_;
+  QHash<QString, QString> redirects_;
+  QByteArray redirect_cache_control_;
   QTcpServer server_;
   QStringList paths_;
 };

@@ -195,6 +195,30 @@ TEST(PlotMagnifierClamp, ValueAxisIsNotClamped) {
   EXPECT_LT(fixture.xWidth(), 2.0e-9) << "a value X axis has no ns floor";
 }
 
+// A zoom box may leave the view past the end of the data. Wheel zooming there must keep a forward window: clamping
+// its right edge to the data end alone would put it left of the left edge and fold the axis, and every later zoom
+// would then start from that collapsed window.
+TEST(PlotMagnifierClamp, WheelZoomBeyondTheDataKeepsAForwardWindow) {
+  MagnifierFixture fixture;
+  fixture.magnifier.setTimeXAxis(true);
+  fixture.magnifier.setDefaultMode(PJ::PlotMagnifier::kXAxis);
+  fixture.magnifier.setAxisLimits(QwtPlot::xBottom, 0.0, 1.0);  // the data spans 0..1 s
+  fixture.plot.setAxisScale(QwtPlot::xBottom, 1.5, 3.0);        // the view lies after it
+  fixture.plot.updateAxes();
+  fixture.plot.replot();
+
+  fixture.plantMouseAtCenter();  // one notch in, centered at 2.25 s
+  const QwtScaleDiv& zoomed = fixture.plot.axisScaleDiv(QwtPlot::xBottom);
+  EXPECT_LT(zoomed.lowerBound(), zoomed.upperBound()) << "the X axis folded";
+  // One notch zooms in by the wheel factor (0.9): the window shrinks, and only by that much.
+  EXPECT_NEAR(zoomed.upperBound() - zoomed.lowerBound(), 1.5 * 0.9, 1e-6);
+
+  fixture.zoomX(0.01);  // and zooming back out reaches the data again
+  const QwtScaleDiv& out = fixture.plot.axisScaleDiv(QwtPlot::xBottom);
+  EXPECT_LT(out.lowerBound(), 1.0);
+  EXPECT_LT(out.lowerBound(), out.upperBound());
+}
+
 // Zooming OUT on a time axis is never affected by the floor.
 TEST(PlotMagnifierClamp, ZoomOutUnaffectedByFloor) {
   MagnifierFixture fixture;
@@ -289,9 +313,8 @@ TEST(PlotMagnifierClamp, BoundsCannotUndercutFloor) {
 
   fixture.zoomX(1.0e10);
 
-  // The clamp re-expands to ~2 ns; allow a hair of float noise from computing the
-  // edges at the 0.5 s offset scale. The pre-fix clamp-then-bound ordering trimmed
-  // this to ~1 ns (half the floor), which this bound comfortably rejects.
+  // The clamp re-expands to ~2 ns; allow a hair of float noise from computing the edges at the 0.5 s offset scale. A
+  // clamp-then-bound ordering would trim this to ~1 ns (half the floor), which this bound rejects.
   EXPECT_GT(last_rect.right() - last_rect.left(), 1.9e-9)
       << "a tight bound must not shave the clamped window below the 2 ns floor";
 }

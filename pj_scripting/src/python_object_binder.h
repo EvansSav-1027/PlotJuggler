@@ -7,16 +7,17 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string_view>
 
 #include "pj_base/builtin/builtin_object.hpp"
 
-// The object half of the Python on-demand binding (docs/derived_objects/ARCHITECTURE.md §6, §14), the twin of
-// object_binder.h over the same native operations: objects as read-only views over their SDK field tables (a list is a
-// lazy sequence read through `list_at`, an int64 field a Python int), the point-cloud, image and decoded-pixel methods,
-// the `pj.scene` / `pj.annotations` / `pj.cloud` / `pj.voxels` builders and `pj.tf`. The surface is
-// python_object_script.h's.
+// The object half of the Python on-demand binding (docs/derived_objects/ARCHITECTURE.md "Types and bindings",
+// "Scripting languages"), the twin of object_binder.h over the same native operations: objects as read-only views over
+// their SDK field tables (a list is a lazy sequence read through `list_at`, an int64 field a Python int), the
+// point-cloud, image and decoded-pixel methods, the `pj.scene` / `pj.annotations` / `pj.cloud` / `pj.voxels` builders
+// and `pj.tf`. The surface is python_object_script.h's.
 //
 // Every operation that walks the data runs without the GIL: it reads only C++ state the call's arguments keep alive.
 // The types are plain CPython types, registered once per process: they have no constructor, take no attribute and
@@ -78,6 +79,10 @@ void releaseRecycledViews();
 
 /// How many freed struct-view blocks wait for reuse: 0 once a run has ended. For tests. GIL held.
 [[nodiscard]] std::size_t recycledViewCount();
+
+/// Runs as an `xyz_points` scan starts its stretch without the GIL (the iterator busy): a test's latch to hold the scan
+/// open. Set and cleared while no script runs. For tests.
+void setPointScanHook(std::function<void()> hook);
 
 /// Registers the binder's types on the first call, which must hold the GIL outside any ScriptCallScope (registering is
 /// host work the armed hook could refuse); later calls only read.

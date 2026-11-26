@@ -8,11 +8,9 @@
 #include <gtest/gtest.h>
 
 #include <QApplication>
-#include <QPointer>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QTemporaryDir>
-#include <QTimer>
 #include <QToolButton>
 #include <QTreeWidgetItem>
 #include <algorithm>
@@ -26,6 +24,7 @@
 #include "MainWindow.h"
 #include "dataset_test_helpers.h"
 #include "pj_base/sdk/platform.hpp"
+#include "pj_datastore/incremental_engine.hpp"
 #include "pj_marketplace/qt_diagnostic_bridge.hpp"
 #include "pj_runtime/AppSession.h"
 #include "pj_runtime/CatalogModel.h"
@@ -35,6 +34,7 @@
 #include "pj_runtime/SessionManager.h"
 #include "pj_runtime/Time.h"
 #include "pj_widgets/CurveTreeView.h"
+#include "support/modal_answerer.h"
 #include "ui/CurveListPanel.h"
 
 using namespace Qt::StringLiterals;
@@ -47,6 +47,9 @@ class MainWindowCustomTopicsTestPeer {
     return *window.session_;
   }
   // What the panel's Delete runs.
+  static void deleteCustomTopics(MainWindow& window, const QStringList& catalog_keys) {
+    window.deleteCustomTopics(catalog_keys);
+  }
   static void deleteCustomTopic(MainWindow& window, const QString& catalog_key) {
     window.deleteCustomTopic(catalog_key);
   }
@@ -58,8 +61,8 @@ class MainWindowCustomTopicsTestPeer {
     window.refreshCustomTopicsPanel();
   }
   // These windows load no plugin, so the tests name the toolbox that would declare `custom_topics_editor`.
-  static void setCustomTopicsEditorId(MainWindow& window, const QString& plugin_id) {
-    window.session_->extensionCatalog().setCustomTopicsEditorIdForTest(plugin_id);
+  static void setCustomTopicsEditorId(MainWindow& window, const QString& plugin_id, bool views = false) {
+    window.session_->extensionCatalog().setCustomTopicsEditorIdForTest(plugin_id, views);
     window.syncCustomTopicsEditor();
   }
   [[nodiscard]] static int customTopicsSyncs(const MainWindow& window) {
@@ -76,6 +79,27 @@ class MainWindowCustomTopicsTestPeer {
   }
   [[nodiscard]] static std::size_t undoSize(const MainWindow& window) {
     return window.undo_states_.size();
+  }
+  static void redo(MainWindow& window) {
+    window.onRedo();
+  }
+  [[nodiscard]] static std::size_t redoSize(const MainWindow& window) {
+    return window.redo_states_.size();
+  }
+  // The forced step a plugin's create records.
+  static void pushUndoStep(MainWindow& window) {
+    window.onUndoableChange(/*force_new_state=*/true);
+  }
+  // A scene dock's change, its step still pending on the debounce.
+  static void startSceneUndoDebounce(MainWindow& window) {
+    window.scene_undo_debounce_.start();
+  }
+  // What the debounce's timeout runs.
+  static void fireSceneUndoDebounce(MainWindow& window) {
+    if (window.scene_undo_debounce_.isActive()) {
+      window.scene_undo_debounce_.stop();
+      window.onUndoableChange();
+    }
   }
 };
 
@@ -99,6 +123,15 @@ return { id="neg", name="Negate", output="same",
 constexpr const char* kNegate2 = R"LUAU(-- pj-script: luau
 return { id="neg2", name="Negate", output="same",
   create = function(p) return { calculate = function(t, v) return -v end } end }
+)LUAU";
+constexpr const char* kNegate3 = R"LUAU(-- pj-script: luau
+return { id="neg3", name="Negate", output="same",
+  create = function(p) return { calculate = function(t, v) return -v end } end }
+)LUAU";
+// "neg" edited: another script for the same transform.
+constexpr const char* kTriple = R"LUAU(-- pj-script: luau
+return { id="neg", name="Negate", output="same",
+  create = function(p) return { calculate = function(t, v) return -3 * v end } end }
 )LUAU";
 
 PJ::scripting::OutputSpec cloudOutput(std::string name = "cropped") {
@@ -127,38 +160,28 @@ QTreeWidgetItem* findRowByKey(QTreeWidgetItem* item, const QString& key) {
   return nullptr;
 }
 
-// Presses the first button (the destructive "Delete") of every themed message box that opens while it lives, after
-// running `meanwhile` with the box still open: what a user changing the session behind a pending prompt does.
+// Presses button `button` (0 the destructive "Delete", 1 Cancel) of every themed message box that opens while it lives,
+// after running `meanwhile` with the box still open: what a user changing the session behind a pending prompt does.
 class MessageBoxAnswerer {
  public:
-  explicit MessageBoxAnswerer(std::function<void()> meanwhile = {}, int button = 0)
-      : meanwhile_(std::move(meanwhile)), button_(button) {
-    timer_.setInterval(5);
-    QObject::connect(&timer_, &QTimer::timeout, &timer_, [this]() {
-      QWidget* modal = QApplication::activeModalWidget();
-      if (modal == nullptr || modal == answered_box_ || modal->objectName() != u"pjMessageBox"_s) {
-        return;
-      }
-      const auto buttons = modal->findChildren<QPushButton*>(u"pjMessageBoxButton"_s);
-      if (buttons.size() <= button_) {
-        return;
-      }
-      answered_box_ = modal;
-      ++answered;
-      if (meanwhile_) {
-        meanwhile_();
-      }
-      QMetaObject::invokeMethod(buttons.at(button_), "click", Qt::QueuedConnection);
-    });
-    timer_.start();
+  explicit MessageBoxAnswerer(std::function<void()> meanwhile = {}, int button = 0) : answerer_(5) {
+    answerer_.every(
+        [button](QWidget* dialog) {
+          return pj_app_test::isMessageBox(dialog) && pj_app_test::messageBoxButtons(dialog).size() > button;
+        },
+        [this, button, meanwhile = std::move(meanwhile)](QWidget* box) {
+          ++answered;
+          if (meanwhile) {
+            meanwhile();
+          }
+          QMetaObject::invokeMethod(
+              pj_app_test::messageBoxButtons(box).at(button), &QAbstractButton::click, Qt::QueuedConnection);
+        });
   }
   int answered = 0;
 
  private:
-  std::function<void()> meanwhile_;
-  int button_ = 0;  ///< which button it presses: 0 the destructive one, 1 Cancel
-  QPointer<QWidget> answered_box_;
-  QTimer timer_;
+  pj_app_test::ModalAnswerer answerer_;
 };
 
 // One window with a dataset holding an (empty) cloud topic and a scalar topic, and the editor named.
@@ -227,7 +250,7 @@ struct CustomTopicsFixture {
   }
 };
 
-// UI-02: persistent recipes (a finding included) list their object topics in Custom Topics and leave the Datasets
+// Persistent recipes (a finding included) list their object topics in Custom Topics and leave the Datasets
 // tree; a preview is in neither, yet stays resolvable in the catalog; its removal leaves nothing behind.
 TEST(MainWindowCustomTopicsTest, CustomTopicsListsPersistentRecipesOnly) {
   CustomTopicsFixture fx;
@@ -261,7 +284,7 @@ TEST(MainWindowCustomTopicsTest, CustomTopicsListsPersistentRecipesOnly) {
   EXPECT_EQ(fx.panel->customTopicNames().size(), 2);
 }
 
-// UI-03: use-only unless the declared editor made it: the pencil follows the row's owner.
+// Use-only unless the declared editor made it: the pencil follows the row's owner.
 TEST(MainWindowCustomTopicsTest, EditIsEnabledOnlyForEditorRows) {
   CustomTopicsFixture fx;
   ASSERT_TRUE(fx.setUp());
@@ -275,7 +298,23 @@ TEST(MainWindowCustomTopicsTest, EditIsEnabledOnlyForEditorRows) {
   EXPECT_TRUE(fx.edit->isEnabled());
 }
 
-// UI-04: the delete handler refuses another plugin's recipe on its own (the panel disables the action, but nothing
+// An editor that declares `custom_topics_viewer` opens other owners' rows as a view: the pencil is enabled on them,
+// and says so; Delete stays theirs.
+TEST(MainWindowCustomTopicsTest, AViewingEditorOffersThePencilOnOtherOwnersRows) {
+  CustomTopicsFixture fx;
+  ASSERT_TRUE(fx.setUp());
+  ASSERT_TRUE(fx.install(cropRecipe("assistant", "crop")));
+  MainWindowCustomTopicsTestPeer::setCustomTopicsEditorId(fx.window, QString::fromLatin1(kEditor), /*views=*/true);
+
+  fx.select("assistant/crop/cropped");
+  EXPECT_TRUE(fx.edit->isEnabled());
+  EXPECT_EQ(fx.edit->toolTip(), u"View the formula (created by assistant; read-only)"_s);
+
+  MainWindowCustomTopicsTestPeer::setCustomTopicsEditorId(fx.window, QString::fromLatin1(kEditor), /*views=*/false);
+  EXPECT_FALSE(fx.edit->isEnabled());
+}
+
+// The delete handler refuses another plugin's recipe on its own (the panel disables the action, but nothing
 // else may reach it), and the editor's own recipe goes with its topic and rows.
 TEST(MainWindowCustomTopicsTest, DeleteOfAnotherPluginsRecipeIsRefused) {
   CustomTopicsFixture fx;
@@ -300,7 +339,7 @@ TEST(MainWindowCustomTopicsTest, DeleteOfAnotherPluginsRecipeIsRefused) {
   EXPECT_EQ(fx.panel->customTopicNames(), QStringList{u"assistant/crop/cropped"_s});
 }
 
-// UI-04: the same backstop for a transform output: another plugin's is use-only, with no editor declared nothing is
+// The same backstop for a transform output: another plugin's is use-only, with no editor declared nothing is
 // deletable, and the editor's own goes.
 TEST(MainWindowCustomTopicsTest, DeleteOfAnotherPluginsTransformIsRefused) {
   CustomTopicsFixture fx;
@@ -327,7 +366,95 @@ TEST(MainWindowCustomTopicsTest, DeleteOfAnotherPluginsTransformIsRefused) {
   EXPECT_TRUE(transforms.transformIdsForPlugin(kEditor).empty()) << "the editor's own goes";
 }
 
-// UI-04: deleting the editor's transform never cascades into another plugin's: a reader owned elsewhere refuses the
+// A text series is not plottable, but its Custom Topics row resolves to its transform like any other: Delete removes
+// it.
+TEST(MainWindowCustomTopicsTest, DeleteOfATextSeriesRemovesItsTransform) {
+  constexpr const char* kLabel = R"LUAU(-- pj-script: luau
+return { id="label", name="Label", output="string",
+  create = function(p) return { calculate = function(t, v) return v > 0 and "up" or "down" end } end }
+)LUAU";
+  CustomTopicsFixture fx;
+  ASSERT_TRUE(fx.setUp());
+  PJ::DataProcessorService& transforms = fx.app().sessionManager().dataProcessorService();
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "label", {"sensor/value"}, {"sensor/state"}, kLabel, "{}"));
+  fx.app().catalogModel().rebuildFromDatastore();
+  MainWindowCustomTopicsTestPeer::syncCustomTopicsPanel(fx.window);
+  const QString key = fx.keyOf("sensor/state");
+  ASSERT_FALSE(key.isEmpty());
+
+  MainWindowCustomTopicsTestPeer::deleteCustomTopic(fx.window, key);
+  EXPECT_TRUE(transforms.transformIdsForPlugin(kEditor).empty()) << "the text series' transform goes";
+}
+
+// A transform's row is its own output topic, found by topic id. A create refuses an output name already in use, but
+// a topic of that name can arrive later in another dataset (a stream, a reload); in an earlier dataset a name lookup
+// finds it first. That topic stays in the Datasets tree.
+TEST(MainWindowCustomTopicsTest, ATransformRowIsItsOutputNotATopicOfTheSameName) {
+  CustomTopicsFixture fx;
+  ASSERT_TRUE(fx.setUp());
+  const PJ::DatasetId second = pj_test::createDataset(fx.app(), "second.mcap", /*own_time_domain=*/true);
+  ASSERT_NE(second, 0U);
+  ASSERT_NE(pj_test::addScalarTopic(fx.app(), second, "other"), 0U);
+  PJ::DataProcessorService& transforms = fx.app().sessionManager().dataProcessorService();
+  const auto created = transforms.upsertTransform(kEditor, "neg", {"other/value"}, {"out"}, kNegate, "{}");
+  ASSERT_TRUE(created.has_value()) << created.error();
+  ASSERT_NE(pj_test::addScalarTopic(fx.app(), fx.dataset, "out"), 0U) << "a topic named like the output arrives";
+  fx.app().catalogModel().rebuildFromDatastore();
+  MainWindowCustomTopicsTestPeer::syncCustomTopicsPanel(fx.window);
+
+  QString loaded_key;
+  QString output_key;
+  for (const PJ::CatalogItem& item : fx.app().catalogModel().items()) {
+    if (item.topic_name == u"out"_s) {
+      (item.dataset_id == second ? output_key : loaded_key) = item.key;
+    }
+  }
+  ASSERT_FALSE(loaded_key.isEmpty());
+  ASSERT_FALSE(output_key.isEmpty()) << "the transform writes into its input's dataset";
+  EXPECT_NE(findRowByKey(fx.custom->invisibleRootItem(), output_key), nullptr) << "the transform's output is listed";
+  EXPECT_EQ(findRowByKey(fx.custom->invisibleRootItem(), loaded_key), nullptr) << "the loaded topic is not";
+  EXPECT_NE(findRowByKey(fx.tree->invisibleRootItem(), loaded_key), nullptr) << "it stays under Datasets";
+  EXPECT_EQ(findRowByKey(fx.tree->invisibleRootItem(), output_key), nullptr);
+}
+
+// A grouped output ("t:a,b", one topic with a column per field) moves to Custom Topics whole: every column is listed
+// there and none stays under Datasets.
+TEST(MainWindowCustomTopicsTest, AGroupedTransformOutputMovesWholeToCustomTopics) {
+  constexpr const char* kSplit = R"LUAU(-- pj-script: luau
+return { id="split", name="Split",
+  create = function(p) return { calculate = function(t, v) return v, -v end } end }
+)LUAU";
+  CustomTopicsFixture fx;
+  ASSERT_TRUE(fx.setUp());
+  PJ::DataProcessorService& transforms = fx.app().sessionManager().dataProcessorService();
+  const auto created = transforms.upsertTransform(kEditor, "split", {"sensor/value"}, {"pair:a,b"}, kSplit, "{}");
+  ASSERT_TRUE(created.has_value()) << created.error();
+  fx.app().catalogModel().rebuildFromDatastore();
+  MainWindowCustomTopicsTestPeer::syncCustomTopicsPanel(fx.window);
+
+  QStringList keys;
+  for (const PJ::CatalogItem& item : fx.app().catalogModel().items()) {
+    if (item.topic_name == u"pair"_s) {
+      keys << item.key;
+    }
+  }
+  ASSERT_EQ(keys.size(), 2) << "one topic, a column per field";
+  for (const QString& key : keys) {
+    const QTreeWidgetItem* row = findRowByKey(fx.custom->invisibleRootItem(), key);
+    ASSERT_NE(row, nullptr) << key.toStdString();
+    EXPECT_EQ(findRowByKey(fx.tree->invisibleRootItem(), key), nullptr) << key.toStdString();
+    EXPECT_TRUE(row->text(0) == u"pair/a"_s || row->text(0) == u"pair/b"_s) << row->text(0).toStdString();
+  }
+
+  // Deleting its rows together removes the transform once; the rows after the first are skipped.
+  MainWindowCustomTopicsTestPeer::deleteCustomTopics(fx.window, keys);
+  EXPECT_TRUE(transforms.transformIdsForPlugin(kEditor).empty());
+  for (const QString& key : keys) {
+    EXPECT_EQ(findRowByKey(fx.custom->invisibleRootItem(), key), nullptr) << key.toStdString();
+  }
+}
+
+// Deleting the editor's transform never cascades into another plugin's: a reader owned elsewhere refuses the
 // delete up front, by name, and nothing is removed.
 TEST(MainWindowCustomTopicsTest, DeleteCascadingIntoAnotherPluginsTransformIsRefused) {
   CustomTopicsFixture fx;
@@ -351,7 +478,7 @@ TEST(MainWindowCustomTopicsTest, DeleteCascadingIntoAnotherPluginsTransformIsRef
       fx.reported.front(), u"delete-cascade-read-only: 'neg' cannot be deleted: 'neg' of assistant reads its output"_s);
 }
 
-// UI-04: the owner is checked again when the prompt is answered: an editor unloaded while the dependents prompt of an
+// The owner is checked again when the prompt is answered: an editor unloaded while the dependents prompt of an
 // on-demand delete is open leaves its recipe in place.
 TEST(MainWindowCustomTopicsTest, OnDemandDeleteRechecksTheOwnerAfterThePrompt) {
   CustomTopicsFixture fx;
@@ -374,7 +501,7 @@ TEST(MainWindowCustomTopicsTest, OnDemandDeleteRechecksTheOwnerAfterThePrompt) {
   EXPECT_TRUE(fx.reported.join(u"; "_s).contains(u"delete-read-only"_s)) << fx.reported.join(u"; "_s).toStdString();
 }
 
-// UI-04: selecting several rows of one recipe (its `id/output` rows) and pressing Delete asks about the recipe once:
+// Selecting several rows of one recipe (its `id/output` rows) and pressing Delete asks about the recipe once:
 // a Cancel is not asked again for the next row, and a Delete removes it as one undo step.
 TEST(MainWindowCustomTopicsTest, DeletingTwoRowsOfOneRecipeDeletesItOnce) {
   CustomTopicsFixture fx;
@@ -420,7 +547,7 @@ TEST(MainWindowCustomTopicsTest, DeletingTwoRowsOfOneRecipeDeletesItOnce) {
   EXPECT_EQ(MainWindowCustomTopicsTestPeer::undoSize(fx.window), before + 1) << "one undo step";
 }
 
-// UI-04: the same recheck on the transform path, before the dependents go: unloading the editor behind the prompt
+// The same recheck on the transform path, before the dependents go: unloading the editor behind the prompt
 // leaves the whole chain.
 TEST(MainWindowCustomTopicsTest, TransformDeleteRechecksTheOwnerBeforeRemovingDependents) {
   CustomTopicsFixture fx;
@@ -441,7 +568,36 @@ TEST(MainWindowCustomTopicsTest, TransformDeleteRechecksTheOwnerBeforeRemovingDe
   EXPECT_EQ(transforms.transformIdsForPlugin(kEditor).size(), 2U) << "neither the transform nor its dependent goes";
 }
 
-// UI-04: a delete never strands a history-exempt reader: the delete is an undo step, and its redo would be refused
+// Deleting every column of a grouped output asks once: the columns are one transform, and a cancelled prompt does not
+// come back for the next column.
+TEST(MainWindowCustomTopicsTest, DeletingAGroupedOutputsColumnsAsksOnce) {
+  constexpr const char* kSplit = R"LUAU(-- pj-script: luau
+return { id="split", name="Split",
+  create = function(p) return { calculate = function(t, v) return v, -v end } end }
+)LUAU";
+  CustomTopicsFixture fx;
+  ASSERT_TRUE(fx.setUp());
+  PJ::DataProcessorService& transforms = fx.app().sessionManager().dataProcessorService();
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "split", {"sensor/value"}, {"pair:a,b"}, kSplit, "{}"));
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg2", {"pair/a"}, {"chain"}, kNegate2, "{}"));
+  fx.app().catalogModel().rebuildFromDatastore();
+  MainWindowCustomTopicsTestPeer::syncCustomTopicsPanel(fx.window);
+  QStringList keys;
+  for (const PJ::CatalogItem& item : fx.app().catalogModel().items()) {
+    if (item.topic_name == u"pair"_s) {
+      keys << item.key;
+    }
+  }
+  ASSERT_EQ(keys.size(), 2);
+
+  const MessageBoxAnswerer cancel({}, /*button=*/1);
+  MainWindowCustomTopicsTestPeer::deleteCustomTopics(fx.window, keys);
+  QApplication::processEvents();
+  EXPECT_EQ(cancel.answered, 1) << "one prompt for the one transform";
+  EXPECT_EQ(transforms.transformIdsForPlugin(kEditor).size(), 2U) << "cancelled: nothing goes";
+}
+
+// A delete never strands a history-exempt reader: the delete is an undo step, and its redo would be refused
 // for the reader it strands. Refused up front, naming the reader, and nothing is removed.
 TEST(MainWindowCustomTopicsTest, DeleteReadByAHistoryExemptRecipeIsRefused) {
   CustomTopicsFixture fx;
@@ -465,7 +621,7 @@ TEST(MainWindowCustomTopicsTest, DeleteReadByAHistoryExemptRecipeIsRefused) {
       u"delete-exempt-reader: 'crop' cannot be deleted: the protected 'assistant/finding/cropped' reads its output"_s);
 }
 
-// LAY-12 across a file load: a derived topic is no part of the data universe history is checked against, so the load
+// Across a file load: a derived topic is no part of the data universe history is checked against, so the load
 // after a delete keeps the undo step, and the undo brings the recipe back.
 TEST(MainWindowCustomTopicsTest, ADeleteKeepsItsUndoAcrossTheNextFileLoad) {
   CustomTopicsFixture fx;
@@ -489,7 +645,178 @@ TEST(MainWindowCustomTopicsTest, ADeleteKeepsItsUndoAcrossTheNextFileLoad) {
   EXPECT_NE(fx.service().graph().find(mine.key()), nullptr) << "the undo brings the recipe back";
 }
 
-// UI-07: the scheduled refresh (a node state, an offset) rebuilds the on-demand rows only. The transform rows come from
+// A transform delete is its own undo step: the undo brings back the transform as it was just before, not as it was
+// before the edit that preceded the delete. The edit pushed no step, so the delete must refresh the baseline itself.
+TEST(MainWindowCustomTopicsTest, ATransformDeleteIsItsOwnUndoStep) {
+  CustomTopicsFixture fx;
+  ASSERT_TRUE(fx.setUp());
+  PJ::DataProcessorService& transforms = fx.app().sessionManager().dataProcessorService();
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg", {"sensor/value"}, {"sensor/mine"}, kNegate, "{}"));
+  fx.app().catalogModel().rebuildFromDatastore();
+  MainWindowCustomTopicsTestPeer::syncCustomTopicsPanel(fx.window);
+  MainWindowCustomTopicsTestPeer::completeFileLoad(fx.window, u"/tmp/run.mcap"_s);
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg", {"sensor/value"}, {"sensor/mine"}, kTriple, "{}"));
+  const std::size_t before = MainWindowCustomTopicsTestPeer::undoSize(fx.window);
+
+  MainWindowCustomTopicsTestPeer::deleteCustomTopic(fx.window, fx.keyOf("sensor/mine"));
+  ASSERT_TRUE(transforms.transformIdsForPlugin(kEditor).empty());
+  EXPECT_EQ(MainWindowCustomTopicsTestPeer::undoSize(fx.window), before + 1) << "the delete is an undo step";
+
+  MainWindowCustomTopicsTestPeer::undo(fx.window);
+  const std::vector<PJ::DataProcessorService::TransformRecipe> live = transforms.transformRecipes();
+  ASSERT_EQ(live.size(), 1U) << "the undo brings the transform back";
+  EXPECT_EQ(live.front().script, kTriple) << "as edited, not as loaded";
+
+  MainWindowCustomTopicsTestPeer::redo(fx.window);
+  EXPECT_TRUE(transforms.transformIdsForPlugin(kEditor).empty()) << "the redo deletes it again";
+}
+
+// A change still pending on the scene debounce is its own step, recorded before the delete's: refreshing the baseline
+// alone would fold it into the step before.
+TEST(MainWindowCustomTopicsTest, ATransformDeleteRecordsAPendingDebouncedStepFirst) {
+  CustomTopicsFixture fx;
+  ASSERT_TRUE(fx.setUp());
+  PJ::DataProcessorService& transforms = fx.app().sessionManager().dataProcessorService();
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg", {"sensor/value"}, {"sensor/mine"}, kNegate, "{}"));
+  fx.app().catalogModel().rebuildFromDatastore();
+  MainWindowCustomTopicsTestPeer::syncCustomTopicsPanel(fx.window);
+  MainWindowCustomTopicsTestPeer::completeFileLoad(fx.window, u"/tmp/run.mcap"_s);
+  const std::size_t before = MainWindowCustomTopicsTestPeer::undoSize(fx.window);
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg", {"sensor/value"}, {"sensor/mine"}, kTriple, "{}"));
+  MainWindowCustomTopicsTestPeer::startSceneUndoDebounce(fx.window);
+
+  MainWindowCustomTopicsTestPeer::deleteCustomTopic(fx.window, fx.keyOf("sensor/mine"));
+  ASSERT_TRUE(transforms.transformIdsForPlugin(kEditor).empty());
+  EXPECT_EQ(MainWindowCustomTopicsTestPeer::undoSize(fx.window), before + 2) << "the pending step, then the delete";
+
+  MainWindowCustomTopicsTestPeer::undo(fx.window);
+  std::vector<PJ::DataProcessorService::TransformRecipe> live = transforms.transformRecipes();
+  ASSERT_EQ(live.size(), 1U);
+  EXPECT_EQ(live.front().script, kTriple) << "the delete undone";
+  MainWindowCustomTopicsTestPeer::undo(fx.window);
+  live = transforms.transformRecipes();
+  ASSERT_EQ(live.size(), 1U);
+  EXPECT_EQ(live.front().script, kNegate) << "the pending change undone on its own";
+}
+
+// A delete that takes a dependent transform with it is one undo step, and its undo brings both back as they were
+// just before: the unrecorded edit is in the baseline, refreshed before the cascade removes anything.
+TEST(MainWindowCustomTopicsTest, ATransformDeleteAndItsCascadeAreOneUndoStep) {
+  CustomTopicsFixture fx;
+  ASSERT_TRUE(fx.setUp());
+  PJ::DataProcessorService& transforms = fx.app().sessionManager().dataProcessorService();
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg", {"sensor/value"}, {"sensor/mine"}, kNegate, "{}"));
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg2", {"sensor/mine"}, {"sensor/chain"}, kNegate2, "{}"));
+  fx.app().catalogModel().rebuildFromDatastore();
+  MainWindowCustomTopicsTestPeer::syncCustomTopicsPanel(fx.window);
+  MainWindowCustomTopicsTestPeer::completeFileLoad(fx.window, u"/tmp/run.mcap"_s);
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg", {"sensor/value"}, {"sensor/mine"}, kTriple, "{}"));
+  const std::size_t before = MainWindowCustomTopicsTestPeer::undoSize(fx.window);
+
+  const MessageBoxAnswerer answerer;
+  MainWindowCustomTopicsTestPeer::deleteCustomTopic(fx.window, fx.keyOf("sensor/mine"));
+  QApplication::processEvents();
+  ASSERT_EQ(answerer.answered, 1);
+  ASSERT_TRUE(transforms.transformIdsForPlugin(kEditor).empty());
+  EXPECT_EQ(MainWindowCustomTopicsTestPeer::undoSize(fx.window), before + 1) << "one undo step";
+
+  MainWindowCustomTopicsTestPeer::undo(fx.window);
+  const std::vector<PJ::DataProcessorService::TransformRecipe> live = transforms.transformRecipes();
+  ASSERT_EQ(live.size(), 2U) << "the undo brings both back";
+  const auto neg = std::find_if(
+      live.begin(), live.end(), [](const auto& recipe) { return recipe.key == std::string(kEditor) + "/neg"; });
+  ASSERT_NE(neg, live.end());
+  EXPECT_EQ(neg->script, kTriple) << "as edited";
+
+  MainWindowCustomTopicsTestPeer::redo(fx.window);
+  EXPECT_TRUE(transforms.transformIdsForPlugin(kEditor).empty()) << "the redo deletes both again";
+}
+
+// A cancelled delete records nothing and keeps the redo.
+TEST(MainWindowCustomTopicsTest, ACancelledTransformDeleteRecordsNothing) {
+  CustomTopicsFixture fx;
+  ASSERT_TRUE(fx.setUp());
+  PJ::DataProcessorService& transforms = fx.app().sessionManager().dataProcessorService();
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg", {"sensor/value"}, {"sensor/mine"}, kNegate, "{}"));
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg2", {"sensor/mine"}, {"sensor/chain"}, kNegate2, "{}"));
+  fx.app().catalogModel().rebuildFromDatastore();
+  MainWindowCustomTopicsTestPeer::syncCustomTopicsPanel(fx.window);
+  MainWindowCustomTopicsTestPeer::completeFileLoad(fx.window, u"/tmp/run.mcap"_s);
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg", {"sensor/value"}, {"sensor/mine"}, kTriple, "{}"));
+  MainWindowCustomTopicsTestPeer::pushUndoStep(fx.window);
+  MainWindowCustomTopicsTestPeer::undo(fx.window);
+  const std::size_t before = MainWindowCustomTopicsTestPeer::undoSize(fx.window);
+  ASSERT_EQ(MainWindowCustomTopicsTestPeer::redoSize(fx.window), 1U);
+
+  const MessageBoxAnswerer cancel({}, /*button=*/1);
+  MainWindowCustomTopicsTestPeer::deleteCustomTopic(fx.window, fx.keyOf("sensor/mine"));
+  QApplication::processEvents();
+  ASSERT_EQ(cancel.answered, 1);
+  EXPECT_EQ(transforms.transformIdsForPlugin(kEditor).size(), 2U);
+  EXPECT_EQ(MainWindowCustomTopicsTestPeer::undoSize(fx.window), before);
+  EXPECT_EQ(MainWindowCustomTopicsTestPeer::redoSize(fx.window), 1U);
+}
+
+// A cancelled delete leaves a change pending on the scene debounce its own step, not folded into the step before.
+TEST(MainWindowCustomTopicsTest, ACancelledTransformDeleteKeepsAPendingStepItsOwn) {
+  CustomTopicsFixture fx;
+  ASSERT_TRUE(fx.setUp());
+  PJ::DataProcessorService& transforms = fx.app().sessionManager().dataProcessorService();
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg", {"sensor/value"}, {"sensor/mine"}, kNegate, "{}"));
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg2", {"sensor/mine"}, {"sensor/chain"}, kNegate2, "{}"));
+  fx.app().catalogModel().rebuildFromDatastore();
+  MainWindowCustomTopicsTestPeer::syncCustomTopicsPanel(fx.window);
+  MainWindowCustomTopicsTestPeer::completeFileLoad(fx.window, u"/tmp/run.mcap"_s);
+  const std::size_t before = MainWindowCustomTopicsTestPeer::undoSize(fx.window);
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg", {"sensor/value"}, {"sensor/mine"}, kTriple, "{}"));
+  MainWindowCustomTopicsTestPeer::startSceneUndoDebounce(fx.window);
+
+  const MessageBoxAnswerer cancel({}, /*button=*/1);
+  MainWindowCustomTopicsTestPeer::deleteCustomTopic(fx.window, fx.keyOf("sensor/mine"));
+  QApplication::processEvents();
+  ASSERT_EQ(cancel.answered, 1);
+  MainWindowCustomTopicsTestPeer::fireSceneUndoDebounce(fx.window);
+  EXPECT_EQ(MainWindowCustomTopicsTestPeer::undoSize(fx.window), before + 1) << "the pending change is a step";
+
+  MainWindowCustomTopicsTestPeer::undo(fx.window);
+  const std::vector<PJ::DataProcessorService::TransformRecipe> live = transforms.transformRecipes();
+  const auto neg = std::find_if(
+      live.begin(), live.end(), [](const auto& recipe) { return recipe.key == std::string(kEditor) + "/neg"; });
+  ASSERT_NE(neg, live.end());
+  EXPECT_EQ(neg->script, kNegate) << "undone on its own";
+}
+
+// A cascade that fails part-way has already removed some dependents: that is still an undo step, so the next undo
+// brings them back instead of jumping past them.
+TEST(MainWindowCustomTopicsTest, ATransformDeleteWhoseCascadeFailsIsStillAnUndoStep) {
+  CustomTopicsFixture fx;
+  ASSERT_TRUE(fx.setUp());
+  PJ::DataProcessorService& transforms = fx.app().sessionManager().dataProcessorService();
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg", {"sensor/value"}, {"sensor/mine"}, kNegate, "{}"));
+  ASSERT_TRUE(transforms.upsertTransform(kEditor, "neg2", {"sensor/mine"}, {"sensor/chain"}, kNegate2, "{}"));
+  const auto leaf = transforms.upsertTransform(kEditor, "neg3", {"sensor/chain"}, {"sensor/leaf"}, kNegate3, "{}");
+  ASSERT_TRUE(leaf.has_value());
+  fx.app().catalogModel().rebuildFromDatastore();
+  MainWindowCustomTopicsTestPeer::syncCustomTopicsPanel(fx.window);
+  MainWindowCustomTopicsTestPeer::completeFileLoad(fx.window, u"/tmp/run.mcap"_s);
+  const std::size_t before = MainWindowCustomTopicsTestPeer::undoSize(fx.window);
+  // The leaf's node already gone from the engine: its removal fails, after which the cascade still removes "neg2".
+  ASSERT_TRUE(transforms.incrementalEngine().removeNode(leaf->node_id).has_value());
+
+  const MessageBoxAnswerer answerer;
+  MainWindowCustomTopicsTestPeer::deleteCustomTopic(fx.window, fx.keyOf("sensor/mine"));
+  QApplication::processEvents();
+  ASSERT_EQ(answerer.answered, 1);
+  const std::vector<std::string> left = transforms.transformIdsForPlugin(kEditor);
+  ASSERT_EQ(std::count(left.begin(), left.end(), "neg2"), 0) << "the cascade removed a dependent before failing";
+  EXPECT_EQ(MainWindowCustomTopicsTestPeer::undoSize(fx.window), before + 1) << "recorded despite the failure";
+
+  MainWindowCustomTopicsTestPeer::undo(fx.window);
+  const std::vector<std::string> restored = transforms.transformIdsForPlugin(kEditor);
+  EXPECT_EQ(std::count(restored.begin(), restored.end(), "neg2"), 1) << "the undo brings the dependent back";
+}
+
+// The scheduled refresh (a node state, an offset) rebuilds the on-demand rows only. The transform rows come from
 // the last full sync, rebuilt once more after the catalog changed.
 TEST(MainWindowCustomTopicsTest, AScheduledRefreshReusesTheTransformRows) {
   CustomTopicsFixture fx;
@@ -520,7 +847,7 @@ TEST(MainWindowCustomTopicsTest, AScheduledRefreshReusesTheTransformRows) {
   EXPECT_TRUE(fx.panel->customTopicNames().contains(u"sensor/chain"_s));
 }
 
-// UI-05: "+" exists only while a toolbox declares `custom_topics_editor`; with none every row is read-only.
+// "+" exists only while a toolbox declares `custom_topics_editor`; with none every row is read-only.
 TEST(MainWindowCustomTopicsTest, NoDeclaredEditorHidesPlusAndMakesRowsReadOnly) {
   CustomTopicsFixture fx;
   ASSERT_TRUE(fx.setUp());
@@ -534,7 +861,7 @@ TEST(MainWindowCustomTopicsTest, NoDeclaredEditorHidesPlusAndMakesRowsReadOnly) 
   EXPECT_FALSE(fx.edit->isEnabled());
 }
 
-// UI-06: rows are flat and named by recipe (the id, or `id/output` for several object outputs); an external owner
+// Rows are flat and named by recipe (the id, or `id/output` for several object outputs); an external owner
 // is badged, by its id when it is not loaded; the tooltip names the dataset.
 TEST(MainWindowCustomTopicsTest, CustomTopicsRowsAreFlatNamedByRecipe) {
   CustomTopicsFixture fx;
@@ -564,7 +891,7 @@ TEST(MainWindowCustomTopicsTest, CustomTopicsRowsAreFlatNamedByRecipe) {
   EXPECT_TRUE(crop->toolTip(0).contains(u"dataset run.mcap"_s)) << crop->toolTip(0).toStdString();
 }
 
-// PIN-08 (the panel half): removing a finding, announced by whoever removed it, takes its row out of Custom Topics
+// Removing a finding, announced by whoever removed it, takes its row out of Custom Topics
 // and the catalog with no further call from the shell.
 TEST(MainWindowCustomTopicsTest, RemovingAFindingRemovesItsRowEverywhere) {
   CustomTopicsFixture fx;
@@ -581,7 +908,7 @@ TEST(MainWindowCustomTopicsTest, RemovingAFindingRemovesItsRowEverywhere) {
   EXPECT_TRUE(fx.keyOf("assistant/pin/cropped").isEmpty());
 }
 
-// UI-07 through the session: the row glyph follows the node state, and a burst of state changes is one refresh
+// Through the session: the row glyph follows the node state, and a burst of state changes is one refresh
 // at the next event-loop turn, not one per change.
 TEST(MainWindowCustomTopicsTest, RowGlyphFollowsTheNodeStateAndBurstsCoalesce) {
   CustomTopicsFixture fx;
@@ -610,7 +937,7 @@ TEST(MainWindowCustomTopicsTest, RowGlyphFollowsTheNodeStateAndBurstsCoalesce) {
   EXPECT_EQ(MainWindowCustomTopicsTestPeer::customTopicsSyncs(fx.window), before + 1);
 }
 
-// PIN-09 through the shell: a finding's "Pinned at" follows the Source Timeline: a drag of its dataset (the
+// Through the shell: a finding's "Pinned at" follows the Source Timeline: a drag of its dataset (the
 // per-dataset offset signal) re-words it although no recipe row changed.
 TEST(MainWindowCustomTopicsTest, PinnedTooltipFollowsTheDatasetOffset) {
   CustomTopicsFixture fx;

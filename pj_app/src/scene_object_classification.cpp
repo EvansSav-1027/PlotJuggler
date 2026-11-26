@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MPL-2.0
 #include "scene_object_classification.h"
 
+#include "pj_runtime/CatalogModel.h"
+
 #ifdef PJ_WITH_SCENE2D
 #include "pj_scene2d_widgets/Scene2DDockWidget.h"
 #endif
@@ -35,7 +37,10 @@ bool isImageFamilyObjectType(sdk::BuiltinObjectType type) {
          type == sdk::BuiltinObjectType::kDepthImage || type == sdk::BuiltinObjectType::kImageAnnotations;
 }
 
-QString sceneKindForObjectType(sdk::BuiltinObjectType type) {
+QString panelKindForObjectType(sdk::BuiltinObjectType type) {
+  if (type == sdk::BuiltinObjectType::kLog) {
+    return u"log"_s;
+  }
   if (isImageFamilyObjectType(type)) {
     return is2dSceneObjectType(type) ? u"scene2d"_s : QString{};
   }
@@ -49,7 +54,18 @@ QString sceneKindForObjectType(sdk::BuiltinObjectType type) {
 }
 
 bool isDroppableObjectType(sdk::BuiltinObjectType type) {
-  return !sceneKindForObjectType(type).isEmpty();
+  return !panelKindForObjectType(type).isEmpty();
+}
+
+bool isCustomWidgetObjectType(sdk::BuiltinObjectType type) {
+  return type != sdk::BuiltinObjectType::kNone && !isPanelOnlyObjectType(type) && !isDroppableObjectType(type);
+}
+
+QString objectTypeBadgeIcon(sdk::BuiltinObjectType type) {
+  if (type == sdk::BuiltinObjectType::kLog) {
+    return u":/resources/svg/view_list.svg"_s;
+  }
+  return isCustomWidgetObjectType(type) ? u":/resources/svg/custom_widget.svg"_s : QString{};
 }
 
 }  // namespace PJ

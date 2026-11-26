@@ -246,8 +246,9 @@ void ModelRhiPass::admit(const PlaceFn& place, const MeshShadingParams& shading,
       if (mesh == layer->modelMeshes().end() || mesh->second == nullptr || !mesh->second->ok || draw.frame_id.empty()) {
         continue;
       }
-      // Cursor-placed (entry clock): a robot model's links ARE TF frames, and
-      // scene-entity models follow the marker rule (a finding at its stamp).
+      // Cursor-placed (entry clock): a robot model's links ARE TF frames. A
+      // scene-entity model is too (a finding's at its stamp): unlike the entity's
+      // primitives it does not use the entity's own stamp.
       const Scene3DLayer& owner = layer->modelLayer();
       const auto placed = place(draw.frame_id, owner.renderStamp(), owner.placementHoldFor(draw.frame_id));
       if (!placed.has_value()) {
@@ -338,7 +339,7 @@ void ModelRhiPass::admit(const PlaceFn& place, const MeshShadingParams& shading,
 
 void ModelRhiPass::prepare(const RhiFrameContext& frame, const MeshShadingParams& shading) {
   if (!ready()) {
-    return;  // never built: no layer of this family since the last release
+    return;
   }
   QRhi* rhi = frame.rhi;
   admitted_prepared_ = true;
@@ -973,8 +974,10 @@ bool ModelRhiPass::buildMesh(
       mesh.texture_refs.push_back(key);
       continue;
     }
-    const QRhiTexture::Flags flags = key.second ? QRhiTexture::sRGB : QRhiTexture::Flags{};
-    QRhiTexture* texture = rhi->newTexture(QRhiTexture::RGBA8, image->second.size(), 1, flags);
+    // Plain RGBA8 for every slot: model.frag decodes the colour slots itself,
+    // because Qt's OpenGL backend (desktop GL, WebGL) ignores QRhiTexture::sRGB
+    // for uncompressed formats and would hand the shader raw sRGB bytes as linear values.
+    QRhiTexture* texture = rhi->newTexture(QRhiTexture::RGBA8, image->second.size(), 1);
     if (texture == nullptr || !texture->create()) {
       delete texture;
       return fail("Could not allocate a model material texture");

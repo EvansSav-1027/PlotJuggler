@@ -2,7 +2,7 @@
 
 [← Back to the README](../README.md)
 
-PJ4 uses **C++20, CMake 3.22+ and Conan 2**, with Qt pinned in
+PJ4 uses **C++20, CMake 3.25+ and Conan 2**, with Qt pinned in
 [`versions.env`](../versions.env). The commands below follow the repository's
 Linux build scripts; the Windows entry points follow them, and packaging
 references are at the end.
@@ -28,10 +28,10 @@ sudo apt-get install -y \
   libva-dev libdrm-dev xvfb zstd
 ```
 
-Clone the public PJ4 branch with its submodules. `main` contains PJ3:
+Clone PJ4 (the `main` branch; PJ3 lives on `main-3.x`) with its submodules:
 
 ```bash
-git clone --branch main-4.x --recurse-submodules https://github.com/PlotJuggler/PlotJuggler.git
+git clone --recurse-submodules https://github.com/PlotJuggler/PlotJuggler.git
 cd PlotJuggler
 ```
 
@@ -42,7 +42,7 @@ Install the Python build tools in a virtual environment:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install 'conan>=2,<3' 'aqtinstall>=3.3'
+python -m pip install 'cmake>=3.25,<4' 'conan>=2,<3' 'aqtinstall>=3.3'
 ```
 
 If you do not already have a Conan default profile, create one:
@@ -67,7 +67,7 @@ resolves dependencies using `conan.lock`, and builds into `build/`.
 The first build may also compile missing dependencies.
 
 Rerun `./build.sh` for incremental builds. To omit the test suite, use
-`./build.sh --skip-test`; other options are listed by `./build.sh --help`.
+`./build.sh --no-tests`; other options are listed by `./build.sh --help`.
 
 Scene3D, the plots and the media viewer render through QRhi: OpenGL on Linux,
 D3D11 on Windows, Metal on macOS; `PJ_GRAPHICS_API=opengl|vulkan|d3d11|d3d12|metal`
@@ -93,18 +93,18 @@ configure CMake directly while network access is available:
 ./scripts/configure_conan_remote.sh
 conan install . --output-folder=build --build=missing \
   --lockfile=conan.lock --lockfile-partial \
-  -s build_type=RelWithDebInfo -s compiler.cppstd=20 \
+  -s build_type=Release -s compiler.cppstd=20 \
   -r plotjuggler-conan -r conancenter
 source versions.env
 cmake -S . -B build -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH="$PWD/.qt/$PJ_QT_VERSION/gcc_64" \
   -DPJ_BUILD_TESTS=OFF
 ```
 
 The Conan recipe and lockfile list the library dependencies; Qt is installed
-separately. The configure step also populates `build/_deps` with Qwt source.
+separately. The configure step also populates `build/_deps` with Qwt and nanoarrow source.
 With tests enabled, it additionally fetches the pinned SDK source for test
 fixtures. Conan may compile missing dependency binaries during preparation;
 the application has not been built yet.
@@ -123,8 +123,9 @@ with `--no-remote --build=never` in place of the two `-r` options and
 `--build=missing`. Cache preparation must use the same source revision, profiles,
 compiler, architecture and build options as the offline build. Generated CMake
 and Conan files contain absolute paths; a transferred build needs regeneration
-and local source overrides such as `FETCHCONTENT_SOURCE_DIR_QWT_UPSTREAM` and,
-when needed, `FETCHCONTENT_SOURCE_DIR_PLOTJUGGLER_SDK`.
+and local source overrides such as `FETCHCONTENT_SOURCE_DIR_QWT_UPSTREAM`,
+`FETCHCONTENT_SOURCE_DIR_NANOARROW` and, when needed,
+`FETCHCONTENT_SOURCE_DIR_PLOTJUGGLER_SDK`.
 
 ## Notes for PJ3 package maintainers
 
@@ -136,12 +137,24 @@ when needed, `FETCHCONTENT_SOURCE_DIR_PLOTJUGGLER_SDK`.
   [official-plugin porting guide](https://github.com/PlotJuggler/pj-official-plugins/blob/main/porting_guide.md).
   Install compatible extensions through **File → Marketplace**.
 - PJ4 filters use a different contract from PJ3 custom Lua functions; see
-  [Filter Class Contract](../pj_scripting/docs/FILTER_CLASS.md#5-differences-from-pj3-lua_custom_function-intentional).
+  [Filter Class Contract](../pj_scripting/docs/FILTER_CLASS.md#differences-from-pj3-lua_custom_function).
   Keep original PJ3 layouts and scripts when validating a migrated analysis.
-- Packaging and runtime-library deployment are separate from compiling the
-  application. Follow the [packaging guides](../packaging/README.md), including
-  the [Debian installation layout](../packaging/deb/README.md#layout), rather than
-  expecting `cmake --install` to install the desktop application and its runtime.
+- `cmake --install` installs `plotjuggler4` and its `pj-plugin-check` helper side
+  by side in `bin/` and, on Linux, the desktop entry and icons. The app seeds
+  bundled plugins from `<bindir>/../lib/plotjuggler/plugins` (macOS:
+  `<bindir>/../Resources/plugins`), which the install leaves empty. Qt, Python
+  and the libraries must come from the prefix; bundling them is packaging work,
+  so see the [packaging guides](../packaging/README.md), including the
+  [Debian installation layout](../packaging/deb/README.md#layout).
+- Switches for distribution builds, all OFF unless noted: `PJ_SYSTEM_QWT`,
+  `PJ_SYSTEM_NANOCDR` and `PJ_SYSTEM_ADS` take Qwt, nanocdr and
+  Qt-Advanced-Docking from the system (`PJ_SYSTEM_ADS` needs a 5.x from 5.1.1
+  on, since its SameMajorVersion package config rejects 6.x, carrying the
+  fork's "keep inactive tabs parented" patch; see the root `CMakeLists.txt`), and
+  `PJ_WARNINGS_AS_ERRORS` (ON) drops `-Werror` / `/WX` when turned off. An
+  installed `plotjuggler_sdk` is used only when its version equals the pin in
+  `conanfile.txt` (a pre-release pin accepts any installed version); otherwise
+  the pinned release is downloaded and built in-tree.
 
 ## Run tests
 
@@ -151,12 +164,19 @@ After a default build:
 ./test.sh
 ```
 
-The wrapper runs CTest without opening windows. For GUI and GPU coverage under a
-virtual display, use the same command as Linux CI:
+The wrapper runs CTest offscreen, so no test opens a window on your desktop. The
+QRhi display runners (label `qrhi`) skip there; `--display` runs them inside a
+private Xvfb (`xvfb-run`, `QT_QPA_PLATFORM=xcb`, `WAYLAND_DISPLAY` unset), serially
+as Linux CI does:
 
 ```bash
-xvfb-run -a ctest --test-dir build --output-on-failure --timeout 120
+./test.sh --display -L qrhi
 ```
+
+No test picks a real display on its own: a display pass runs only where
+`QT_QPA_PLATFORM` names a real QPA, as `--display` and the CI lanes do. On macOS
+and Windows `--display` uses the desktop (`cocoa`, `windows`), which has no virtual
+equivalent there.
 
 GPU-backed tests self-skip when there is no usable graphics backend (the QRhi
 display runners under `offscreen`, or a backend without a driver) — expected on a
@@ -210,8 +230,11 @@ Conan remote (anonymous read). Build paths without Conan (WebAssembly, pixi) fet
 pinned release tag from GitHub and build the SDK in-tree (see the root
 `CMakeLists.txt`). `pj_datastore` is added right after the SDK is resolved, so the
 `plotjuggler_sdk::base` and `pj_internal_fmt` targets it links already exist; its Conan
-dependencies (`nanoarrow`, `tsl-robin-map`, `benchmark`) are in the root
-`conanfile.txt`.
+dependencies (`tsl-robin-map`, `benchmark`) are in the root `conanfile.txt`. ConanCenter
+has no nanoarrow 0.9.0 with IPC: `pj_datastore/cmake/PjNanoarrow.cmake` takes
+an installed one (conda-forge's `libnanoarrow`) and otherwise builds the pinned Apache
+source release in-tree; pass `-DFETCHCONTENT_SOURCE_DIR_NANOARROW=<unpacked tarball>`
+to build offline.
 
 **Local-SDK mode.** `./build.sh --sdk-local[=PATH]` builds `plotjuggler_sdk` from a
 local working tree (default: the `../plotjuggler_sdk` sibling checkout) instead of the
@@ -224,23 +247,32 @@ Per-module gtest runners are registered with `gtest_discover_tests` in
 [`cmake/PjTests.cmake`](../cmake/PjTests.cmake), one process per case, under ctest names
 `<runner>.<Suite>.<Case>`. `test.sh` forces `QT_QPA_PLATFORM=offscreen` because many
 widget tests create a `QApplication` without choosing a platform and would otherwise
-open windows.
+open windows. Every runner registered there also installs the backward-cpp crash handler
+(`cmake/test_mains/pj_test_crash_handler.cpp`), so a crashing case prints its symbolized
+stack under `--output-on-failure` instead of a bare `SegFault`; sanitizer lanes leave it
+out and keep the sanitizer's own report, and Windows leaves it out because gtest already
+reports a crash there as an SEH exception.
 
 **Build tree size and debug info.** `./build.sh --minimal` builds what the packaging
 pipeline compiles (app closure only, no tests, demos or debug info); `--no-tests`,
 `--no-demos`, `--target NAME`, `--debug-info LEVEL` and `--no-compress-debug` select the
-pieces individually. For Linux RelWithDebInfo builds, `PJ_DEBUG_INFO=none|lines|full|split`
-selects no debug info, line/backtrace info, full DWARF, or DWARF in `.dwo` sidecars, and
-`PJ_COMPRESS_DEBUG=ON|OFF` controls zlib compression
-([`cmake/PjDebugInfo.cmake`](../cmake/PjDebugInfo.cmake)). `build.sh` defaults to `split`
-and `ON` on Linux; its options, or the same names as environment variables (how CI and
-the container wrapper drive it), override either knob.
+pieces individually. Every build, the app and its Conan dependencies alike, uses the stock
+`Release` flags (`-O3`; `/O2 /Ob2` on MSVC, whose Release links also get `/DEBUG` for a
+public-symbol PDB); debug info is the only addition. For Linux builds,
+`PJ_DEBUG_INFO=none|lines|full|split` selects no debug info, line/backtrace info, full
+DWARF, or DWARF in `.dwo` sidecars, and `PJ_COMPRESS_DEBUG=ON|OFF` controls zlib compression
+([`cmake/PjDebugInfo.cmake`](../cmake/PjDebugInfo.cmake)). `build.sh` defaults to `lines`
+(`-g1`: function names, file:line and inlined frames, enough for `perf` and backtraces;
+use `split` or `full` when gdb must show variables) and `ON` on Linux; its options, or
+the same names as environment variables (how CI and the container wrapper drive it),
+override either knob.
 [`packaging/appimage/build_in_docker.sh`](../packaging/appimage/build_in_docker.sh)
-defaults to `PJ_DEBUG_INFO=none`, so the AppImage ships without DWARF, and the Conan
+defaults to `PJ_DEBUG_INFO=none`, so the AppImage ships without DWARF (the `plotjuggler4`
+executable keeps its symbol table, so crash backtraces name its frames), and the Conan
 static archives in the builder image are stripped of DWARF; pass `--with-tests` to it to
 build the full suite and demos, then filter a module inside the builder image with
 `ctest -R '^pj_runtime_tests\.' --test-dir build`. Linux GNU/Clang builds use thin
-archives, and `resources.qrc` is compiled once as `pj_resources`.
+archives, and `resources.qrc` plus the splash memes in `memes.qrc` are compiled once as `pj_resources`.
 [`scripts/build_tree_size.sh`](../scripts/build_tree_size.sh) `<build-dir>` reports bytes
 by artifact class in decimal GB.
 
@@ -274,24 +306,33 @@ installs the `gcc_64` build.
 
 ## Portability
 
-Linux and Windows are shipped targets. macOS is not yet, but
+Linux, Windows and macOS arm64 are shipped targets; the macOS `.dmg` comes from
+[`macos-release.yml`](../.github/workflows/macos-release.yml) ([guide](../packaging/macos/README.md)).
 [`macos-ci.yml`](../.github/workflows/macos-ci.yml) builds and tests on macOS arm64
 (AppleClang, Scene3D on Metal) nightly when the default branch moved, and on demand
 (`gh workflow run "macOS CI" --ref <branch>`). AppleClang's `-Wunused-const-variable` and
 `-Wunused-lambda-capture` catch platform-conditional code GCC accepts, and macOS temp
 dirs sit behind the `/var -> /private/var` symlink, so tests must compare canonical paths.
 
+The nightly workflows (macOS CI, Pixi CI, Sanitizers, WASM CI with Firefox) run on the default branch when it moved
+since the previous night; the daily WASM plugins pin workflow instead proposes the browser build's plugins pin. A failed
+nightly opens a `Nightly failure: <workflow>` issue labelled `nightly-failure` and assigned to the maintainer, or
+comments on the one already open; the next nightly that runs green closes it
+([`nightly-failure.yml`](../.github/workflows/nightly-failure.yml)). Every test step gates its job: a test that
+cannot pass on a platform skips itself in the test, with the reason.
+
 Windows packaging: conda-forge ships no LGPL FFmpeg for win-64, so pixi-based Windows
 artifacts must use the local `recipes/ffmpeg` package (the Conan path builds its own
-LGPL-trimmed FFmpeg on all platforms). Windows runtime packaging (windeployqt plus the
-FFmpeg/Qt DLLs `pj_app` needs) is in scope: `windows-ci.yml` resolves DLLs through `PATH`
-at test time, which is not a shippable layout.
+LGPL-trimmed FFmpeg on all platforms). `windows-ci.yml` resolves the Qt and FFmpeg DLLs
+through `PATH` at test time, which is not a shippable layout; the installer and portable
+ZIP bundle them ([installer guide](../packaging/installer/README.md)).
 
 ## Third-party dependencies
 
-Vendored dependencies live in `3rdparty/<name>/` (the PJ3 convention) and are added from
+Vendored dependencies live in `3rdparty/<name>/` and are added from
 the top-level `CMakeLists.txt`, mostly with `add_subdirectory`. They are explicitly
-vendored: do not take them from Conan or system packages.
+vendored: do not take them from Conan or system packages (distribution builds can
+opt out with `PJ_SYSTEM_ADS` / `PJ_SYSTEM_NANOCDR`, above).
 
 - **Qt-Advanced-Docking-System**: the docking framework used by `pj_app`.
 - **nanocdr**: added with `add_subdirectory`.
@@ -307,19 +348,18 @@ vendored: do not take them from Conan or system packages.
 **Qwt is external, not vendored**: `3rdparty/qwt/` holds only CMake glue. The default
 build fetches the official release tarball (SHA-256 pinned) and compiles it unmodified on
 every path, pixi included (`-DPJ_SYSTEM_QWT=ON` can link conda-forge's prebuilt `qwt` once
-it is built against the pinned `qt6-main`). Never patch Qwt sources: behavior PJ3 carried
-as Qwt patches lives in the app, namely axis tick-label formatting in `pj_plotting`'s
+it is built against the pinned `qt6-main`). Never patch Qwt sources: behavior that
+would need a Qwt patch lives in the app, namely axis tick-label formatting in `pj_plotting`'s
 `PlotScaleDraw` (twin in `pj_dialog_host`'s chart preview) and the "Lines and Dots" curve
 style in `pj_plotting`'s `PlotCurve` (Lines plus one batched, pixel-weeded `drawDots`
 pass; `PlotRhiCanvas` builds the same square dots as geometry). See
 `3rdparty/qwt/README.PJ4.md`.
 
-Other PJ3-style vendorables (`QCodeEditor`, `sol2`, `color_widgets`, `date`) are vendored
-on the same pattern when a module needs them, decided case by case.
-
 Everything else (GLM, assimp, FFmpeg, the Lua runtime, ...) comes from Conan, including
 **backward-cpp** (`backward-cpp/1.6`): `pj_app` links `Backward::Backward` and installs a
-`backward::SignalHandling` crash handler in `main.cpp` for symbolized stack traces. Its
+`backward::SignalHandling` crash handler in `main.cpp` for symbolized stack traces (the gtest
+runners in `cmake/PjTests.cmake` install the same handler on Linux and macOS; neither does in
+the sanitizer lanes, whose own report it would replace). Its
 default `dw` backend pulls `elfutils` from Conan, so rich traces need no system `-dev`
 packages.
 
@@ -331,11 +371,18 @@ Windows builds use the same Conan + CMake flow through three root entry points,
 with Windows and share `scripts\windows\PjWindowsCommon.ps1`. They mirror `build.sh` / `run.sh` / `test.sh` (same options, same
 `PJ_*` variables, same `build\` tree) and reproduce the Windows CI job: VS 2022
 MSVC 14.4x, Conan with every profile setting pinned (`compiler.version=194`),
-Ninja Multi-Config, RelWithDebInfo with `/Z7` embedded debug info. A local
+Ninja Multi-Config, Release with `/Z7` embedded debug info (CI and the
+release build compile that configuration without debug info). A local
 `build\` therefore accepts the exact commands from
 [`windows-ci.yml`](../.github/workflows/windows-ci.yml) (`cmake -S . -B build
--G "Ninja Multi-Config" ...`, `cmake --build build --config RelWithDebInfo`,
-`ctest --test-dir build --build-config RelWithDebInfo`) and vice versa.
+-G "Ninja Multi-Config" ...`, `cmake --build build --config Release`,
+`ctest --test-dir build --build-config Release`) and vice versa.
+
+`plotjuggler4.exe` is a GUI-subsystem program, so it opens no console window.
+Started from a terminal it attaches to that terminal for its output (`--help`,
+the self-tests, Qt's log), but an interactive cmd or PowerShell prompt does not
+wait for it, so the prompt comes back at once and `%ERRORLEVEL%` / `$LASTEXITCODE`
+is not its exit code. `run.bat`, Git Bash, a batch file and `start /wait` do wait.
 
 Install:
 
@@ -390,7 +437,7 @@ lines of Conan's `global.conf` to point there and at ConanCenter's source
 mirror, and printing the edit; `core.*` settings cannot be passed on the
 command line), runs `conan install` with the CI settings, configures with
 `-G "Ninja Multi-Config"` into `build\`, copies `build\compile_commands.json` to
-the repository root, and builds the `RelWithDebInfo` configuration. The first
+the repository root, and builds the `Release` configuration. The first
 build compiles any dependency the remotes have no binary for (FFmpeg, CPython,
 assimp, ...) from source and can take well over an hour; later builds are
 incremental. `build.bat --help` lists the options; they are the ones `build.sh`
@@ -399,7 +446,7 @@ accepts, except that `--sanitize`, `--tsan`, `--debug-info` and
 Conan and CMake command lines without building. `sccache` is used as the
 compiler launcher when it is on `PATH`.
 
-The application is `build\pj_app\RelWithDebInfo\plotjuggler4.exe` (Ninja
+The application is `build\pj_app\Release\plotjuggler4.exe` (Ninja
 Multi-Config puts each configuration's binaries in a subdirectory). It needs the
 Qt, FFmpeg and CPython DLLs at load time; `run.bat` prepends the pinned Qt `bin\`
 and the Conan bin directories recorded at configure time in
@@ -410,7 +457,7 @@ than double-clicking the exe. Arguments are forwarded to the application
 a notice and launch normally.
 
 `test.bat` sets up the same `PATH`, forces `QT_QPA_PLATFORM=offscreen`, and runs
-`ctest --test-dir build --build-config RelWithDebInfo --output-on-failure
+`ctest --test-dir build --build-config Release --output-on-failure
 --no-tests=error --timeout 120` followed by your arguments; `--test-dir DIR`
 selects another tree, `--sanitize` accepts only `none`, and the exit code is
 ctest's.

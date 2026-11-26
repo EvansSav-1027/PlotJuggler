@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -71,7 +72,7 @@ const DecodedFrame* onlyPixelLayerFrame(const MediaFrame& frame) {
 }
 
 // Bridges the source's worker-thread frame-ready callback to a condition variable
-// the test can block on (decoding is now off-thread). Install AFTER the set*()
+// the test can block on. Install AFTER the set*()
 // calls and before the first setTimestamp().
 // Declare it BEFORE the source it is installed on: the source's worker thread
 // calls into it until the source is destroyed.
@@ -147,7 +148,7 @@ TEST(DepthPipelineSourceTest, EmitsRawDepthFloatsWithParams) {
   EXPECT_EQ(layer_frame->depth.colormap, 0u);  // kTurbo
 }
 
-// Resolve-before-memo regression: a request landing on the already-delivered
+// A request landing on the already-delivered
 // entry must dedup on metadata alone WITHOUT resolving payload bytes — a resolve
 // is a cold refetch (file read + whole-chunk decompress) once the
 // ResidentPayloadPool has evicted the entry's seed. The store's warm latestAt
@@ -225,6 +226,53 @@ TEST(DepthPipelineSourceTest, SameStampReplacementDecodesAgain) {
   ASSERT_NE(frame->pixels, nullptr);
   const auto* depths = reinterpret_cast<const float*>(frame->pixels->data());
   EXPECT_FLOAT_EQ(depths[0], 2.0f) << "replacement content did not reach the decoded frame";
+}
+
+// Rows longer than a SIMD lane, with every kind of no-data sample: the conversion is one vectorizable loop per
+// encoding, and its vector body and scalar tail must agree.
+TEST(DepthPipelineSourceTest, LongRowsConvertEverySampleAndZeroTheInvalidOnes) {
+  ObjectStore store;
+  auto topic = registerDepthTopic(store);
+  ASSERT_NE(topic.id, 0u);
+
+  constexpr uint32_t kSamples = 37;
+  std::vector<uint16_t> millimeters(kSamples);
+  std::vector<float> meters(kSamples);
+  std::vector<float> expected_from_meters(kSamples);
+  const float invalid[] = {
+      std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -1.0f, 0.0f};
+  for (uint32_t i = 0; i < kSamples; ++i) {
+    millimeters[i] = i % 5 == 0 ? uint16_t{0} : static_cast<uint16_t>(i * 1700);
+    const bool valid = i % 3 != 0;
+    meters[i] = valid ? 0.25f * static_cast<float>(i) : invalid[(i / 3) % 4];
+    expected_from_meters[i] = valid ? meters[i] : 0.0f;
+  }
+  ASSERT_TRUE(store.pushOwned(topic, 1'000, serializeDepth(kSamples, 1, "16UC1", makeU16Le(millimeters))).has_value());
+  ASSERT_TRUE(store.pushOwned(topic, 2'000, serializeDepth(kSamples, 1, "32FC1", makeF32Le(meters))).has_value());
+
+  FrameSync sync;
+  DepthPipelineSource source(&store, topic);
+  sync.install(source);
+
+  auto from_mm = pumpFrameAt(source, sync, 1'000);
+  ASSERT_TRUE(from_mm.has_value());
+  const DecodedFrame* mm_frame = onlyPixelLayerFrame(*from_mm);
+  ASSERT_NE(mm_frame, nullptr);
+  ASSERT_EQ(mm_frame->pixels->size(), kSamples * sizeof(float));
+  const auto* mm_depths = reinterpret_cast<const float*>(mm_frame->pixels->data());
+  for (uint32_t i = 0; i < kSamples; ++i) {
+    EXPECT_FLOAT_EQ(mm_depths[i], static_cast<float>(millimeters[i]) * 0.001f) << i;
+  }
+
+  auto from_m = pumpFrameAt(source, sync, 2'000);
+  ASSERT_TRUE(from_m.has_value());
+  const DecodedFrame* m_frame = onlyPixelLayerFrame(*from_m);
+  ASSERT_NE(m_frame, nullptr);
+  ASSERT_EQ(m_frame->pixels->size(), kSamples * sizeof(float));
+  const auto* m_depths = reinterpret_cast<const float*>(m_frame->pixels->data());
+  for (uint32_t i = 0; i < kSamples; ++i) {
+    EXPECT_EQ(m_depths[i], expected_from_meters[i]) << i;
+  }
 }
 
 TEST(DepthPipelineSourceTest, Emits32FC1FloatsPassthrough) {

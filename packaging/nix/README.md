@@ -15,7 +15,7 @@ nix flake check                   # build + installed-package smoke checks
 ```
 
 `packages.x86_64-linux.plotjuggler` and `apps.x86_64-linux.plotjuggler` alias the
-default outputs, preserving the old flake's names. The executable is `plotjuggler4`.
+default outputs. The executable is `plotjuggler4`.
 The package includes the desktop entry, icon, and sibling `pj-plugin-check` helper.
 Tests, demos, and the optional GPL raster helper are excluded from the app build.
 
@@ -56,11 +56,15 @@ ordinary CMake builds in the development shell see the working tree directly.
   uses Qt private headers.
 - The SDK version comes from `conanfile.txt`, and its source hash comes from the
   root `CMakeLists.txt`. Nix fetches and unpacks those verified bytes, then supplies
-  them through `FETCHCONTENT_SOURCE_DIR_PLOTJUGGLER_SDK`.
+  them through `FETCHCONTENT_SOURCE_DIR_PLOTJUGGLER_SDK`. nanoarrow arrives the same
+  way (`FETCHCONTENT_SOURCE_DIR_NANOARROW`), from the URL and hash pinned in
+  `pj_datastore/cmake/PjNanoarrow.cmake`: Nixpkgs' nanoarrow is older and Meson-built.
 - Compatible Nixpkgs packages supply the other dependencies where possible.
-  Luau's embedding libraries, nanoarrow with IPC/flatcc, Cloudini, MCAP C++ headers,
-  and decode-only LGPL FFmpeg reuse the pins in `recipes/`. Their existing CMake
+  Luau's embedding libraries, MCAP C++ headers, and
+  decode-only LGPL FFmpeg reuse the pins in `recipes/`. Their existing CMake
   adapters and FFmpeg build/license/consumer checks are reused rather than copied.
+  Cloudini has no recipe (conda takes it from conda-forge): `dependencies.nix`
+  pins it and it installs its own CMake package, `cloudini_lib`.
 - `inputs.self.submodules` includes the Git-pinned vendored sources. Configure and
   compilation run without network access; only Nix's fixed-output fetches download
   dependency sources. The optional raster helper is not compiled or installed.

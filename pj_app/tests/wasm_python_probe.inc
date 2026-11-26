@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -131,8 +132,8 @@ constexpr const char* kWasmPyBuiltinLoop =
     "def evaluate(inputs, params):\n    s = 0\n    for i in range(200000):\n        s += abs(-i)\n    return "
     "float(s)\n";
 
-/// Mean per-call micros over 2001 back-to-back runs. Not the desktop bench's median: browsers coarsen the clock
-/// (about 20 us steps), which a per-call median reads as one step.
+/// Mean per-call micros over 2001 back-to-back runs. Not the desktop bench's median: browsers coarsen the clock, which
+/// a per-call median reads as one step.
 double wasmPyMeanMicros(
     const PJ::scripting::CompiledPythonScript& script, const std::vector<PJ::scripting::NamedValue>& inputs) {
   const auto begin = std::chrono::steady_clock::now();
@@ -151,6 +152,14 @@ void wasmPyWorkerChecks() {
   qInfo(
       "PJ_WASM_PY_BOOT worker_ms=%.1f %s", wasmPyMillisSince(boot_begin),
       booted ? "ok" : ("error=" + booted.error()).c_str());
+  struct stat zip_stat{};
+  qInfo(
+      "PJ_WASM_PY_STDLIB stat=%d bytes=%lld", ::stat("/lib/python314.zip", &zip_stat),
+      static_cast<long long>(zip_stat.st_size));
+  if (!booted) {  // no interpreter: the checks below would call into CPython unbooted (the stdlib walk does)
+    qInfo("PJ_WASM_PY_DONE");
+    return;
+  }
   // Then, before anything else imports: the allowed modules' lazy dependencies inside a strict, armed run (heapq
   // behind statistics.Counter, decimal's C fallback to _pydecimal behind statistics.Decimal), then the surface walk.
   if (auto lazy = compileOnDemandScriptPython(kWasmPyLazyScript)) {
@@ -172,9 +181,40 @@ void wasmPyWorkerChecks() {
   }
 
   const std::vector<NamedValue> x_input{NamedValue{.name = "x", .value = 3.0}};
-  if (auto four = compileOnDemandScriptPython(kWasmPyFourLineScript)) {
+  // The same 4-line script in Python and in Luau, timed in alternating rounds: measured one after the other, a change
+  // of clock speed or core between the two (a hybrid CPU, a busy runner) moved their ratio by half on its own.
+  // Each line reports the median round's per-call micros.
+  auto four = compileOnDemandScriptPython(kWasmPyFourLineScript);
+  auto luau4 = compileOnDemandScript("local inputs = ...\nlocal x = inputs.x\nreturn { y = math.sqrt(x * x + 1.0) }\n");
+  if (four && luau4) {
+    const PJ::Span<const NamedValue> luau_inputs(x_input.data(), x_input.size());
     const std::string outcome = wasmPyOutcome(wasmPyRun(*four, x_input));
-    qInfo("PJ_WASM_PY_PERCALL four_line_mean_us=%.2f %s", wasmPyMeanMicros(*four, x_input), outcome.c_str());
+    // Untimed, like Python's run above: Luau's first call on this thread builds its sandboxed state.
+    const std::string luau_outcome = wasmPyOutcome(runOnDemandScript(*luau4, luau_inputs, "{}", {}));
+    // The median round: a summed mean let one stall of a few ms (a migration, a GC) carry the ratio alone.
+    // A 100-call round lasts milliseconds, far above the browsers' coarsened clock step.
+    constexpr int kRounds = 21;
+    constexpr int kCallsPerRound = 100;
+    int failed = 0;
+    std::vector<double> python_rounds;
+    std::vector<double> luau_rounds;
+    const auto time_round = [&failed](auto&& run) {
+      const auto begin = std::chrono::steady_clock::now();
+      for (int i = 0; i < kCallsPerRound; ++i) {
+        failed += run() ? 0 : 1;
+      }
+      return wasmPyMillisSince(begin) * 1000.0 / kCallsPerRound;
+    };
+    for (int round = 0; round < kRounds; ++round) {
+      python_rounds.push_back(time_round([&] { return bool(wasmPyRun(*four, x_input)); }));
+      luau_rounds.push_back(time_round([&] { return bool(runOnDemandScript(*luau4, luau_inputs, "{}", {})); }));
+    }
+    const auto median = [](std::vector<double>& rounds) {
+      std::nth_element(rounds.begin(), rounds.begin() + kRounds / 2, rounds.end());
+      return rounds[kRounds / 2];
+    };
+    qInfo("PJ_WASM_PY_PERCALL four_line_mean_us=%.2f failed=%d %s", median(python_rounds), failed, outcome.c_str());
+    qInfo("PJ_WASM_PY_PERCALL luau_four_line_mean_us=%.2f %s", median(luau_rounds), luau_outcome.c_str());
   }
 
   if (auto forty_three = compileOnDemandScriptPython(kWasmPyFortyThreeLineScript)) {
@@ -188,8 +228,9 @@ void wasmPyWorkerChecks() {
     }
   }
 
-  // Allocation-heavy (ARCHITECTURE §19's sum(range(n))): each element past 256 is an int allocated and freed under the
-  // cap, inside one C call. Best of three; a lax watchdog, since Firefox runs it several times slower.
+  // Allocation-heavy (the sum(range(n)) case of docs/derived_objects/ARCHITECTURE.md): each element past 256 is an int
+  // allocated and freed under the cap, inside one C call. Best of three; a lax watchdog, since Firefox runs it several
+  // times slower.
   if (auto alloc =
           compileOnDemandScriptPython("def evaluate(inputs, params):\n    return float(sum(range(1_000_000)))\n")) {
     RunOptions options;
@@ -213,14 +254,6 @@ void wasmPyWorkerChecks() {
     qInfo(
         "PJ_WASM_PY_LOOP luau_pure ns_per_iter=%.1f %s", wasmPyMillisSince(begin) * 1e6 / 200000.0,
         wasmPyOutcome(result).c_str());
-  }
-  if (auto luau4 =
-          compileOnDemandScript("local inputs = ...\nlocal x = inputs.x\nreturn { y = math.sqrt(x * x + 1.0) }\n")) {
-    const auto begin = std::chrono::steady_clock::now();
-    for (int i = 0; i < 2001; ++i) {
-      (void)runOnDemandScript(*luau4, PJ::Span<const NamedValue>(x_input.data(), x_input.size()), "{}", {});
-    }
-    qInfo("PJ_WASM_PY_PERCALL luau_four_line_mean_us=%.2f", wasmPyMillisSince(begin) * 1000.0 / 2001.0);
   }
 
   if (auto spin = compileOnDemandScriptPython("def evaluate(inputs, params):\n    while True:\n        pass\n")) {
@@ -264,10 +297,8 @@ void wasmPyWorkerChecks() {
 extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_python_smoke() {
   using namespace PJ::scripting;
   qInfo("PJ_WASM_PY_AVAILABLE %d", pythonAvailable() ? 1 : 0);
-  struct stat zip_stat{};
-  qInfo(
-      "PJ_WASM_PY_STDLIB stat=%d bytes=%lld", ::stat("/lib/python314.zip", &zip_stat),
-      static_cast<long long>(zip_stat.st_size));
+  struct stat zip_stat{};  // no stdlib before the first Python use downloads it (python_sandbox.cpp)
+  qInfo("PJ_WASM_PY_STDLIB_BEFORE stat=%d", ::stat("/lib/python314.zip", &zip_stat));
   const auto begin = std::chrono::steady_clock::now();
   auto compiled = compileOnDemand("python", kWasmPyFourLineScript);
   qInfo(
@@ -278,8 +309,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_python_smoke() {
 
 /// Worst case for the GUI thread: a worker script holds the GIL inside one C call (`sum` over a long range, sized to
 /// outlast the spec's 500 ms settle and the validate's 100 ms bound many times over even in the fastest browser; it is
-/// a wall-clock hold, which neither the GIL switch interval nor the watchdog interrupts) while the GUI compiles. A pure-Python loop would not
-/// do: it hands the GIL over every switch interval (5 ms).
+/// a wall-clock hold, which neither the GIL switch interval nor the watchdog interrupts) while the GUI compiles. A
+/// pure-Python loop would not do: it hands the GIL over every switch interval (5 ms).
 /// `pj_wasm_test_python_hold_gil` first validates a broken script while the interpreter is free (the error comes back),
 /// then starts the holder; `pj_wasm_test_python_compile_now`, called while it runs, logs how long the GUI waited for a
 /// compile (no wait: the script compiles at its first run) and for a validate (its bound, then unchecked), then runs
@@ -325,4 +356,31 @@ extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_python_compile_now() {
         wasmPyOutcome(runOnDemand(script, PJ::Span<const NamedValue>(x_input.data(), x_input.size()), "{}", {}, {}))
             .c_str());
   }).detach();
+}
+
+/// The stdlib download's failures, before the first successful Python use (tests/wasm/python.spec.js routes the
+/// download). Step 0, GUI thread: a recipe's handle, compiled as the GUI does (no interpreter). Step 1, GUI thread: a
+/// validate of a valid script, waiting up to `arg` ms. Step 2: that one handle run on a worker, numbered by `arg`.
+/// Step 3: a failed download's retry cooldown, `arg` ms.
+extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_python_stdlib(int step, int arg) {
+  using namespace PJ::scripting;
+  static std::optional<CompiledOnDemandScript> handle;  // set by step 0 before any step 2 reads it
+  if (step == 0) {
+    auto compiled = compileOnDemand("python", kWasmPyValueScript);
+    qInfo("PJ_WASM_PY_DL_HANDLE %s", compiled ? "ok" : ("error=" + compiled.error()).c_str());
+    if (compiled) {
+      handle = std::move(*compiled);
+    }
+  } else if (step == 1) {
+    setPythonValidateWaitForTest(static_cast<std::uint64_t>(arg));
+    const auto checked = checkOnDemand("python", kWasmPyValueScript);
+    setPythonValidateWaitForTest(0);
+    qInfo("PJ_WASM_PY_DL_VALIDATE %s", wasmPyCheckOutcome(checked).c_str());
+  } else if (step == 3) {
+    setPythonStdlibRetryCooldownForTest(static_cast<std::uint64_t>(arg));
+  } else if (step == 2 && handle) {
+    std::thread([arg] {
+      qInfo("PJ_WASM_PY_DL_RUN %d %s", arg, wasmPyOutcome(runOnDemand(*handle, {}, "{}", {}, {})).c_str());
+    }).detach();
+  }
 }

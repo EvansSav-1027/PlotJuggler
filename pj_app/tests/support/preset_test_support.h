@@ -45,12 +45,23 @@ class PresetTestPeer {
   [[nodiscard]] static Workspace capture(const MainWindow& window) {
     return window.captureWorkspace();
   }
-  static void loadLayoutFile(MainWindow& window, const QString& path) {
-    window.loadLayoutFromPath(path, MainWindow::LayoutLoadInteractivity::kAutomated);
+  // As --layout opens it, or as File → Load Layout does when `interactive` (which asks
+  // before reloading or starting the layout's sources).
+  static void loadLayoutFile(MainWindow& window, const QString& path, bool interactive = false) {
+    window.loadLayoutFromPath(
+        path, interactive ? MainWindow::LayoutLoadInteractivity::kInteractive
+                          : MainWindow::LayoutLoadInteractivity::kAutomated);
+  }
+  // File → Save Layout, "Bind to this data source" as given.
+  static void saveLayoutFile(MainWindow& window, const QString& path, bool include_data_source) {
+    window.saveLayoutToPath(path, include_data_source);
   }
   // What File → Save Layout with Sources writes.
   [[nodiscard]] static std::optional<QDomDocument> sourceLayout(const MainWindow& window, QString& error) {
     return window.browserSourceLayoutDocument(error);
+  }
+  [[nodiscard]] static QString sideFilePrompt(const QString& name, const QString& source_path, int number, int total) {
+    return MainWindow::browserReplaySideFilePrompt(name, source_path, number, total);
   }
   // The undo/redo snapshot of the live workspace.
   [[nodiscard]] static QByteArray liveState(const MainWindow& window) {

@@ -1,10 +1,9 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 
-// M4.2 Task 4 — the DataProcessorService *transform* API (plugin-created,
-// named, owned, persisted nodes), distinct from the per-curve filter path.
-// Transforms share the eager IncrementalEngine substrate but live in their own
-// recipe map keyed by "<plugin_id>/<id>".
+// The DataProcessorService transform API (plugin-created, named, owned, persisted nodes), distinct from the per-curve
+// filter path. Transforms share the eager IncrementalEngine substrate but live in their own recipe map keyed by
+// "<plugin_id>/<id>".
 
 #include <gtest/gtest.h>
 
@@ -27,6 +26,7 @@
 #include "pj_base/dataset.hpp"
 #include "pj_base/type_tree.hpp"
 #include "pj_base/types.hpp"
+#include "pj_bench_stats.h"
 #include "pj_datastore/engine.hpp"
 #include "pj_datastore/incremental_engine.hpp"
 #include "pj_datastore/query.hpp"
@@ -92,6 +92,34 @@ constexpr const char* kScale = R"LUAU(return { {
     return { calculate = function(time, value) return value * 2 end }
   end
 } })LUAU";
+
+constexpr const char* kScaleBoom = R"LUAU(return { {
+  id = "scale_boom", name = "Scale Boom", output = "same",
+  create = function(params)
+    return { calculate = function(time, value) error("boom") end }
+  end
+} })LUAU";
+
+// Classifies each sample into a state label: a text output (`output = "string"`), one input or several.
+constexpr const char* kState = R"LUAU(-- pj-script: luau
+return { id="state", name="State", output="string",
+  create = function(p) return { calculate = function(t, v, ...)
+    if select("#", ...) > 0 then return v > 1.5 and "fast" or "slow", "seen" end
+    return v < 0 and "falling" or "walking"
+  end } end }
+)LUAU";
+
+std::vector<std::string> readStrings(DataEngine& engine, TopicId tid, std::size_t col) {
+  std::vector<std::string> out;
+  const auto lock = engine.lockEngine();
+  const TopicStorage* storage = engine.getTopicStorage(tid);
+  if (!storage) {
+    return out;
+  }
+  auto cursor = rangeQuery(storage->sealedChunks(), 0, std::numeric_limits<Timestamp>::max());
+  cursor.forEach([&](const SampleRow& row) { out.emplace_back(row.chunk->readString(col, row.row_index)); });
+  return out;
+}
 
 // Read one column of a topic as doubles (readValues above is column-0 only).
 std::vector<double> readColumn(DataEngine& engine, TopicId tid, std::size_t col) {
@@ -283,6 +311,15 @@ TEST(DataProcessorTransformTest, RemoveFilterRejectsTransformNodeId) {
   EXPECT_TRUE(fx.listed(recipe->output_topic_ids.front()));
 }
 
+// An in-place edit rewrites rows under the same TopicIds, so no new topic reaches the catalog: plots drop their
+// cached samples only on a non-live samplesIngested.
+void recordIngested(SessionManager& session, std::unordered_set<TopicId>& announced) {
+  QObject::connect(&session, &SessionManager::samplesIngested, [&announced](const QVector<TopicId>& ids, bool live) {
+    EXPECT_FALSE(live);
+    announced.insert(ids.begin(), ids.end());
+  });
+}
+
 TEST(DataProcessorTransformTest, UpsertReplacesExistingNode) {
   Fixture fx;
   fx.seed("speed", {1.0, 2.0});
@@ -292,12 +329,61 @@ TEST(DataProcessorTransformTest, UpsertReplacesExistingNode) {
   EXPECT_EQ(readValues(fx.engine, first->output_topic_ids.front()), (std::vector<double>{-1.0, -2.0}));
 
   // Same key, new script -> replace in place; one recipe, new behaviour.
+  std::unordered_set<TopicId> ingested;
+  recordIngested(fx.session, ingested);
   const auto second = fx.service.upsertTransform("pluginA", "negate", {"speed"}, {"speed/out"}, kTimes10, "{}");
   ASSERT_TRUE(second.has_value()) << second.error();
+  EXPECT_TRUE(ingested.contains(first->output_topic_ids.front()));
   EXPECT_EQ(fx.service.transformRecipes().size(), 1u);
   EXPECT_EQ(second->node_id, first->node_id);
   EXPECT_EQ(second->output_topic_ids, first->output_topic_ids);
   EXPECT_EQ(readValues(fx.engine, second->output_topic_ids.front()), (std::vector<double>{10.0, 20.0}));
+}
+
+TEST(DataProcessorTransformTest, InPlaceEditAnnouncesChainedOutputs) {
+  Fixture fx;
+  fx.seed("speed", {1.0, 2.0});
+  const auto parent = fx.service.upsertTransform("pluginA", "negate", {"speed"}, {"mid"}, kNegate, "{}");
+  ASSERT_TRUE(parent.has_value()) << parent.error();
+  const auto child = fx.service.upsertTransform("pluginB", "negate", {"mid"}, {"final"}, kNegate, "{}");
+  ASSERT_TRUE(child.has_value()) << child.error();
+
+  std::unordered_set<TopicId> ingested;
+  recordIngested(fx.session, ingested);
+  const auto replaced = fx.service.upsertTransform("pluginA", "negate", {"speed"}, {"mid"}, kTimes10, "{}");
+  ASSERT_TRUE(replaced.has_value()) << replaced.error();
+
+  EXPECT_TRUE(ingested.contains(parent->output_topic_ids.front()));
+  EXPECT_TRUE(ingested.contains(child->output_topic_ids.front()));
+}
+
+TEST(DataProcessorTransformTest, FilterUpdateAnnouncesRewrittenOutputs) {
+  Fixture fx;
+  fx.seed("speed", {1.0, 2.0});
+  auto catalogue = std::make_shared<scripting::FilterCatalogue>(scripting::makeLuauEngine());
+  ASSERT_TRUE(catalogue->addBundledSource(kScale, "test").has_value());
+  fx.service.setFilterCatalogue(catalogue);
+  const auto filtered = fx.service.applyFilter(fx.input, fx.ds, "scale", "filtered");
+  ASSERT_TRUE(filtered.has_value()) << filtered.error();
+  const auto child = fx.service.upsertTransform("pluginB", "negate", {"filtered"}, {"final"}, kNegate, "{}");
+  ASSERT_TRUE(child.has_value()) << child.error();
+  auto processor = catalogue->makeProcessor("scale", "{}");
+  ASSERT_TRUE(processor.has_value()) << processor.error();
+
+  std::unordered_set<TopicId> ingested;
+  recordIngested(fx.session, ingested);
+  ASSERT_TRUE(fx.service.updateFilter(filtered->node_id, std::move(processor).value()).has_value());
+  EXPECT_TRUE(ingested.contains(filtered->output_topic_id));
+  EXPECT_TRUE(ingested.contains(child->output_topic_ids.front()));
+
+  // A failed update reverts and replays, so it rewrites the outputs too.
+  ASSERT_TRUE(catalogue->addBundledSource(kScaleBoom, "test").has_value());
+  auto failing = catalogue->makeProcessor("scale_boom", "{}");
+  ASSERT_TRUE(failing.has_value()) << failing.error();
+  ingested.clear();
+  EXPECT_FALSE(fx.service.updateFilter(filtered->node_id, std::move(failing).value()).has_value());
+  EXPECT_TRUE(ingested.contains(filtered->output_topic_id));
+  EXPECT_TRUE(ingested.contains(child->output_topic_ids.front()));
 }
 
 TEST(DataProcessorTransformTest, ExistingKeyCannotChangePersistentLifetime) {
@@ -350,8 +436,13 @@ TEST(DataProcessorTransformTest, FailedCompatibleReplacementRollsBackRootAndDepe
   const auto child = fx.service.upsertTransform("pluginB", "negate", {"mid"}, {"final"}, kNegate, "{}");
   ASSERT_TRUE(child.has_value()) << child.error();
 
+  // The failed run and the revert's replay both rewrite the outputs: plots must drop their cached samples.
+  std::unordered_set<TopicId> ingested;
+  recordIngested(fx.session, ingested);
   const auto failed = fx.service.upsertTransform("pluginA", "negate", {"speed"}, {"mid"}, kNegateBoom, "{}");
   ASSERT_FALSE(failed.has_value());
+  EXPECT_TRUE(ingested.contains(parent->output_topic_ids.front()));
+  EXPECT_TRUE(ingested.contains(child->output_topic_ids.front()));
   EXPECT_EQ(fx.service.transformRecipes().size(), 2u);
   EXPECT_TRUE(fx.service.incrementalEngine().hasNode(parent->node_id));
   EXPECT_TRUE(fx.service.incrementalEngine().hasNode(child->node_id));
@@ -395,6 +486,80 @@ TEST(DataProcessorTransformTest, RemovingTransformCascadesDownstreamFilter) {
   EXPECT_FALSE(fx.listed(child->output_topic_id));
 }
 
+// "Remove all Datasets" reaches SessionManager::removeDataset without the shell's cascade prompt: the processors
+// reading the dataset must go with it, or the bridge's `list` keeps them and their names stay taken.
+TEST(DataProcessorTransformTest, RemovingTheInputDatasetRemovesItsProcessors) {
+  Fixture fx;
+  fx.seed("speed", {1.0, 2.0});
+  const auto parent = fx.service.upsertTransform("pluginA", "negate", {"speed"}, {"mid"}, kNegate, "{}");
+  ASSERT_TRUE(parent.has_value()) << parent.error();
+  auto catalogue = std::make_shared<scripting::FilterCatalogue>(scripting::makeLuauEngine());
+  ASSERT_TRUE(catalogue->addBundledSource(kScale, "test").has_value());
+  fx.service.setFilterCatalogue(std::move(catalogue));
+  ASSERT_TRUE(fx.service.applyFilter(parent->output_topic_ids.front(), fx.ds, "scale", "final").has_value());
+
+  fx.session.removeDataset(fx.ds);
+  EXPECT_TRUE(fx.service.transformIdsForPlugin("pluginA").empty());
+  EXPECT_TRUE(fx.service.transformRecipes().empty());
+  EXPECT_TRUE(fx.service.recipes().empty());
+
+  fx.seed("speed", {3.0});
+  const auto again = fx.service.upsertTransform("pluginA", "negate", {"speed"}, {"mid"}, kNegate, "{}");
+  EXPECT_TRUE(again.has_value()) << again.error();
+}
+
+// A merge or a reload can retire a topic a processor still reads; listTopics() hides it, the erase does not.
+TEST(DataProcessorTransformTest, RemovingTheDatasetRemovesAProcessorReadingARetiredTopic) {
+  Fixture fx;
+  fx.seed("speed", {1.0, 2.0});
+  ASSERT_TRUE(fx.service.upsertTransform("pluginA", "negate", {"speed"}, {"mid"}, kNegate, "{}").has_value());
+  fx.engine.retireTopic(fx.input);
+
+  EXPECT_TRUE(fx.session.removeDataset(fx.ds));
+  EXPECT_TRUE(fx.service.transformRecipes().empty());
+}
+
+// The fan-out reload erases the dataset it replaces before the layout restore rebinds its processors.
+TEST(DataProcessorTransformTest, RemovingTheDatasetCanKeepItsProcessors) {
+  Fixture fx;
+  fx.seed("speed", {1.0, 2.0});
+  ASSERT_TRUE(fx.service.upsertTransform("pluginA", "negate", {"speed"}, {"mid"}, kNegate, "{}").has_value());
+
+  EXPECT_FALSE(fx.session.removeDataset(fx.ds, /*remove_dependent_processors=*/false));
+  EXPECT_EQ(fx.service.transformRecipes().size(), 1U);
+}
+
+// A leaf that cannot be removed (here its node is already gone from the engine) must not keep its parent: leaf-first,
+// the leaf fails before the parent is reached.
+TEST(DataProcessorTransformTest, RemovingDependentsContinuesPastAFailedRemoval) {
+  Fixture fx;
+  fx.seed("speed", {1.0, 2.0});
+  const auto parent = fx.service.upsertTransform("pluginA", "negate", {"speed"}, {"mid"}, kNegate, "{}");
+  ASSERT_TRUE(parent.has_value()) << parent.error();
+  const auto leaf = fx.service.upsertTransform("pluginA", "split", {"mid"}, {"leaf_a", "leaf_b"}, kSplit, "{}");
+  ASSERT_TRUE(leaf.has_value()) << leaf.error();
+  ASSERT_TRUE(fx.service.incrementalEngine().removeNode(leaf->node_id).has_value());
+
+  EXPECT_FALSE(fx.service.removeProcessorsDependingOn({fx.input}).has_value());
+  EXPECT_EQ(fx.service.transformIdsForPlugin("pluginA"), std::vector<std::string>{"split"});
+}
+
+// The output of a transform lives in its first input's dataset, which can outlive the dataset removed.
+TEST(DataProcessorTransformTest, RemovingASecondInputsDatasetRetiresTheOutputInTheSurvivingDataset) {
+  Fixture fx;
+  fx.seed("other", {1.0, 2.0});
+  const DatasetId surviving = fx.ds;
+  fx.seed("speed", {3.0, 4.0});
+  const auto sum = fx.service.upsertTransform("pluginA", "sum", {"other", "speed"}, {"sum"}, kSum, "{}");
+  ASSERT_TRUE(sum.has_value()) << sum.error();
+  ASSERT_EQ(sum->dataset_id, surviving);
+  const TopicId output = sum->output_topic_ids.front();
+
+  EXPECT_TRUE(fx.session.removeDataset(fx.ds));
+  const auto topics = fx.engine.listTopics(surviving);
+  EXPECT_EQ(std::find(topics.begin(), topics.end(), output), topics.end());
+}
+
 TEST(DataProcessorTransformTest, RemoveRetiresTopic) {
   Fixture fx;
   fx.seed("speed", {1.0});
@@ -407,7 +572,6 @@ TEST(DataProcessorTransformTest, RemoveRetiresTopic) {
   EXPECT_FALSE(fx.listed(out));  // retired -> dropped from the catalog
   EXPECT_TRUE(fx.service.transformRecipes().empty());
 
-  // Removing an unknown key is an error.
   EXPECT_FALSE(fx.service.removeTransform("pluginA/ghost").has_value());
 }
 
@@ -419,7 +583,6 @@ TEST(DataProcessorTransformTest, RollbackLeavesNoZombieTopic) {
   EXPECT_FALSE(fx.service.upsertTransform("pluginA", "boom", {"speed"}, {"speed/out"}, kBoom, "{}").has_value());
   EXPECT_TRUE(fx.service.transformRecipes().empty());
 
-  // A healthy transform can re-use the freed name.
   const auto ok = fx.service.upsertTransform("pluginA", "negate", {"speed"}, {"speed/out"}, kNegate, "{}");
   EXPECT_TRUE(ok.has_value()) << ok.error();
 }
@@ -433,15 +596,13 @@ TEST(DataProcessorTransformTest, OutputNameCollisionRejected) {
   // A different transform claiming the same output name is rejected, not clobbered.
   const auto b = fx.service.upsertTransform("pluginB", "other", {"speed"}, {"speed/out"}, kNegate, "{}");
   EXPECT_FALSE(b.has_value());
-  // A's output is untouched and A's recipe survives.
   EXPECT_EQ(fx.service.transformRecipes().size(), 1u);
   EXPECT_TRUE(fx.listed(a->output_topic_ids.front()));
 }
 
-// Field-level input binding on a schemaless topic: a "<topic>/<field>" input must
-// resolve to the named column (separator normalized '/'->'.'), not topic column 0.
-// Regression: schema_id == 0 topics (JSON scalar-only ingest) were unresolvable by
-// field name, and nested fields failed on the '/' vs '.' separator mismatch.
+// Field-level input binding on a schemaless topic (schema_id == 0, the JSON scalar-only ingest shape): a
+// "<topic>/<field>" input must resolve to the named column (separator normalized '/'->'.', so nested fields work), not
+// topic column 0.
 TEST(DataProcessorTransformTest, ResolvesSchemalessNestedFieldInput) {
   Fixture fx;
   // /imu with dotted nested columns; "orientation.w" is the LAST column (index 3),
@@ -546,7 +707,6 @@ TEST(DataProcessorTransformTest, GroupsStructuredOutputIntoOneTopic) {
 
   const auto rec = fx.service.upsertTransform("pluginA", "split", {"speed"}, {"rpy:a,b"}, kSplit, "{}");
   ASSERT_TRUE(rec.has_value()) << rec.error();
-  // Grouped: exactly ONE output topic, not two.
   ASSERT_EQ(rec->output_topic_ids.size(), 1u);
   const TopicId out = rec->output_topic_ids.front();
 
@@ -560,7 +720,6 @@ TEST(DataProcessorTransformTest, GroupsStructuredOutputIntoOneTopic) {
   const PJ::TypeTreeNode* root = fx.engine.typeRegistry().lookup(schema_id);
   ASSERT_NE(root, nullptr);
   EXPECT_EQ(PJ::flattenFieldPaths(*root), (std::vector<std::string>{"a", "b"}));
-  // Column 0 = value, column 1 = -value.
   EXPECT_EQ(readColumn(fx.engine, out, 0), (std::vector<double>{1.0, 2.0, 3.0}));
   EXPECT_EQ(readColumn(fx.engine, out, 1), (std::vector<double>{-1.0, -2.0, -3.0}));
 }
@@ -685,7 +844,8 @@ TEST(DataProcessorTransformTest, DatasetQualifiedUpsertWorksWithStreamStyleSourc
   EXPECT_EQ(rec->input_topic_ids, (std::vector<TopicId>{duplicate->topic_id}));
 }
 
-TEST(DataProcessorTransformTest, DatasetQualifiedUpsertRejectsADuplicatedSourceName) {
+// A source loaded twice is addressed by the catalog's labels: "s" is the older copy, "s (2)" the newer.
+TEST(DataProcessorTransformTest, DatasetQualifiedUpsertPicksACopyOfADuplicatedSourceByLabel) {
   Fixture fx;
   fx.seed("speed", {1.0});  // source "s"
   const DatasetId second = *fx.engine.createDataset(DatasetDescriptor{.source_name = "s", .time_domain_id = 0});
@@ -694,9 +854,12 @@ TEST(DataProcessorTransformTest, DatasetQualifiedUpsertRejectsADuplicatedSourceN
   writer.appendScalar(*duplicate, 0, 9.0);
   fx.engine.commitChunks(writer.flushAll());
 
-  const auto rec = fx.service.upsertTransform("pluginA", "negate", {"s:speed"}, {"out"}, kNegate, "{}");
-  ASSERT_FALSE(rec.has_value());
-  EXPECT_NE(rec.error().find("ambiguous"), std::string::npos) << rec.error();
+  const auto older = fx.service.upsertTransform("pluginA", "negate", {"s:speed"}, {"out"}, kNegate, "{}");
+  ASSERT_TRUE(older.has_value()) << older.error();
+  EXPECT_EQ(older->input_topic_ids, (std::vector<TopicId>{fx.input}));
+  const auto newer = fx.service.upsertTransform("pluginB", "negate", {"s (2):speed"}, {"out2"}, kNegate, "{}");
+  ASSERT_TRUE(newer.has_value()) << newer.error();
+  EXPECT_EQ(newer->input_topic_ids, (std::vector<TopicId>{duplicate->topic_id}));
 }
 
 // A ':' whose prefix is no loaded source stays part of the name; the error
@@ -709,8 +872,7 @@ TEST(DataProcessorTransformTest, ColonNameThatMatchesNoSourceGetsTheQualifierHin
   EXPECT_NE(rec.error().find("dataset qualifier"), std::string::npos) << rec.error();
 }
 
-// Bug (PR #619 #4): qualified inputs naming two different datasets are resolved
-// independently and accepted; the SDK contract says they must agree on one.
+// Qualified inputs naming two different datasets are rejected: the SDK contract says they must agree on one.
 TEST(DataProcessorTransformTest, QualifiedInputsNamingTwoDatasetsAreRejected) {
   Fixture fx;
   fx.seed("speed", {3.0});  // source "s"
@@ -725,9 +887,8 @@ TEST(DataProcessorTransformTest, QualifiedInputsNamingTwoDatasetsAreRejected) {
   EXPECT_NE(rec.error().find("dataset"), std::string::npos) << rec.error();
 }
 
-// Bug (PR #619 #3): the config read-back a plugin re-edits from (transformRecipeJson,
-// behind data_processor_config) returns bare input names, so resubmitting it is
-// ambiguous once `speed` exists in two datasets.
+// The config read-back a plugin re-edits from (transformRecipeJson, behind data_processor_config) must stay
+// resubmittable: a bare input name is qualified once `speed` exists in two datasets.
 TEST(DataProcessorTransformTest, ConfigReadBackResubmitsUnambiguously) {
   Fixture fx;
   fx.seed("speed", {3.0});  // source "s"
@@ -789,15 +950,19 @@ TEST(DataProcessorTransformTest, ConfigReadBackKeepsBareWhenALongerSourcePrefixS
   EXPECT_EQ(configInputs(fx.service, "pluginA/negate"), (std::vector<std::string>{"b:x"}));
 }
 
-// A source loaded twice cannot be addressed by name: read-back must not emit
-// "s:speed", which the resolver rejects as ambiguous.
-TEST(DataProcessorTransformTest, ConfigReadBackKeepsBareWhenTheSourceIsLoadedTwice) {
+// A source loaded twice: read-back qualifies the input with the label of the copy the
+// transform reads ("s" for the older, "s (2)" for the newer), which resubmits to it.
+TEST(DataProcessorTransformTest, ConfigReadBackNamesTheCopyWhenTheSourceIsLoadedTwice) {
   Fixture fx;
   fx.seed("speed", {3.0});  // source "s"
   ASSERT_TRUE(fx.service.upsertTransform("pluginA", "negate", {"speed"}, {"out"}, kNegate, "{}").has_value());
   const DatasetId second = *fx.engine.createDataset(DatasetDescriptor{.source_name = "s", .time_domain_id = 0});
   (void)addSeries(fx.engine, second, "speed", 8.0);
-  EXPECT_EQ(configInputs(fx.service, "pluginA/negate"), (std::vector<std::string>{"speed"}));
+  const std::vector<std::string> inputs = configInputs(fx.service, "pluginA/negate");
+  EXPECT_EQ(inputs, (std::vector<std::string>{"s:speed"}));
+  const auto resubmitted = fx.service.upsertTransform("pluginB", "negate", inputs, {"out2"}, kNegate, "{}");
+  ASSERT_TRUE(resubmitted.has_value()) << resubmitted.error();
+  EXPECT_EQ(resubmitted->input_topic_ids, std::vector<TopicId>{fx.input});
 }
 
 // A bare cross-dataset transform (x in a, y in b) is accepted; its read-back must
@@ -1026,9 +1191,8 @@ TEST(DataProcessorTransformTest, ExemptDependentsOfEmptyWhenNoExemptDependent) {
   EXPECT_TRUE(fx.service.exemptDependentsOf(removable).empty());
 }
 
-// Regression [Codex #6]: removalImpact() reports the grouped DECLARATION
-// "rpy:a,b", not the materialized topic "rpy", so an exempt marker
-// generator reading "rpy/a" is not found as a dependent and undo can strand it.
+// removalImpact() must report the materialized topic "rpy", not the grouped declaration "rpy:a,b", so an exempt
+// marker generator reading "rpy/a" is found as a dependent and undo cannot strand it.
 TEST(DataProcessorTransformTest, StrandPreflightSeesGroupedTransformOutputTopic) {
   Fixture fx;
   fx.seed("speed", {1.0, 2.0});
@@ -1150,9 +1314,7 @@ TEST(DataProcessorTransformTest, EditingOrRemovingATransformMarksTheRulesReading
   EXPECT_FALSE(markers.isStale("p/other"));
 }
 
-// ---------------------------------------------------------------------------
-// Time-sliced first materialization (a new persistent transform)
-// ---------------------------------------------------------------------------
+// ---- Time-sliced first materialization (a new persistent transform) ----
 
 // Large enough that the Luau replay needs several 8 ms slices even on a fast box.
 constexpr std::size_t kLargeRows = 200'000;
@@ -1208,6 +1370,9 @@ std::vector<std::pair<Timestamp, double>> synchronousAccumulator(
 
 struct SliceLog {
   int slices = 0;
+  /// The longest slice in this thread's CPU time. The budget is a wall-clock
+  /// deadline, so a slice preempted on a loaded machine overruns it in wall time
+  /// while doing less work; what the budget bounds is the work a slice does.
   std::chrono::nanoseconds longest{0};
 };
 
@@ -1215,8 +1380,13 @@ SliceLog stepUntilDone(DataProcessorService& service) {
   SliceLog log;
   for (int guard = 0; guard < 1'000'000; ++guard) {
     const auto start = std::chrono::steady_clock::now();
+    const double cpu_start_ms = pj_bench::threadCpuMs();
     const bool done = service.stepMaterialization();
-    log.longest = std::max<std::chrono::nanoseconds>(log.longest, std::chrono::steady_clock::now() - start);
+    const std::chrono::duration<double, std::milli> cpu(pj_bench::threadCpuMs() - cpu_start_ms);
+    // CPU time never exceeds wall time; the min undoes Windows' 15.6 ms CPU-clock ticks.
+    const auto slice = std::min<std::chrono::nanoseconds>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(cpu), std::chrono::steady_clock::now() - start);
+    log.longest = std::max(log.longest, slice);
     ++log.slices;
     if (done) {
       break;
@@ -1271,7 +1441,6 @@ TEST(DataProcessorTimeSliceTest, DeleteDuringReplayDropsIt) {
   EXPECT_FALSE(fx.service.materializationPending());
   EXPECT_TRUE(fx.service.stepMaterialization());
   EXPECT_TRUE(fx.service.transformRecipes().empty());
-  // The name is free again.
   EXPECT_TRUE(createAccumulator(fx.service, "acc", "x", "acc_out").has_value());
 }
 
@@ -1349,7 +1518,6 @@ TEST(DataProcessorTimeSliceTest, UndoAndRedoOfACreateDuringReplay) {
   const std::vector<DataProcessorService::TransformRecipe> snapshot = fx.service.transformRecipes();
   ASSERT_EQ(snapshot.size(), 1u);
 
-  // Undo: restore the pre-create history state (no transforms).
   fx.service.clearTransforms(RestoreIntent::kHistory);
   EXPECT_FALSE(fx.service.materializationPending());
   EXPECT_TRUE(fx.service.transformRecipes().empty());
@@ -1400,7 +1568,6 @@ TEST(DataProcessorTimeSliceTest, FailureAfterTheFirstSliceIsReportedAsAnError) {
   EXPECT_NE(reported.front().message.find("late_out"), std::string::npos) << reported.front().message;
   EXPECT_NE(reported.front().message.find("late boom"), std::string::npos) << reported.front().message;
   EXPECT_NE(reported.front().message.find("incomplete"), std::string::npos) << reported.front().message;
-  // The transform stays, with the rows committed before the failing slice.
   EXPECT_EQ(fx.service.transformRecipes().size(), 1u);
   EXPECT_LT(readRows(fx.engine, sliced->output_topic_ids.front()).size(), kFailAfter);
 }
@@ -1435,7 +1602,6 @@ TEST(DataProcessorTimeSliceTest, StreamingTransformThatStartsFailingIsReportedOn
   commit_rows(7, 3);  // still failing: not reported again
   EXPECT_EQ(reported.size(), 1u);
 
-  // An edit replays the history healthily; its next failure is a new one.
   ASSERT_TRUE(
       fx.service.upsertTransform("p", "late", {"x"}, {"late_out"}, lateFailureScript("late", 12), "{}").has_value());
   commit_rows(10, 1);  // 11 rows: healthy
@@ -1750,6 +1916,179 @@ TEST(DataProcessorTransformTest, ReloadRunsARuleOverTheRecomputedTransformOutput
   }
 
   EXPECT_EQ(first_value(), 50.0);
+}
+
+// One reload of the seedMultiColumn("data", {"time", "a"}) topic that writes only "a", as a CSV reloaded with "time"
+// as the X axis does: the "time" column is left without a value and retired by the prune.
+void reloadWithoutTime(Fixture& fx) {
+  RefillGuard guard = fx.session.beginRefill(fx.ds);
+  DataWriter writer = fx.engine.createWriter();
+  for (int row = 0; row < 2; ++row) {
+    ASSERT_TRUE(writer.beginRow(fx.input, static_cast<Timestamp>(row) * 1'000'000'000LL).has_value());
+    writer.set<double>(fx.input, 1, 7.0);
+    ASSERT_TRUE(writer.finishRow(fx.input).has_value());
+  }
+  ASSERT_FALSE(fx.engine.commitChunks(writer.flushAll()).empty());
+  ASSERT_TRUE(guard.recomputeProcessors().has_value());
+  guard.pruneVanishedTopics();
+  guard.commit();
+}
+
+// A processor reading a column a reload lost behaves as one whose input topic a reload lost: it stays bound, its output
+// goes empty, and no later reload or rollback replay fails on it.
+TEST(DataProcessorTransformTest, TransformOnAColumnALoadLostStaysBoundAndEmpty) {
+  Fixture fx;
+  fx.seedMultiColumn("data", {"time", "a"}, {{0.0, 0.1}, {1.0, 2.0}});
+  const auto on_time = fx.service.upsertTransform("pluginA", "negate", {"data/time"}, {"neg_time"}, kNegate, "{}");
+  ASSERT_TRUE(on_time.has_value()) << on_time.error();
+  const TopicId output = on_time->output_topic_ids.front();
+  ASSERT_EQ(readValues(fx.engine, output).size(), 2U);
+
+  reloadWithoutTime(fx);
+  EXPECT_TRUE(readValues(fx.engine, output).empty()) << "its input holds no value any more";
+  const auto replay = fx.service.rebindAndRecomputeForReplacedSources({fx.input});
+  EXPECT_TRUE(replay.has_value()) << "a rollback's repair replay: " << replay.error();
+  reloadWithoutTime(fx);
+  EXPECT_TRUE(readValues(fx.engine, output).empty());
+}
+
+// The whole-topic name of a topic whose first column a reload lost resolves to its first column still listed.
+TEST(DataProcessorTransformTest, WholeTopicInputSkipsAColumnALoadLost) {
+  Fixture fx;
+  fx.seedMultiColumn("data", {"time", "a"}, {{0.0, 0.1}, {1.0, 2.0}});
+  reloadWithoutTime(fx);
+
+  const auto whole = fx.service.upsertTransform("pluginA", "negate", {"data"}, {"neg_data"}, kNegate, "{}");
+  ASSERT_TRUE(whole.has_value()) << whole.error();
+  EXPECT_EQ(readValues(fx.engine, whole->output_topic_ids.front()), (std::vector<double>{-7.0, -7.0}));
+}
+
+// A transform declaring `output = "string"` writes a text column, which the catalog lists as a string series.
+TEST(DataProcessorTransformTest, StringOutputMaterializesATextColumn) {
+  Fixture fx;
+  fx.seed("speed", {-1.0, 2.0, -3.0});
+
+  const auto rec = fx.service.upsertTransform("pluginA", "state", {"speed"}, {"state"}, kState, "{}");
+  ASSERT_TRUE(rec.has_value()) << rec.error();
+  const TopicId out = rec->output_topic_ids.front();
+  EXPECT_EQ(readStrings(fx.engine, out, 0), (std::vector<std::string>{"falling", "walking", "falling"}));
+  {
+    const auto lock = fx.engine.lockEngine();
+    const TopicStorage* st = fx.engine.getTopicStorage(out);
+    ASSERT_NE(st, nullptr);
+    const PJ::TypeTreeNode* root = fx.engine.typeRegistry().lookup(st->descriptor().schema_id);
+    ASSERT_NE(root, nullptr);
+    std::vector<std::optional<PrimitiveType>> leaves{root->primitive_type};
+    for (const auto& child : root->children) {
+      leaves.push_back(child->primitive_type);
+    }
+    EXPECT_NE(std::find(leaves.begin(), leaves.end(), PrimitiveType::kString), leaves.end());
+  }
+
+  // A layout restore carries the script, and with it the declared output type.
+  const DataProcessorService::TransformRecipe snapshot = fx.service.transformRecipes().front();
+  fx.service.clearAllTransforms();
+  const auto restored = fx.service.restoreTransform(snapshot);
+  ASSERT_TRUE(restored.has_value()) << restored.error();
+  EXPECT_EQ(
+      readStrings(fx.engine, restored->output_topic_ids.front(), 0),
+      (std::vector<std::string>{"falling", "walking", "falling"}));
+}
+
+// A Transform Editor formula over a text column (a ROS std_msgs/String, a CSV word column) sees the text, so it can
+// compare it with a label. The script and params_json are what the editor sends for "single" mode.
+TEST(DataProcessorTransformTest, EditorFormulaOverTextColumnComparesStrings) {
+  constexpr const char* kEditorScript = R"LUAU(-- pj-script: luau
+local function _pj_make()
+
+  return function(time, value)
+if value == "walking" then return 1 else return 0 end
+  end
+end
+local T = { id = "is_walking", name = "is_walking", output = "double" }
+T.__index = T
+function T.create(_) return setmetatable({ fn = _pj_make() }, T) end
+function T:calculate(t, v, ...) return self.fn(t, v, ...) end
+return T
+)LUAU";
+  const nlohmann::json editor_params = {
+      {"output_name", "is_walking"},
+      {"global_code", ""},
+      {"function_body", "if value == \"walking\" then return 1 else return 0 end"},
+      {"sources", nlohmann::json::array()},
+      {"language", "luau"},
+      {"mode", "single"},
+      {"source_series", "robot_state/data"},
+      {"extra_sources", nlohmann::json::array()}};
+
+  Fixture fx;
+  fx.ds = *fx.engine.createDataset(DatasetDescriptor{.source_name = "s", .time_domain_id = 0});
+  DataWriter writer = fx.engine.createWriter();
+  fx.input = *writer.registerTopic(fx.ds, TopicDescriptor{.name = "robot_state", .schema_id = 0, .dataset_id = fx.ds});
+  ASSERT_TRUE(writer.ensureColumn(fx.input, "data", PrimitiveType::kString).has_value());
+  const std::vector<std::string_view> states{"walking", "falling", "walking"};
+  for (std::size_t i = 0; i < states.size(); ++i) {
+    ASSERT_TRUE(writer.beginRow(fx.input, static_cast<Timestamp>(i) * 1'000'000'000LL).has_value());
+    writer.set<std::string_view>(fx.input, 0, states[i]);
+    ASSERT_TRUE(writer.finishRow(fx.input).has_value());
+  }
+  fx.engine.commitChunks(writer.flushAll());
+
+  const auto rec = fx.service.upsertTransform(
+      "transform_editor", "is_walking", {"robot_state/data"}, {"is_walking"}, kEditorScript, editor_params.dump());
+  ASSERT_TRUE(rec.has_value()) << rec.error();
+  EXPECT_EQ(readValues(fx.engine, rec->output_topic_ids.front()), (std::vector<double>{1.0, 0.0, 1.0}));
+}
+
+// A formula doing arithmetic on text is refused with the script's error, and the error names the text input.
+TEST(DataProcessorTransformTest, ArithmeticOnATextInputIsRefusedNamingIt) {
+  constexpr const char* kTwice = R"LUAU(-- pj-script: luau
+return { id="twice", name="Twice",
+  create = function(p) return { calculate = function(t, v) return v * 2 end } end }
+)LUAU";
+  Fixture fx;
+  fx.ds = *fx.engine.createDataset(DatasetDescriptor{.source_name = "s", .time_domain_id = 0});
+  DataWriter writer = fx.engine.createWriter();
+  fx.input = *writer.registerTopic(fx.ds, TopicDescriptor{.name = "robot_state", .schema_id = 0, .dataset_id = fx.ds});
+  ASSERT_TRUE(writer.ensureColumn(fx.input, "data", PrimitiveType::kString).has_value());
+  ASSERT_TRUE(writer.beginRow(fx.input, 0).has_value());
+  writer.set<std::string_view>(fx.input, 0, "walking");
+  ASSERT_TRUE(writer.finishRow(fx.input).has_value());
+  fx.engine.commitChunks(writer.flushAll());
+
+  const auto rec = fx.service.upsertTransform("pluginA", "twice", {"robot_state/data"}, {"twice"}, kTwice, "{}");
+  ASSERT_FALSE(rec.has_value());
+  EXPECT_NE(rec.error().find("arithmetic"), std::string::npos) << rec.error();
+  EXPECT_NE(rec.error().find("robot_state/data is text"), std::string::npos) << rec.error();
+}
+
+TEST(DataProcessorTransformTest, StringOutputsOfAMimoTransform) {
+  Fixture two;
+  two.seedMultiColumn("pose", {"a", "b"}, {{1.0, 2.0}, {5.0, 6.0}});
+  const auto pair =
+      two.service.upsertTransform("pluginA", "state", {"pose/a", "pose/b"}, {"rate:pace,note"}, kState, "{}");
+  ASSERT_TRUE(pair.has_value()) << pair.error();
+  const TopicId out = pair->output_topic_ids.front();
+  EXPECT_EQ(readStrings(two.engine, out, 0), (std::vector<std::string>{"slow", "fast"}));
+  EXPECT_EQ(readStrings(two.engine, out, 1), (std::vector<std::string>{"seen", "seen"}));
+}
+
+// Editing a transform in place keeps its output columns, so an edit that switches between text and numbers is
+// refused and the running transform keeps its values.
+TEST(DataProcessorTransformTest, EditSwitchingBetweenTextAndNumbersIsRefused) {
+  Fixture fx;
+  fx.seed("speed", {-1.0, 2.0});
+  const auto first = fx.service.upsertTransform("pluginA", "negate", {"speed"}, {"out"}, kNegate, "{}");
+  ASSERT_TRUE(first.has_value()) << first.error();
+
+  constexpr const char* kNegateAsText = R"LUAU(-- pj-script: luau
+return { id="negate", name="Negate", output="string",
+  create = function(p) return { calculate = function(t, v) return tostring(-v) end } end }
+)LUAU";
+  const auto edited = fx.service.upsertTransform("pluginA", "negate", {"speed"}, {"out"}, kNegateAsText, "{}");
+  ASSERT_FALSE(edited.has_value());
+  EXPECT_NE(edited.error().find("text"), std::string::npos) << edited.error();
+  EXPECT_EQ(readValues(fx.engine, first->output_topic_ids.front()), (std::vector<double>{1.0, -2.0}));
 }
 
 }  // namespace

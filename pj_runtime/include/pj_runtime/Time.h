@@ -2,23 +2,20 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 
-// PJ4's DISPLAY-relative time vocabulary: the app-level coordinate the Qwt axis
-// and PlaybackEngine speak, layered on top of the absolute time spine in
-// pj_base/time.hpp (PJ::Timepoint / PJ::Duration / fromRaw / toRaw). The spine
-// stays int64 across storage/ABI/wire and its chrono mirror now lives in pj_base
-// so every layer can name absolute time; the DISPLAY types below stay here
-// because the per-dataset display offset is an app-presentation policy, not an
-// SDK concern. Two concepts, kept un-mixable by the type system:
-//   * DisplayOffset   — the per-dataset shift (a strong-named Duration).
-//   * DisplaySeconds  — display-relative seconds (raw - display_offset) the Qwt
-//                       axis / PlaybackEngine speak; a strong double, so absolute
-//                       seconds can't masquerade as a display coordinate.
+// PJ4's DISPLAY-relative time vocabulary: the app-level coordinate the Qwt axis and PlaybackEngine speak, layered on
+// the absolute time spine in pj_base/time.hpp (PJ::Timepoint / PJ::Duration / fromRaw / toRaw), which stays int64
+// across storage, ABI and wire. The DISPLAY types stay here because the per-dataset display offset is an
+// app-presentation policy, not an SDK concern. Two concepts, kept un-mixable by the type system:
+//   * DisplayOffset  - the per-dataset shift (a strong-named Duration).
+//   * DisplaySeconds - display-relative seconds (raw - display_offset) the Qwt axis / PlaybackEngine speak; a strong
+//                      double, so absolute seconds cannot masquerade as a display coordinate.
 //
-// DisplaySeconds wraps a double (not an opaque enum) so display-axis math stays
-// natural; the safety lives at toDisplaySeconds()/rawToDisplaySeconds(), which
-// DEMAND a DisplayOffset so the raw->display subtraction can't be skipped.
+// DisplaySeconds wraps a double (not an opaque enum) so display-axis math stays natural; the safety lives at
+// toDisplaySeconds()/rawToDisplaySeconds(), which DEMAND a DisplayOffset so the raw->display subtraction cannot be
+// skipped.
 
 #include <chrono>
+#include <cmath>
 #include <compare>
 #include <limits>
 #include <optional>
@@ -30,12 +27,10 @@
 
 namespace PJ {
 
-/// Seconds <-> nanoseconds conversion factor for the IDataWidget boundary
-/// (tracker time travels as seconds in a bare double; storage timestamps are
-/// int64 nanoseconds). Derived from std::chrono so the ratio can never drift
-/// from the time types it converts between. Prefer converting through
-/// std::chrono::duration directly where practical (it adds nothing at -O2); use
-/// this constant where a plain multiplier/divisor reads better.
+/// Seconds <-> nanoseconds conversion factor for the IDataWidget boundary (tracker time travels as seconds in a bare
+/// double; storage timestamps are int64 nanoseconds). Derived from std::chrono so the ratio cannot drift from the time
+/// types it converts between. Prefer converting through std::chrono::duration where practical; use this constant where
+/// a plain multiplier/divisor reads better.
 inline constexpr double kNanosecondsPerSecond = static_cast<double>(std::chrono::nanoseconds::period::den);
 
 /// The per-dataset display shift carried as a strong-named Duration, so call
@@ -120,8 +115,6 @@ using DisplayRange = PJ::Range<DisplaySeconds>;
   return raw_ns - offset_ns;
 }
 
-// --- display seam: the offset is MANDATORY, so raw->display can't be skipped ---
-
 /// Build the per-dataset display shift from the engine's TimeDomain.
 [[nodiscard]] constexpr DisplayOffset offsetOf(const TimeDomain& domain) noexcept {
   return DisplayOffset{Duration{domain.display_offset}};
@@ -153,7 +146,28 @@ using DisplayRange = PJ::Range<DisplaySeconds>;
   return toRaw(toAbsolute(seconds, offset));
 }
 
-// --- Qwt / IDataWidget edge: DisplaySeconds <-> bare double (axis stays double) ---
+/// rawToDisplaySeconds raised to the first double that displaySecondsToRaw maps back to `raw_ns` or later.
+/// Far from the display origin a double does not hold every nanosecond (near 1.7e9 s it steps ~238 ns),
+/// and the nearest one can convert back to an instant before `raw_ns`: a seek to that time would show
+/// the sample before. Used for every time a seek may come back with: a sample handed to a Widget plugin,
+/// pj.playback.v1's to_display_time, and both ends of a playback range (the engine clamps a seek into the
+/// range, so a nearest-rounded end would clamp a seek to the last sample onto the one before it, and a
+/// nearest-rounded start would put a seek to the range start before the first sample).
+[[nodiscard]] inline DisplaySeconds rawToDisplaySecondsAtOrAfter(Timestamp raw_ns, DisplayOffset offset) noexcept {
+  DisplaySeconds seconds = rawToDisplaySeconds(raw_ns, offset);
+  // Within a millisecond of the int64 limits (an "end of time" sentinel) a raised double no longer converts
+  // back to a Timestamp: keep the nearest time there.
+  constexpr Timestamp kLimitMargin = 1'000'000;
+  if (raw_ns > std::numeric_limits<Timestamp>::max() - kLimitMargin ||
+      raw_ns < std::numeric_limits<Timestamp>::min() + kLimitMargin) {
+    return seconds;
+  }
+  // Each step moves the converted instant by one double step; two cover the rounding of both conversions.
+  for (int step = 0; step < 4 && displaySecondsToRaw(seconds, offset) < raw_ns; ++step) {
+    seconds.value = std::nextafter(seconds.value, std::numeric_limits<double>::infinity());
+  }
+  return seconds;
+}
 
 /// Unwrap to the bare display-seconds double the Qwt axis / IDataWidget expect.
 [[nodiscard]] constexpr double toAxisDouble(DisplaySeconds seconds) noexcept {

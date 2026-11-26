@@ -12,25 +12,21 @@
 #include "../rhi_scene_pass.h"
 #include "pj_base/time.hpp"
 #include "pj_scene3d_core/tf/tf_connections.h"
+#include "pj_scene3d_core/tf/view_sampling.h"
 #include "pj_scene3d_widgets/grid_geometry.h"
 #include "pj_scene3d_widgets/scene_look_defaults.h"
 
 namespace pj::scene3d {
 
-/// The view's prelude family: the ground grid (lines, or filled cells with the
-/// lines drawn analytically in the cell shader, which receive the mesh shadow)
-/// and the TF parent-connection lines. Drawn before
-/// every layer in each scene pass, grid as data (graded) and connections as
-/// annotations (tonemap bypass, annotation alpha blend). The TF triads that
-/// follow the prelude belong to the pose family. The grid is built once per
-/// settings change, at the fixed-frame origin, into a Static buffer; grid.vert and
-/// grid_cell.vert add the origin offset (fixed-frame origin - render origin), so
-/// panning, following and playback upload nothing. Grid positions and the render
-/// origin (the camera focal) are floats, so the shader's float add equals the
-/// double subtraction it replaces bit for bit. The TF connections (a Dynamic
-/// buffer) are camera-relative like every TF placement, rebuilt with the TF
-/// buffer, its revision, the fixed frame, the time or the render origin, and
-/// drawn with a zero offset.
+/// The view's prelude family: the ground grid (lines, or filled cells with the lines drawn analytically in the cell
+/// shader, which receive the mesh shadow) and the TF parent-connection lines. Drawn before every layer in each scene
+/// pass: the grid as data (graded), the connections as annotations (tonemap bypass, annotation alpha blend). The TF
+/// triads that follow the prelude belong to the pose family. The grid is built once per settings change, at the
+/// fixed-frame origin, into a Static buffer; grid.vert and grid_cell.vert add the origin offset (fixed-frame origin -
+/// render origin), so panning, following and playback upload nothing. Grid positions and the render origin (the
+/// camera focal) are floats, so the shader's float add equals the double subtraction it replaces bit for bit. The TF
+/// connections (a Dynamic buffer) are camera-relative like every TF placement, rebuilt with the TF buffer, its
+/// revision, the fixed frame, the time or the render origin, and drawn with a zero offset.
 class GridRhiPass {
  public:
   struct Settings {
@@ -89,10 +85,10 @@ class GridRhiPass {
 
   /// Grid lines (line style only) plus connection lines.
   [[nodiscard]] int lastLineVertexCount() const {
-    return static_cast<int>(grid_line_vertex_count_ + connection_vertices_.size());
+    return static_cast<int>(2U * (grid_lines_.size() + connection_lines_.size()));
   }
   [[nodiscard]] int lastTriangleVertexCount() const {
-    return static_cast<int>(grid_cell_vertex_count_);
+    return static_cast<int>(grid_cells_.size());
   }
 #ifdef PJ_RHI_TEST_HOOKS
   /// Grid and connection rebuilds since initialization; cumulative.
@@ -105,20 +101,11 @@ class GridRhiPass {
 #endif
 
  private:
-  struct Vertex {
-    float x = 0.0F;
-    float y = 0.0F;
-    float z = 0.0F;
-    float r = 0.0F;
-    float g = 0.0F;
-    float b = 0.0F;
-    float a = 1.0F;
-  };
-
   struct ConnectionKey {
     bool visible = true;
     const TransformBuffer* tf = nullptr;
     std::uint64_t tf_revision = 0;
+    pj::tf::Sampling sampling = pj::tf::Sampling::kHold;
     std::string fixed_frame;
     PJ::Timepoint time{};
     glm::dvec3 render_origin{0.0};
@@ -126,8 +113,8 @@ class GridRhiPass {
     bool operator==(const ConnectionKey&) const = default;
   };
 
-  static QRhiVertexInputLayout vertexLayout();
-  static void appendVertex(std::vector<Vertex>& out, const glm::dvec3& point, const glm::vec4& color);
+  static void appendSegment(
+      std::vector<LineSegment>& out, const glm::vec3& a, const glm::vec3& b, const glm::vec4& color);
 
   RhiPassSetup setup_;  // view-owned uniforms; the shadow receiver is built later against it
   QRhiShaderResourceBindings* shader_resources_ = nullptr;
@@ -144,7 +131,7 @@ class GridRhiPass {
   QRhiBuffer* origin_offset_uniforms_ = nullptr;
   QRhiBuffer* zero_offset_uniforms_ = nullptr;
   std::array<float, 8> grid_uniforms_{};  // origin offset + cell-edge phase, then line colour + cell side
-  QRhiBuffer* grid_buffer_ = nullptr;     // Static: cells, then lines
+  QRhiBuffer* grid_buffer_ = nullptr;     // Static: grid_cells_ or grid_lines_, by style
   QRhiBuffer* connection_buffer_ = nullptr;
   quint32 grid_capacity_ = 0;
   quint32 connection_capacity_ = 0;
@@ -158,11 +145,10 @@ class GridRhiPass {
   std::uint64_t grid_build_count_ = 0;
   std::uint64_t connection_build_count_ = 0;
 
-  std::vector<Vertex> grid_vertices_;  // cells, then lines
-  std::vector<Vertex> connection_vertices_;
+  std::vector<ColorVertex> grid_cells_;
+  std::vector<LineSegment> grid_lines_;
+  std::vector<LineSegment> connection_lines_;
   std::vector<TfConnectionSegment> segments_;
-  quint32 grid_cell_vertex_count_ = 0;
-  quint32 grid_line_vertex_count_ = 0;
 };
 
 }  // namespace pj::scene3d

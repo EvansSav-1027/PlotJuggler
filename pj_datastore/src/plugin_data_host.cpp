@@ -23,6 +23,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -57,18 +58,13 @@ using FieldHandle = PJ_field_handle_t;
   return std::string_view(view.data == nullptr ? "" : view.data, view.size);
 }
 
-// Collapse runs of '/' into a single '/' in a topic/field name. Plugin-supplied names
-// are opaque, but an empty '/'-segment ("//") carries no meaning in the curve
-// hierarchy, so we normalize it here — the one boundary every DataSource/Parser name
-// crosses to become a datastore key — so the stored key, the UI catalog (which reads
-// the descriptor name) and the by-name transform resolver all agree on a single slash.
-// Common case (no "//") allocates nothing: callers guard on `needsSlashNormalization`.
+// The write hosts collapse "//" to "/" in topic and field names, so the stored key, the catalog and the by-name
+// transform resolver agree. Callers check needsSlashNormalization() first, so the common name allocates nothing.
 [[nodiscard]] bool needsSlashNormalization(std::string_view name) {
   return name.find("//") != std::string_view::npos;
 }
 
-// A field also needs work if it starts with '/' (a leading slash would double up at
-// the "topic/field" junction), not just when it has internal "//".
+// A field's leading '/' would double up at the "topic/field" junction.
 [[nodiscard]] bool needsFieldNormalization(std::string_view name) {
   return needsSlashNormalization(name) || (!name.empty() && name.front() == '/');
 }
@@ -352,16 +348,300 @@ void flattenColumnsImpl(
   return nullptr;
 }
 
+/// The Arrow type a column of `type` reads back as through read_series_arrow.
+[[nodiscard]] ArrowType arrowTypeOf(PrimitiveType type) {
+  switch (type) {
+    case PrimitiveType::kFloat32:
+      return NANOARROW_TYPE_FLOAT;
+    case PrimitiveType::kFloat64:
+      return NANOARROW_TYPE_DOUBLE;
+    case PrimitiveType::kInt8:
+      return NANOARROW_TYPE_INT8;
+    case PrimitiveType::kInt16:
+      return NANOARROW_TYPE_INT16;
+    case PrimitiveType::kInt32:
+      return NANOARROW_TYPE_INT32;
+    case PrimitiveType::kInt64:
+      return NANOARROW_TYPE_INT64;
+    case PrimitiveType::kUint8:
+      return NANOARROW_TYPE_UINT8;
+    case PrimitiveType::kUint16:
+      return NANOARROW_TYPE_UINT16;
+    case PrimitiveType::kUint32:
+      return NANOARROW_TYPE_UINT32;
+    case PrimitiveType::kUint64:
+      return NANOARROW_TYPE_UINT64;
+    case PrimitiveType::kBool:
+      return NANOARROW_TYPE_BOOL;
+    case PrimitiveType::kString:
+      return NANOARROW_TYPE_STRING;
+    case PrimitiveType::kUnspecified:
+      return NANOARROW_TYPE_NA;
+  }
+  return NANOARROW_TYPE_NA;
+}
+
+/// The index of `field` among `chunk`'s columns; none for a chunk sealed before the field appeared.
+[[nodiscard]] std::optional<std::size_t> columnIndexOf(const TopicChunk& chunk, FieldId field) {
+  for (std::size_t i = 0; i < chunk.columns.size(); ++i) {
+    if (chunk.columns[i].descriptor->field_id == field) {
+      return i;
+    }
+  }
+  return std::nullopt;
+}
+
+/// `fn(T{})` with the C++ type a numeric `type` is stored as; none for bool, string and unspecified.
+template <typename Fn>
+[[nodiscard]] std::optional<bool> visitNumeric(PrimitiveType type, Fn&& fn) {
+  switch (type) {
+    case PrimitiveType::kFloat32:
+      return fn(float{});
+    case PrimitiveType::kFloat64:
+      return fn(double{});
+    case PrimitiveType::kInt8:
+      return fn(int8_t{});
+    case PrimitiveType::kInt16:
+      return fn(int16_t{});
+    case PrimitiveType::kInt32:
+      return fn(int32_t{});
+    case PrimitiveType::kInt64:
+      return fn(int64_t{});
+    case PrimitiveType::kUint8:
+      return fn(uint8_t{});
+    case PrimitiveType::kUint16:
+      return fn(uint16_t{});
+    case PrimitiveType::kUint32:
+      return fn(uint32_t{});
+    case PrimitiveType::kUint64:
+      return fn(uint64_t{});
+    case PrimitiveType::kBool:
+    case PrimitiveType::kString:
+    case PrimitiveType::kUnspecified:
+      break;
+  }
+  return std::nullopt;
+}
+
+template <typename T>
+[[nodiscard]] ArrowErrorCode appendValue(ArrowArray* child, T value) {
+  if constexpr (std::is_floating_point_v<T>) {
+    return ArrowArrayAppendDouble(child, value);
+  } else if constexpr (std::is_signed_v<T>) {
+    return ArrowArrayAppendInt(child, value);
+  } else {
+    return ArrowArrayAppendUInt(child, value);
+  }
+}
+
+/// Appends one row to the [timestamp, value] struct being built, as its own element: any type, nulls included.
+[[nodiscard]] bool appendRow(
+    ArrowArray* array, const TopicChunk& chunk, std::size_t col_index, std::size_t row, PrimitiveType type) {
+  ArrowArray* val_child = array->children[1];
+  if (ArrowArrayAppendInt(array->children[0], chunk.timestamps[row]) != NANOARROW_OK) {
+    return false;
+  }
+  ArrowErrorCode rc = NANOARROW_OK;
+  if (chunk.isNull(col_index, row)) {
+    rc = ArrowArrayAppendNull(val_child, 1);
+  } else if (const auto appended = visitNumeric(type, [&](auto tag) {
+               return appendValue(val_child, decodeNumericExact<decltype(tag)>(chunk, col_index, row)) == NANOARROW_OK;
+             })) {
+    rc = *appended ? NANOARROW_OK : EINVAL;
+  } else if (type == PrimitiveType::kBool) {
+    rc = ArrowArrayAppendInt(val_child, chunk.readBool(col_index, row) ? 1 : 0);
+  } else if (type == PrimitiveType::kString) {
+    const auto text = chunk.readString(col_index, row);
+    rc = ArrowArrayAppendString(val_child, ArrowStringView{text.data(), static_cast<int64_t>(text.size())});
+  } else {
+    rc = ArrowArrayAppendNull(val_child, 1);
+  }
+  return rc == NANOARROW_OK && ArrowArrayFinishElement(array) == NANOARROW_OK;
+}
+
+/// appendRow() over rows [begin, end) of a numeric column without nulls, as one block, for whole-series toolbox reads.
+template <typename T>
+[[nodiscard]] bool appendNumericRun(
+    ArrowArray* array, const TopicChunk& chunk, std::size_t col, std::size_t begin, std::size_t end) {
+  const std::size_t n = end - begin;
+  const auto start = static_cast<std::size_t>(array->length);
+  if (ArrowArrayAppendEmpty(array, static_cast<int64_t>(n)) != NANOARROW_OK) {
+    return false;
+  }
+  std::memcpy(
+      reinterpret_cast<int64_t*>(ArrowArrayBuffer(array->children[0], 1)->data) + start,
+      chunk.timestamps.data() + begin, n * sizeof(Timestamp));
+  T* out = reinterpret_cast<T*>(ArrowArrayBuffer(array->children[1], 1)->data) + start;
+  if (chunk.columnEncoding(col) == EncodingType::kConstant) {
+    std::fill_n(out, n, decodeNumericExact<T>(chunk, col, begin));
+  } else {
+    for (std::size_t i = 0; i < n; ++i) {
+      out[i] = decodeNumericExact<T>(chunk, col, begin + i);
+    }
+  }
+  return true;
+}
+
+/// Appends rows [begin, end) of `chunk`: as one block when the column is numeric without nulls in the chunk, row by
+/// row otherwise.
+[[nodiscard]] bool appendChunkRun(
+    ArrowArray* array, const TopicChunk& chunk, std::size_t col, std::size_t begin, std::size_t end,
+    PrimitiveType type) {
+  if (!chunk.columns[col].validity_bitmap.has_value()) {
+    if (const auto appended = visitNumeric(
+            type, [&](auto tag) { return appendNumericRun<decltype(tag)>(array, chunk, col, begin, end); })) {
+      return *appended;
+    }
+  }
+  for (std::size_t row = begin; row < end; ++row) {
+    if (!appendRow(array, chunk, col, row, type)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// A field's storage and column descriptor, looked up under the caller's engine lock.
+struct FieldColumn {
+  const TopicStorage* storage = nullptr;
+  ColumnDescriptor desc;
+};
+
+[[nodiscard]] Expected<FieldColumn> lookupFieldColumn(const DataEngine& engine, PJ_field_handle_t field) {
+  const auto* storage = engine.getTopicStorage(field.topic.id);
+  if (storage == nullptr) {
+    return unexpected(fmt::format("topic {} not found", field.topic.id));
+  }
+  const auto columns = effectiveColumns(engine, *storage);
+  const auto* desc = findFieldDescriptor(columns, field.id);
+  if (desc == nullptr) {
+    return unexpected(fmt::format("field {} not found in topic {}", field.id, field.topic.id));
+  }
+  return FieldColumn{storage, *desc};
+}
+
+/// `fn(chunk, column, begin, end)` over the rows of `field` stamped in [t_min, t_max], in time order, a run of one
+/// chunk at a time (RangeCursor::forEachOrderedRun). Chunks sealed before the field appeared hold none of its rows.
+/// Stops at the first `fn` returning false, and returns false then.
+template <typename Fn>
+[[nodiscard]] bool forEachFieldRun(
+    const std::deque<TopicChunk>& chunks, FieldId field, Timestamp t_min, Timestamp t_max, Fn&& fn) {
+  const TopicChunk* column_chunk = nullptr;
+  std::optional<std::size_t> col;
+  bool ok = true;
+  RangeCursor(chunks, t_min, t_max).forEachOrderedRun([&](const ChunkRowRange& run) {
+    if (run.chunk != column_chunk) {
+      column_chunk = run.chunk;
+      col = columnIndexOf(*column_chunk, field);
+    }
+    if (ok && col) {
+      ok = fn(*run.chunk, *col, run.row_start, run.row_end);
+    }
+  });
+  return ok;
+}
+
 }  // namespace
 
-// Engine lock(s) for a write-host operation (driven by the worker while the GUI
-// reads). The shared PJ::lockEnginePair (engine.hpp) in this file's vocabulary:
-// with a staging engine (the pause/resume copy) armed it locks BOTH via
-// std::lock so the worker's write-then-replay can't invert order against flushTo
-// (which also std::lock()s both); otherwise a single recursive lock. Recursive so
-// the locked methods underneath — and ensureField() nested in appendRecord() —
-// re-acquire. The parser-binding ingest route locks through the same helper, so
-// the two write paths can never drift out of lock order.
+Status readSeriesArrowWindow(
+    const DataEngine& engine, PJ_field_handle_t field, Timestamp first, Timestamp last, ArrowSchema* out_schema,
+    ArrowArray* out_array) {
+  if (out_schema == nullptr || out_array == nullptr) {
+    return unexpected(std::string("readSeriesArrow: out_schema and out_array must be non-null"));
+  }
+  engine.awaitCompleteSeries(field.topic.id);  // a snapshot must not catch a derived series mid-replay
+  auto lock = engine.lockEngine();
+
+  auto column = lookupFieldColumn(engine, field);
+  if (!column) {
+    return unexpected(column.error());
+  }
+  const TopicStorage* storage = column->storage;
+  const PrimitiveType type = column->desc.logical_type;
+
+  nanoarrow::UniqueSchema schema;
+  ArrowSchemaInit(schema.get());
+  if (ArrowSchemaSetTypeStruct(schema.get(), 2) != NANOARROW_OK) {
+    return unexpected(std::string("readSeriesArrow: ArrowSchemaSetTypeStruct failed"));
+  }
+  ArrowSchemaInit(schema->children[0]);
+  if (ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT64) != NANOARROW_OK ||
+      ArrowSchemaSetName(schema->children[0], "timestamp") != NANOARROW_OK) {
+    return unexpected(std::string("readSeriesArrow: failed to set timestamp child schema"));
+  }
+  ArrowSchemaInit(schema->children[1]);
+  if (ArrowSchemaSetType(schema->children[1], arrowTypeOf(type)) != NANOARROW_OK ||
+      ArrowSchemaSetName(schema->children[1], column->desc.field_path.c_str()) != NANOARROW_OK) {
+    return unexpected(std::string("readSeriesArrow: failed to set value child schema"));
+  }
+  nanoarrow::UniqueArray array;
+  ArrowError arrow_err;
+  if (ArrowArrayInitFromSchema(array.get(), schema.get(), &arrow_err) != NANOARROW_OK) {
+    return unexpected(std::string("readSeriesArrow: ArrowArrayInitFromSchema failed: ") + arrow_err.message);
+  }
+  if (ArrowArrayStartAppending(array.get()) != NANOARROW_OK) {
+    return unexpected(std::string("readSeriesArrow: ArrowArrayStartAppending failed"));
+  }
+
+  // Rows under the retention floor are evicted: a reader must not see them.
+  const auto& chunks = storage->sealedChunks();
+  const Timestamp floor = storage->retentionFloor();
+  const Timestamp t_min = std::max(first, floor);
+  if (t_min > std::numeric_limits<Timestamp>::min()) {
+    const auto before = latestAt(chunks, t_min - 1, floor, [&field](const TopicChunk& chunk) {
+      return columnIndexOf(chunk, field.id).has_value();
+    });
+    if (before &&
+        !appendRow(array.get(), *before->chunk, *columnIndexOf(*before->chunk, field.id), before->row_index, type)) {
+      return unexpected(std::string("readSeriesArrow: append failed"));
+    }
+  }
+  if (!forEachFieldRun(
+          chunks, field.id, t_min, last,
+          [&](const TopicChunk& chunk, std::size_t col, std::size_t begin, std::size_t end) {
+            return appendChunkRun(array.get(), chunk, col, begin, end, type);
+          })) {
+    return unexpected(std::string("readSeriesArrow: append failed"));
+  }
+
+  if (ArrowArrayFinishBuildingDefault(array.get(), &arrow_err) != NANOARROW_OK) {
+    return unexpected(std::string("readSeriesArrow: finish building failed: ") + arrow_err.message);
+  }
+  ArrowSchemaMove(schema.get(), out_schema);
+  ArrowArrayMove(array.get(), out_array);
+  return okStatus();
+}
+
+Status scanSeriesValues(
+    const DataEngine& engine, PJ_field_handle_t field, const SampleBlockCallback& on_block, Timestamp first) {
+  engine.awaitCompleteSeries(field.topic.id);
+  auto lock = engine.lockEngine();
+  auto column = lookupFieldColumn(engine, field);
+  if (!column) {
+    return unexpected(column.error());
+  }
+  if (!visitNumeric(column->desc.logical_type, [](auto) { return true; })) {
+    return okStatus();
+  }
+  std::vector<double> values;
+  (void)forEachFieldRun(
+      column->storage->sealedChunks(), field.id, std::max(first, column->storage->retentionFloor()),
+      std::numeric_limits<Timestamp>::max(),
+      [&](const TopicChunk& chunk, std::size_t col, std::size_t begin, std::size_t end) {
+        const Span<const Timestamp> ts(chunk.timestamps.data() + begin, end - begin);
+        const bool constant =
+            chunk.columnEncoding(col) == EncodingType::kConstant && !chunk.columns[col].validity_bitmap.has_value();
+        values.resize(constant ? 1 : ts.size());
+        chunk.readColumnAsDoubles(col, Span<double>(values), begin);
+        on_block(ts, values);
+        return true;
+      });
+  return okStatus();
+}
+
+// Engine locks for a write-host operation (the worker writes while the GUI reads). With a staging engine armed it takes
+// both with std::lock, as flushTo() and the parser-binding route do, so they cannot deadlock. Recursive, so nested
+// calls such as ensureField() in appendRecord() re-acquire.
 [[nodiscard]] inline EngineLockPair lockWriteEngines(DataEngine& live, DataEngine* staging) {
   return lockEnginePair(live, staging);
 }
@@ -371,14 +651,9 @@ struct WriteCore {
 
   DataEngine& engine;
   DataWriter writer;
-  // Optional secondary engine for the streaming pause/resume two-engine
-  // lockstep. When non-null, every ensureTopic/ensureField that lands a new
-  // id in `engine_` is mirrored into `*secondary_engine_` with the SAME id —
-  // so a cached plugin TopicHandle/FieldHandle still resolves after the host
-  // swaps which engine is the active write target. Mirroring happens inside
-  // ensureTopic/ensureField so it covers both the explicit C-ABI register
-  // paths AND the lazy "first-write creates the column" paths inside
-  // appendRecord / appendBoundRecord / appendArrowStream.
+  // The pause/resume staging engine, or null. Every topic and field ensureTopic() and ensureField() land is created
+  // there with the same id (appendRecord() and appendArrowStream() create columns through ensureField() too), so a
+  // plugin's cached handles still resolve after setTarget() swaps engines.
   DataEngine* secondary_engine = nullptr;
   std::string last_error;
 
@@ -408,10 +683,7 @@ struct WriteCore {
     }
   };
 
-  // Borrowed lookup key: lets the per-record hot path probe field_cache without
-  // heap-allocating a std::string for the field name on every (cache-hit) field
-  // — the dominant temporary-allocation source during ingest. Heterogeneous
-  // lookup is enabled by the is_transparent hash/equal below.
+  // Borrowed key: the per-record hot path probes field_cache without allocating a std::string per field.
   struct TopicFieldKeyView {
     TopicId topic_id;
     std::string_view field_name;
@@ -427,8 +699,7 @@ struct WriteCore {
     }
 
    private:
-    // Hash the name as a string_view in BOTH overloads so an owning key and a
-    // borrowed view with equal content always hash identically.
+    // Both overloads hash the name as a string_view, so an owning key and an equal view hash alike.
     static std::size_t hash(TopicId topic_id, std::string_view field_name) noexcept {
       std::size_t h1 = std::hash<TopicId>{}(topic_id);
       std::size_t h2 = std::hash<std::string_view>{}(field_name);
@@ -436,9 +707,6 @@ struct WriteCore {
     }
   };
 
-  // Transparent equality covering owning/view in either position, so
-  // robin_map::find can accept a borrowed TopicFieldKeyView. (std::string ==
-  // std::string_view compares by content.)
   struct TopicFieldKeyEq {
     using is_transparent = void;
     template <typename A, typename B>
@@ -456,9 +724,8 @@ struct WriteCore {
     }
   };
 
-  // Probed per field per appended record. std::hash of an integer is the
-  // identity and robin_map masks the low bits, so small topic/field ids must be
-  // mixed: xor-combining them left ~2k distinct hashes for ~200k fields.
+  // Probed per field per appended record. std::hash of an integer is the identity (libstdc++, libc++) and robin_map
+  // masks the low bits, so the small topic and field ids are mixed first.
   struct TopicFieldIdKeyHash {
     std::size_t operator()(const TopicFieldIdKey& key) const noexcept {
       uint64_t mixed = (static_cast<uint64_t>(key.topic_id) << 32) | key.field_id;
@@ -484,17 +751,14 @@ struct WriteCore {
 
   [[nodiscard]] bool createDataSource(std::string_view name, DataSourceHandle* out_source) {
     auto engine_locks = lockWriteEngines(engine, secondary_engine);
-    // Each plugin-created source gets its OWN time domain, exactly as the app's
-    // own file/stream loaders do. The per-source display offset lives on the
-    // domain, so a dataset left on the default domain (id 0) can never carry
-    // one — its Source Timeline bar would draw but refuse every drag.
+    // Each source gets its own time domain, which holds its display offset; the default domain (id 0) cannot carry
+    // one.
     auto td_or = engine.createTimeDomain(std::string(name));
     if (!td_or.has_value()) {
       setError(td_or.error());
       return false;
     }
-    // Same-id mirror per the two-engine lockstep invariant above, done before
-    // the dataset exists so a failed mirror leaves nothing half-created.
+    // Mirrored before the dataset exists, so a failed mirror creates no dataset.
     if (secondary_engine != nullptr) {
       auto mirror_or = secondary_engine->createTimeDomain(std::string(name), *td_or);
       if (!mirror_or.has_value()) {
@@ -512,16 +776,13 @@ struct WriteCore {
     return true;
   }
 
-  // Idempotent re-mirror of a topic onto the secondary engine. Called on
-  // every successful ensureTopic path (including cache hits) so a previously
-  // failed mirror is retried instead of leaving the engines diverged forever
-  // behind the cache.
+  // Runs on every successful ensureTopic() path, cache hits included, so a failed mirror is retried.
   [[nodiscard]] bool mirrorTopicToSecondary(DatasetId dataset_id, TopicId topic_id, std::string_view topic_name) {
     if (secondary_engine == nullptr) {
       return true;
     }
     if (secondary_engine->getTopicStorage(topic_id) != nullptr) {
-      return true;  // already mirrored (most common case)
+      return true;  // already mirrored
     }
     TopicDescriptor desc;
     desc.name = std::string(topic_name);
@@ -535,8 +796,6 @@ struct WriteCore {
   }
 
   [[nodiscard]] bool ensureTopic(DataSourceHandle source, std::string_view topic_name, TopicHandle* out_topic) {
-    // Normalize "//" → "/" once, at the ingest boundary, so the stored topic name,
-    // the catalog and the by-name transform resolver all key off the same string.
     std::string topic_name_normalized;
     if (needsSlashNormalization(topic_name)) {
       topic_name_normalized = normalizeSlashes(topic_name);
@@ -551,8 +810,6 @@ struct WriteCore {
 
     DatasetTopicKey key{.dataset_id = source.id, .topic_name = std::string(topic_name)};
     if (auto it = topic_cache.find(key); it != topic_cache.end()) {
-      // Cache hit — but the secondary may still be missing this topic if a
-      // prior mirror failed; retry. No-op if already mirrored.
       if (!mirrorTopicToSecondary(source.id, it->second.id, topic_name)) {
         return false;
       }
@@ -566,7 +823,6 @@ struct WriteCore {
     for (TopicId tid : topic_ids) {
       const auto* storage = engine.getTopicStorage(tid);
       if (storage != nullptr && storage->descriptor().name == topic_name) {
-        // Found in primary — same retry semantics on the secondary.
         if (!mirrorTopicToSecondary(source.id, tid, topic_name)) {
           return false;
         }
@@ -586,10 +842,6 @@ struct WriteCore {
       return false;
     }
 
-    // Lockstep mirror to the secondary engine (streaming two-engine model).
-    // Forces the same TopicId on both sides so a later setTarget(secondary)
-    // swap finds the topic that the plugin's cached TopicHandle refers to.
-    // See DataEngine::createTopicField for the field-level counterpart.
     if (!mirrorTopicToSecondary(source.id, *tid_or, topic_name)) {
       return false;
     }
@@ -607,36 +859,27 @@ struct WriteCore {
       return true;
     }
 
-    const auto* storage = engine.getTopicStorage(topic.id);
-    if (storage == nullptr) {
-      setError(fmt::format("topic {} not found", topic.id));
-      return false;
-    }
-    const auto columns = effectiveColumns(engine, *storage);
-    const auto* desc = findFieldDescriptor(columns, field_id);
-    if (desc == nullptr) {
-      setError(fmt::format("field {} not found in topic {}", field_id, topic.id));
+    const auto column = lookupFieldColumn(engine, FieldHandle{.topic = topic, .id = field_id});
+    if (!column) {
+      setError(column.error());
       return false;
     }
 
-    *out_type = desc->logical_type;
-    field_types[key] = desc->logical_type;
-    field_cache[{.topic_id = topic.id, .field_name = desc->field_path}] = FieldHandle{.topic = topic, .id = field_id};
+    *out_type = column->desc.logical_type;
+    field_types[key] = column->desc.logical_type;
+    field_cache[{.topic_id = topic.id, .field_name = column->desc.field_path}] =
+        FieldHandle{.topic = topic, .id = field_id};
     return true;
   }
 
-  // With `out_column_type` null (the explicit C-ABI register path) a type
-  // mismatch against an existing column is an error. Non-null (appendRecord's
-  // lazy path) the existing column is returned with its type instead, and the
-  // caller converts the value (coerceExact).
+  // With `out_column_type` null (the C-ABI register path) a type mismatch with an existing column is an error;
+  // otherwise (appendRecord()'s lazy path) the existing column and its type come back, and the caller converts the
+  // value.
   [[nodiscard]] bool ensureField(
       TopicHandle topic, std::string_view field_name, PJ_primitive_type_t abi_type, FieldHandle* out_field,
       PrimitiveType* out_column_type = nullptr) {
-    // Normalize the field name on every entry point (direct ensureField and the lazy
-    // auto-create inside appendRecord). A field path is relative to its topic, so two
-    // things get fixed: internal runs "//" collapse to "/", and a leading '/' (e.g. a
-    // CSV column header "/robot/pose/x") is dropped — otherwise the UI, which joins
-    // topic + '/' + field, would render "topic//robot/pose/x".
+    // A field path is relative to its topic: a leading '/' (a CSV header such as "/robot/pose/x") is dropped, or the
+    // joined "topic/field" name would double the slash.
     std::string field_name_normalized;
     if (needsFieldNormalization(field_name)) {
       field_name_normalized = normalizeSlashes(field_name);
@@ -659,9 +902,6 @@ struct WriteCore {
     }
     const PrimitiveType type = *type_or;
 
-    // Borrowed probe: no std::string is allocated on the common cache-hit path
-    // (every field after a topic's first record). The owning key is built only
-    // when a new field is inserted below.
     if (auto it = field_cache.find(TopicFieldKeyView{.topic_id = topic.id, .field_name = field_name});
         it != field_cache.end()) {
       PrimitiveType existing{};
@@ -672,10 +912,8 @@ struct WriteCore {
         setError(fmt::format("field '{}' already exists with a different type", field_name));
         return false;
       }
-      // Idempotent re-mirror on cache hit — if a previous mirror failed, this
-      // re-attempts it. createTopicField returns the existing FieldId when
-      // (name, type) already matches in the secondary, so it's a cheap no-op
-      // in the steady state.
+      // Re-mirrored on a cache hit, so a failed mirror is retried; createTopicField() returns the existing FieldId when
+      // name and type match.
       if (secondary_engine != nullptr) {
         auto mirror_or =
             secondary_engine->createTopicField(topic.id, field_name, existing, std::optional<FieldId>{it->second.id});
@@ -692,9 +930,8 @@ struct WriteCore {
       return true;
     }
 
-    // Cache miss on a column that may already exist with another type: a fresh
-    // core after a setTarget swap, or a column another writer created. Adopt its
-    // type so ensureColumn resolves it instead of rejecting the mismatch.
+    // On a cache miss the column may exist with another type (a fresh core after a setTarget() swap, or another
+    // writer's column): adopt its type, so ensureColumn() resolves it rather than rejecting the mismatch.
     PrimitiveType column_type = type;
     if (out_column_type != nullptr) {
       const auto& columns = storage->columnDescriptors();
@@ -709,17 +946,7 @@ struct WriteCore {
       return false;
     }
 
-    // Lockstep mirror to the secondary engine (streaming two-engine model).
-    // Forces the same FieldId via DataEngine::createTopicField so that a
-    // cached FieldHandle resolves identically on either engine after a
-    // setTarget swap. Runs from EVERY path that lands here — explicit C-ABI
-    // ensureField AND the lazy "auto-create column on first non-null write"
-    // path inside appendRecord/appendBoundRecord/appendArrowStream — because
-    // they all funnel through this method.
-    //
-    // requested_id is wrapped in std::optional so FieldId 0 (the first field
-    // of any topic) is forced, not auto-assigned. A naive `FieldId == 0`
-    // sentinel would silently mis-assign the first field of every topic.
+    // The requested id is an optional because FieldId 0, a topic's first field, must be forced too.
     if (secondary_engine != nullptr) {
       auto mirror_or =
           secondary_engine->createTopicField(topic.id, field_name, column_type, std::optional<FieldId>{*field_id_or});
@@ -739,9 +966,8 @@ struct WriteCore {
     return true;
   }
 
-  // A value of the wrong type for its column: returns it converted when that is
-  // exact, else nullopt after reporting the field (once) — the caller stores
-  // null for that field and keeps the rest of the record.
+  // A value of the wrong type for its column: converted when that is exact, else nullopt after reporting the field
+  // once; the caller stores null for that field and keeps the rest of the record.
   [[nodiscard]] std::optional<PJ_scalar_value_t> convertForColumn(
       TopicId topic_id, FieldId field_id, const PJ_scalar_value_t& value, PrimitiveType column_type) {
     auto converted = coerceExact(value, column_type);
@@ -828,9 +1054,8 @@ struct WriteCore {
     };
     std::vector<ResolvedField> resolved;
     resolved.reserve(field_count);
-    // Backing store for names that needed "//" → "/" normalization; a deque keeps
-    // element addresses stable so the string_views below (and in seen_names) stay
-    // valid for the whole record. Untouched on the common (no-"//") path.
+    // Normalized names: a deque keeps their addresses stable, so the string_views into it (seen_names too) stay valid
+    // for the whole record.
     std::deque<std::string> normalized_names;
     for (std::size_t i = 0; i < field_count; ++i) {
       const auto& field = fields[i];
@@ -848,13 +1073,10 @@ struct WriteCore {
         return false;
       }
       if (field.is_null) {
-        // Null values: look up existing field by name (borrowed probe, no alloc).
         auto it = field_cache.find(TopicFieldKeyView{.topic_id = topic.id, .field_name = name});
         if (it == field_cache.end()) {
-          // Field has never been seen. Check if this is a typed null (the ABI
-          // carries value.type even when is_null is true). A valid type lets
-          // us create the column now; an untyped null (kNull) is silently
-          // skipped — the column will be created when a non-null value arrives.
+          // A typed null (the ABI keeps value.type when is_null is set) creates the column now; an untyped one
+          // (PJ_PRIMITIVE_TYPE_UNSPECIFIED) is skipped until a value arrives.
           auto type_or = fromAbiType(field.value.type);
           if (type_or.has_value()) {
             FieldHandle handle{};
@@ -975,12 +1197,7 @@ struct WriteCore {
     return true;
   }
 
-  /// Ingest a whole Arrow C Data Interface stream into a topic.
-  ///
-  /// Ownership contract: callers pass a producer-owned @p stream. The caller
-  /// decides whether to release after this call — this method does NOT
-  /// call stream->release. That lets the outermost ABI trampoline enforce
-  /// the "success releases, failure retains" rule uniformly.
+  /// Does not release `stream`: the ABI trampoline releases it on success only.
   [[nodiscard]] bool appendArrowStream(
       TopicHandle topic, struct ArrowArrayStream* stream, PJ_string_view_t timestamp_column) {
     auto engine_locks = lockWriteEngines(engine, secondary_engine);
@@ -1081,10 +1298,9 @@ PJ_string_view_t storeString(CatalogSnapshotState& state, std::string_view value
   return sdk::name(*type);
 }
 
-// v2 only: every object topic of every dataset, derived and marker topics included, sorted
-// by (dataset, name). Called with the engine lock released, since the engine lock and the
-// ObjectStore lock never nest. The strings are copied under the store's shared lock; each
-// type is read from the copied metadata after it.
+// v2 only: every object topic of every dataset, derived and marker topics included, sorted by (dataset, name). Called
+// with the engine lock released: the engine and ObjectStore locks never nest. The strings are copied under the store's
+// shared lock, and each type is read from the copy afterwards.
 void fillObjectTopics(CatalogSnapshotState* state, const ObjectStore& object_store) {
   object_store.forEachTopicRetained(
       [state](ObjectTopicId id, const ObjectTopicDescriptor& desc, const ObjectStore::RetainedRange& retained) {
@@ -1121,16 +1337,16 @@ struct ToolboxCore {
   WriteCore write;
   DataEngine& engine;
 
-  // The scalar half of the catalog (data sources / topics / fields), shared by v1 and
-  // v2. Caller holds engine.lockEngine(): every read here is a live view into engine state.
+  // The scalar half of the catalog, shared by v1 and v2. The caller holds lockEngine(): every read is a live view into
+  // engine state.
   void fillScalarCatalog(CatalogSnapshotState* state) {
     auto dataset_ids = engine.listDatasets();
     std::sort(dataset_ids.begin(), dataset_ids.end());
     state->data_sources.reserve(dataset_ids.size());
 
     for (DatasetId ds_id : dataset_ids) {
-      const auto* dataset = engine.getDataset(ds_id);
-      if (dataset == nullptr) {
+      // A merged-away source is not a dataset any surface lists.
+      if (engine.getDataset(ds_id) == nullptr || engine.isMergedAway(ds_id)) {
         continue;
       }
 
@@ -1145,6 +1361,9 @@ struct ToolboxCore {
         const uint32_t first_field = static_cast<uint32_t>(state->fields.size());
         const auto columns = effectiveColumns(engine, *storage);
         for (const auto& col : columns) {
+          if (storage->isColumnRetired(col.field_id)) {
+            continue;
+          }
           state->fields.push_back(
               PJ_field_info_t{
                   .handle = FieldHandle{.topic = TopicHandle{.id = tid}, .id = col.field_id},
@@ -1165,7 +1384,7 @@ struct ToolboxCore {
       state->data_sources.push_back(
           PJ_data_source_info_t{
               .handle = DataSourceHandle{.id = ds_id},
-              .name = storeString(*state, dataset->source_name),
+              .name = storeString(*state, engine.datasetLabel(ds_id)),
               .first_topic = first_topic,
               .topic_count = static_cast<uint32_t>(state->topics.size()) - first_topic,
           });
@@ -1221,216 +1440,22 @@ struct ToolboxCore {
     return true;
   }
 
-  // v4: materialise one field's time series into host-owned Arrow structs.
-  // Output is a struct array with 2 columns: ["timestamp" (int64),
-  // <field_name> (typed)]. The caller must invoke out_schema->release and
-  // out_array->release when done; release callbacks are set by nanoarrow
-  // and free all allocated buffers.
+  // v4: one field's whole time series as host-owned Arrow structs (readSeriesArrowWindow, unbounded).
   [[nodiscard]] bool readSeriesArrow(FieldHandle field, struct ArrowSchema* out_schema, struct ArrowArray* out_array) {
-    if (out_schema == nullptr || out_array == nullptr) {
-      write.setError("readSeriesArrow: out_schema and out_array must be non-null");
+    if (auto status = readSeriesArrowWindow(
+            engine, field, std::numeric_limits<Timestamp>::min(), std::numeric_limits<Timestamp>::max(), out_schema,
+            out_array);
+        !status) {
+      write.setError(status.error());
       return false;
     }
-    engine.awaitCompleteSeries(field.topic.id);  // a snapshot must not catch a derived series mid-replay
-    auto lock = engine.lockEngine();             // held through the row-decode loop below
-
-    const auto* storage = engine.getTopicStorage(field.topic.id);
-    if (storage == nullptr) {
-      write.setError(fmt::format("topic {} not found", field.topic.id));
-      return false;
-    }
-    const auto columns = effectiveColumns(engine, *storage);
-    const auto* desc = findFieldDescriptor(columns, field.id);
-    if (desc == nullptr) {
-      write.setError(fmt::format("field {} not found in topic {}", field.id, field.topic.id));
-      return false;
-    }
-
-    const ArrowType value_arrow_type = [&]() {
-      switch (desc->logical_type) {
-        case PrimitiveType::kFloat32:
-          return NANOARROW_TYPE_FLOAT;
-        case PrimitiveType::kFloat64:
-          return NANOARROW_TYPE_DOUBLE;
-        case PrimitiveType::kInt8:
-          return NANOARROW_TYPE_INT8;
-        case PrimitiveType::kInt16:
-          return NANOARROW_TYPE_INT16;
-        case PrimitiveType::kInt32:
-          return NANOARROW_TYPE_INT32;
-        case PrimitiveType::kInt64:
-          return NANOARROW_TYPE_INT64;
-        case PrimitiveType::kUint8:
-          return NANOARROW_TYPE_UINT8;
-        case PrimitiveType::kUint16:
-          return NANOARROW_TYPE_UINT16;
-        case PrimitiveType::kUint32:
-          return NANOARROW_TYPE_UINT32;
-        case PrimitiveType::kUint64:
-          return NANOARROW_TYPE_UINT64;
-        case PrimitiveType::kBool:
-          return NANOARROW_TYPE_BOOL;
-        case PrimitiveType::kString:
-          return NANOARROW_TYPE_STRING;
-        case PrimitiveType::kUnspecified:
-          return NANOARROW_TYPE_NA;
-      }
-      return NANOARROW_TYPE_NA;
-    }();
-
-    nanoarrow::UniqueSchema schema;
-    ArrowSchemaInit(schema.get());
-    if (ArrowSchemaSetTypeStruct(schema.get(), 2) != NANOARROW_OK) {
-      write.setError("readSeriesArrow: ArrowSchemaSetTypeStruct failed");
-      return false;
-    }
-    ArrowSchemaInit(schema->children[0]);
-    if (ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT64) != NANOARROW_OK ||
-        ArrowSchemaSetName(schema->children[0], "timestamp") != NANOARROW_OK) {
-      write.setError("readSeriesArrow: failed to set timestamp child schema");
-      return false;
-    }
-    ArrowSchemaInit(schema->children[1]);
-    if (ArrowSchemaSetType(schema->children[1], value_arrow_type) != NANOARROW_OK ||
-        ArrowSchemaSetName(schema->children[1], desc->field_path.c_str()) != NANOARROW_OK) {
-      write.setError("readSeriesArrow: failed to set value child schema");
-      return false;
-    }
-
-    nanoarrow::UniqueArray array;
-    ArrowError arrow_err;
-    if (ArrowArrayInitFromSchema(array.get(), schema.get(), &arrow_err) != NANOARROW_OK) {
-      write.setError(std::string("readSeriesArrow: ArrowArrayInitFromSchema failed: ") + arrow_err.message);
-      return false;
-    }
-    if (ArrowArrayStartAppending(array.get()) != NANOARROW_OK) {
-      write.setError("readSeriesArrow: ArrowArrayStartAppending failed");
-      return false;
-    }
-
-    auto* ts_child = array->children[0];
-    auto* val_child = array->children[1];
-
-    // Rows below the topic's retention floor are logically evicted: a toolbox
-    // plugin reading this series must not see them (the retention contract).
-    // Chunks committed out of time order (a backfill) are merged, so the rows
-    // come out in time order.
-    RangeCursor cursor(storage->sealedChunks(), storage->retentionFloor(), std::numeric_limits<Timestamp>::max());
-    const TopicChunk* column_chunk = nullptr;
-    int col_index = -1;
-    for (; cursor.valid(); cursor.advance()) {
-      const SampleRow sample = cursor.current();
-      const TopicChunk& chunk = *sample.chunk;
-      if (&chunk != column_chunk) {
-        column_chunk = &chunk;
-        col_index = -1;
-        for (std::size_t i = 0; i < chunk.columns.size(); ++i) {
-          if (chunk.columns[i].descriptor->field_id == field.id) {
-            col_index = static_cast<int>(i);
-            break;
-          }
-        }
-      }
-      if (col_index < 0) {
-        continue;  // a chunk without the field
-      }
-      const auto col_sz = static_cast<std::size_t>(col_index);
-      const auto row = static_cast<uint32_t>(sample.row_index);
-      {
-        const auto ts = sample.timestamp;
-        if (ArrowArrayAppendInt(ts_child, ts) != NANOARROW_OK) {
-          write.setError("readSeriesArrow: timestamp append failed");
-          return false;
-        }
-
-        const bool is_null = chunk.isNull(col_sz, row);
-        if (is_null) {
-          if (ArrowArrayAppendNull(val_child, 1) != NANOARROW_OK) {
-            write.setError("readSeriesArrow: null append failed");
-            return false;
-          }
-        } else {
-          ArrowErrorCode rc = NANOARROW_OK;
-          switch (desc->logical_type) {
-            case PrimitiveType::kFloat32:
-              rc = ArrowArrayAppendDouble(val_child, decodeNumericExact<float>(chunk, col_sz, row));
-              break;
-            case PrimitiveType::kFloat64:
-              rc = ArrowArrayAppendDouble(val_child, decodeNumericExact<double>(chunk, col_sz, row));
-              break;
-            case PrimitiveType::kInt8:
-              rc = ArrowArrayAppendInt(val_child, decodeNumericExact<int8_t>(chunk, col_sz, row));
-              break;
-            case PrimitiveType::kInt16:
-              rc = ArrowArrayAppendInt(val_child, decodeNumericExact<int16_t>(chunk, col_sz, row));
-              break;
-            case PrimitiveType::kInt32:
-              rc = ArrowArrayAppendInt(val_child, decodeNumericExact<int32_t>(chunk, col_sz, row));
-              break;
-            case PrimitiveType::kInt64:
-              rc = ArrowArrayAppendInt(val_child, decodeNumericExact<int64_t>(chunk, col_sz, row));
-              break;
-            case PrimitiveType::kUint8:
-              rc = ArrowArrayAppendUInt(val_child, decodeNumericExact<uint8_t>(chunk, col_sz, row));
-              break;
-            case PrimitiveType::kUint16:
-              rc = ArrowArrayAppendUInt(val_child, decodeNumericExact<uint16_t>(chunk, col_sz, row));
-              break;
-            case PrimitiveType::kUint32:
-              rc = ArrowArrayAppendUInt(val_child, decodeNumericExact<uint32_t>(chunk, col_sz, row));
-              break;
-            case PrimitiveType::kUint64:
-              rc = ArrowArrayAppendUInt(val_child, decodeNumericExact<uint64_t>(chunk, col_sz, row));
-              break;
-            case PrimitiveType::kBool:
-              rc = ArrowArrayAppendInt(val_child, chunk.readBool(col_sz, row) ? 1 : 0);
-              break;
-            case PrimitiveType::kString: {
-              const auto text = chunk.readString(col_sz, row);
-              const ArrowStringView sv{text.data(), static_cast<int64_t>(text.size())};
-              rc = ArrowArrayAppendString(val_child, sv);
-              break;
-            }
-            case PrimitiveType::kUnspecified:
-              rc = ArrowArrayAppendNull(val_child, 1);
-              break;
-          }
-          if (rc != NANOARROW_OK) {
-            write.setError("readSeriesArrow: value append failed");
-            return false;
-          }
-        }
-
-        if (ArrowArrayFinishElement(array.get()) != NANOARROW_OK) {
-          write.setError("readSeriesArrow: ArrowArrayFinishElement failed");
-          return false;
-        }
-      }
-    }
-
-    if (ArrowArrayFinishBuildingDefault(array.get(), &arrow_err) != NANOARROW_OK) {
-      write.setError(std::string("readSeriesArrow: finish building failed: ") + arrow_err.message);
-      return false;
-    }
-
-    // Move schema + array into caller-provided out params (transfers release
-    // callbacks; the UniqueXxx destructors become no-ops).
-    ArrowSchemaMove(schema.get(), out_schema);
-    ArrowArrayMove(array.get(), out_array);
     write.last_error.clear();
     return true;
   }
 };
 
-// Minimal atomic shared_ptr cell exposing only the load()/store() surface the
-// write hosts need. std::atomic<std::shared_ptr<T>> (C++20) is provided by
-// libstdc++ only since GCC 12; the build baseline (CI) is GCC 11, where the
-// primary std::atomic<T> template is selected instead and fails its
-// "trivially copyable" static_assert. A mutex gives a happens-before guarantee
-// at least as strong as the acquire/release ordering the callers request, so
-// this is a faithful drop-in. Non-copyable / non-movable like std::atomic — the
-// enclosing *State structs only ever move via the owning unique_ptr, never the
-// State itself, so this matches their requirements exactly.
+// A mutex-backed std::atomic<std::shared_ptr<T>>, which libstdc++ ships only from GCC 12 (CI builds with GCC 11). Like
+// std::atomic, neither copyable nor movable.
 template <typename T>
 class AtomicSharedPtr {
  public:
@@ -1454,20 +1479,12 @@ class AtomicSharedPtr {
 struct DatastoreSourceWriteHostState {
   DatastoreSourceWriteHostState(DataEngine& engine, DataSourceHandle source_handle)
       : core(std::make_shared<WriteCore>(engine)), source(source_handle), primary_engine(&engine) {}
-  // AtomicSharedPtr, not a plain unique_ptr, because the streaming pause/resume
-  // setTarget() swap reconstructs the WriteCore on the GUI thread while the ingest
-  // worker may still be dereferencing the previous one on its own thread. The
-  // worker loads a strong reference for the duration of each call (so the old core
-  // cannot be destroyed under it), and setTarget builds the replacement fully then
-  // publishes it with release ordering. Mirrors the object-store host's
-  // std::atomic<ObjectStore*>; WriteCore holds DataEngine by reference and is not
-  // reseatable, hence the swap rather than an in-place rebind.
+  // setTarget() replaces the core on the GUI thread while the ingest worker may be inside the old one. Load it through
+  // pinCore(): the strong reference keeps the old core alive until the call returns, and the engine locks keep the
+  // swap from flushing the old core while the call stages rows in it.
   AtomicSharedPtr<WriteCore> core;
   DataSourceHandle source;
-  // Streaming two-engine lockstep: remember the primary + secondary engines
-  // so setTarget can re-wire the new WriteCore's secondary_engine_ pointer to
-  // the OTHER engine, keeping mirrors symmetric. Both are raw pointers, not
-  // owning; the streaming manager outlives the host.
+  // Not owned (the streaming manager outlives the host). setTarget() points the new core's mirror at the other one.
   DataEngine* primary_engine = nullptr;
   DataEngine* secondary_engine = nullptr;
 };
@@ -1475,25 +1492,37 @@ struct DatastoreSourceWriteHostState {
 struct DatastoreParserWriteHostState {
   DatastoreParserWriteHostState(DataEngine& engine, TopicHandle topic_handle)
       : core(std::make_shared<WriteCore>(engine)), topic(topic_handle), primary_engine(&engine) {}
-  // AtomicSharedPtr — see DatastoreSourceWriteHostState::core. The setTarget()
-  // swap publishes a fresh WriteCore while the parser worker may still be inside
-  // the previous one; the worker pins it with a strong reference per call, so the
-  // swap can never free a core out from under an in-flight append.
+  // As DatastoreSourceWriteHostState::core.
   AtomicSharedPtr<WriteCore> core;
   TopicHandle topic;
-  // Streaming two-engine lockstep — see DatastoreSourceWriteHostState. Closes
-  // the latent FieldHandle-stale bug for parser plugins that cache handles
-  // (parser_protobuf et al.) on pause/resume.
+  // As in DatastoreSourceWriteHostState: parsers cache FieldHandles across pause/resume.
   DataEngine* primary_engine = nullptr;
   DataEngine* secondary_engine = nullptr;
 };
 
+// A write core and its engine locks, held for one write-host call.
+struct PinnedCore {
+  std::shared_ptr<WriteCore> core;
+  EngineLockPair engine_locks;
+};
+
+// Loads the current core and locks its engines, retrying if setTarget() published another one meanwhile. setTarget()
+// flushes the old core and publishes the new one under the same locks, so a row staged under the pin is either
+// committed by that flush or written through the new core.
+template <typename HostState>
+[[nodiscard]] PinnedCore pinCore(const HostState& state) {
+  for (;;) {
+    auto core = state.core.load(std::memory_order_acquire);
+    auto engine_locks = lockWriteEngines(core->engine, core->secondary_engine);
+    if (state.core.load(std::memory_order_acquire) == core) {
+      return {std::move(core), std::move(engine_locks)};
+    }
+  }
+}
+
 struct DatastoreToolboxHostState {
   DatastoreToolboxHostState(DataEngine& engine, ObjectStore& store) : core(engine), object_store(store) {}
   ToolboxCore core;
-  // Toolbox plugins share the session's object store; the host holds a
-  // reference so register_object_topic + push_owned_object can forward
-  // without going back through the engine.
   ObjectStore& object_store;
   std::string object_last_error;
 
@@ -1504,11 +1533,7 @@ struct DatastoreToolboxHostState {
 
 struct DatastoreSourceObjectWriteHostState {
   DatastoreSourceObjectWriteHostState(ObjectStore& s, DatasetId dataset) : target(&s), dataset_id(dataset) {}
-  // Atomic pointer rather than reference: the streaming two-store flow
-  // retargets the host between the primary and secondary ObjectStore on each
-  // pause/resume transition. Plain reference would not be reassignable. The
-  // atomic guarantees the worker thread sees a fully-published swap from the
-  // manager thread without locking on the hot push path.
+  // Atomic: pause/resume retargets the host between the primary and the secondary ObjectStore while the worker pushes.
   std::atomic<ObjectStore*> target;
   DatasetId dataset_id;
   std::string last_error;
@@ -1522,9 +1547,7 @@ struct DatastoreToolboxObjectReadHostState {
   explicit DatastoreToolboxObjectReadHostState(ObjectStore& s) : store(s) {}
   ObjectStore& store;
   std::string last_error;
-  // Backing storage for the const char* returned by toolboxObjectTopicMetadata:
-  // ObjectStore::descriptor() now returns by value, so the pointer must outlive the
-  // call. Valid until the next toolboxObjectTopicMetadata() on this host.
+  // Backs the const char* toolboxObjectTopicMetadata() returns: valid until the next call on this host.
   std::string last_metadata;
 
   void setError(std::string msg) {
@@ -1534,7 +1557,7 @@ struct DatastoreToolboxObjectReadHostState {
 
 struct DatastoreParserObjectWriteHostState {
   DatastoreParserObjectWriteHostState(ObjectStore& s, ObjectTopicId topic) : target(&s), bound_topic(topic) {}
-  // Atomic pointer rather than reference: see DatastoreSourceObjectWriteHostState.
+  // Atomic: see DatastoreSourceObjectWriteHostState.
   std::atomic<ObjectStore*> target;
   ObjectTopicId bound_topic;
   std::string last_error;
@@ -1563,9 +1586,8 @@ bool guardHostCallback(PJ_error_t* out_error, Fn&& fn) noexcept {
 bool sourceEnsureTopic(void* ctx, PJ_string_view_t topic_name, TopicHandle* out_topic, PJ_error_t* out_error) noexcept {
   return guardHostCallback(out_error, [&] {
     auto* impl = static_cast<DatastoreSourceWriteHostState*>(ctx);
-    // Pin the current WriteCore for the whole call so a concurrent setTarget()
-    // swap can't destroy it under us (and so the op + its error read the SAME core).
-    auto core = impl->core.load(std::memory_order_acquire);
+    // The op and its error read one core.
+    auto [core, engine_locks] = pinCore(*impl);
     if (!core->ensureTopic(impl->source, toStringView(topic_name), out_topic)) {
       propagateError(out_error, core->lastError());
       return false;
@@ -1579,7 +1601,7 @@ bool sourceEnsureField(
     PJ_error_t* out_error) noexcept {
   return guardHostCallback(out_error, [&] {
     auto* impl = static_cast<DatastoreSourceWriteHostState*>(ctx);
-    auto core = impl->core.load(std::memory_order_acquire);
+    auto [core, engine_locks] = pinCore(*impl);
     if (!core->ensureField(topic, toStringView(field_name), type, out_field)) {
       propagateError(out_error, core->lastError());
       return false;
@@ -1593,7 +1615,7 @@ bool sourceAppendRecord(
     PJ_error_t* out_error) noexcept {
   return guardHostCallback(out_error, [&] {
     auto* impl = static_cast<DatastoreSourceWriteHostState*>(ctx);
-    auto core = impl->core.load(std::memory_order_acquire);
+    auto [core, engine_locks] = pinCore(*impl);
     if (!core->appendRecord(topic, timestamp, fields, field_count)) {
       propagateError(out_error, core->lastError());
       return false;
@@ -1607,7 +1629,7 @@ bool sourceAppendBoundRecord(
     PJ_error_t* out_error) noexcept {
   return guardHostCallback(out_error, [&] {
     auto* impl = static_cast<DatastoreSourceWriteHostState*>(ctx);
-    auto core = impl->core.load(std::memory_order_acquire);
+    auto [core, engine_locks] = pinCore(*impl);
     if (!core->appendBoundRecord(topic, timestamp, fields, field_count)) {
       propagateError(out_error, core->lastError());
       return false;
@@ -1621,13 +1643,13 @@ bool sourceAppendArrowStream(
     PJ_error_t* out_error) noexcept {
   return guardHostCallback(out_error, [&] {
     auto* impl = static_cast<DatastoreSourceWriteHostState*>(ctx);
-    auto core = impl->core.load(std::memory_order_acquire);
+    auto [core, engine_locks] = pinCore(*impl);
     if (!core->appendArrowStream(topic, stream, timestamp_column)) {
-      // Failure: plugin retains ownership of the stream; we do NOT release.
+      // On failure the plugin keeps the stream.
       propagateError(out_error, core->lastError());
       return false;
     }
-    // Success: host now owns the stream — release it.
+    // On success the host owns it.
     if (stream != nullptr && stream->release != nullptr) {
       stream->release(stream);
     }
@@ -1640,7 +1662,7 @@ bool parserEnsureField(
     PJ_error_t* out_error) noexcept {
   return guardHostCallback(out_error, [&] {
     auto* impl = static_cast<DatastoreParserWriteHostState*>(ctx);
-    auto core = impl->core.load(std::memory_order_acquire);
+    auto [core, engine_locks] = pinCore(*impl);
     if (!core->ensureField(impl->topic, toStringView(field_name), type, out_field)) {
       propagateError(out_error, core->lastError());
       return false;
@@ -1654,7 +1676,7 @@ bool parserAppendRecord(
     PJ_error_t* out_error) noexcept {
   return guardHostCallback(out_error, [&] {
     auto* impl = static_cast<DatastoreParserWriteHostState*>(ctx);
-    auto core = impl->core.load(std::memory_order_acquire);
+    auto [core, engine_locks] = pinCore(*impl);
     if (!core->appendRecord(impl->topic, timestamp, fields, field_count)) {
       propagateError(out_error, core->lastError());
       return false;
@@ -1668,7 +1690,7 @@ bool parserAppendBoundRecord(
     PJ_error_t* out_error) noexcept {
   return guardHostCallback(out_error, [&] {
     auto* impl = static_cast<DatastoreParserWriteHostState*>(ctx);
-    auto core = impl->core.load(std::memory_order_acquire);
+    auto [core, engine_locks] = pinCore(*impl);
     if (!core->appendBoundRecord(impl->topic, timestamp, fields, field_count)) {
       propagateError(out_error, core->lastError());
       return false;
@@ -1681,7 +1703,7 @@ bool parserAppendArrowStream(
     void* ctx, struct ArrowArrayStream* stream, PJ_string_view_t timestamp_column, PJ_error_t* out_error) noexcept {
   return guardHostCallback(out_error, [&] {
     auto* impl = static_cast<DatastoreParserWriteHostState*>(ctx);
-    auto core = impl->core.load(std::memory_order_acquire);
+    auto [core, engine_locks] = pinCore(*impl);
     if (!core->appendArrowStream(impl->topic, stream, timestamp_column)) {
       propagateError(out_error, core->lastError());
       return false;
@@ -1817,11 +1839,7 @@ bool toolboxRegisterObjectTopic(
     propagateError(out_error, "out_handle must not be null");
     return false;
   }
-  // Validate the source handle against the engine — same check used by scalar
-  // ensureTopic so the toolbox can't register a topic against a dataset that
-  // doesn't exist. Scope the engine lock to JUST this read — do NOT hold it
-  // across object_store.registerTopic below: the engine and ObjectStore locks
-  // must never nest (see pj_datastore/CLAUDE.md).
+  // The engine lock covers this lookup only: the engine and ObjectStore locks never nest.
   {
     auto lock = impl->core.engine.lockEngine();
     if (impl->core.engine.getDataset(source.id) == nullptr) {
@@ -1865,8 +1883,7 @@ bool toolboxRegisterObjectTopicOnDataset(
   }
   bool dataset_exists = false;
   {
-    // getDataset() is a raw accessor: hold the engine lock for the lookup only —
-    // never across the ObjectStore calls below (the two locks must not nest).
+    // The engine lock covers this lookup only, as above.
     const auto lock = impl->core.engine.lockEngine();
     dataset_exists = impl->core.engine.getDataset(dataset_id) != nullptr;
   }
@@ -1877,8 +1894,7 @@ bool toolboxRegisterObjectTopicOnDataset(
   }
   try {
     const std::string name(toStringView(topic_name));
-    // Idempotent: a producer that republishes its whole marker set re-resolves
-    // the same topic handle on every push instead of failing on "already exists".
+    // Idempotent: a producer that republishes its marker set gets the same topic handle back.
     if (const auto existing = impl->object_store.findTopic(dataset_id, name)) {
       out_handle->id = existing->id;
       impl->object_last_error.clear();
@@ -1908,9 +1924,8 @@ bool toolboxRegisterObjectTopicOnDataset(
   }
 }
 
-// Bound a topic's retention to its last `max_entries` snapshots (0 = unlimited).
-// A producer that republishes a whole set at a sentinel timestamp sets 1 so
-// superseded snapshots are evicted instead of accumulating across re-pushes.
+// Keeps a topic's last `max_entries` entries (0 = unlimited). A producer that republishes a whole set at a sentinel
+// timestamp sets 1, so superseded sets are evicted.
 bool toolboxSetObjectTopicRetention(
     void* ctx, PJ_object_topic_handle_t topic, uint64_t max_entries, PJ_error_t* out_error) noexcept {
   auto* impl = static_cast<DatastoreToolboxHostState*>(ctx);
@@ -1964,10 +1979,8 @@ bool toolboxPushOwnedObject(
   }
 }
 
-/// RAII holder for the plugin-owned `fetch_ctx` passed to push_lazy. Stores
-/// the destroy callback pointer and the ctx value; destroys both on drop.
-/// Wrapped in a shared_ptr so the lambda that ObjectStore stores remains
-/// copyable (std::function requires copyable targets).
+/// Owns the plugin's `fetch_ctx` and destroys it once, when the last copy of the store's closure goes. Shared, because
+/// std::function needs a copyable target.
 class PluginFetchCtx {
  public:
   PluginFetchCtx(PJ_lazy_fetch_fn_t fetch_fn, void* fetch_ctx, void (*destroy_fn)(void*)) noexcept
@@ -1984,24 +1997,19 @@ class PluginFetchCtx {
   PluginFetchCtx(PluginFetchCtx&&) = delete;
   PluginFetchCtx& operator=(PluginFetchCtx&&) = delete;
 
-  // Hand fetch_ctx back to the plugin without destroying it (a rejected push:
-  // see pushPluginLazy). Only valid while this holder is the sole reference.
+  // Hands fetch_ctx back to the plugin (a rejected push). Valid only while this holder is the sole reference.
   void disarm() noexcept {
     destroy_fn_ = nullptr;
   }
 
-  // nullopt = the plugin reported failure (or promised bytes it did not hand
-  // over): the LazyCallback contract's fetch-failed signal. An engaged empty
-  // vector is a payload the plugin legitimately produced with zero bytes —
-  // ok with size 0 (data null or not; an empty container's data() may be null).
+  // nullopt when the plugin reports failure or promises bytes it does not hand over (fetch failed); an empty vector is
+  // a legitimately empty payload.
   [[nodiscard]] std::optional<std::vector<uint8_t>> invoke() const {
     if (fetch_fn_ == nullptr) {
       return std::nullopt;
     }
-    // The ABI keeps the returned buffer valid only until the NEXT call on this
-    // fetch_ctx (the SDK's LazyBox reuses one vector), and the store resolves
-    // with no lock held, so two readers of one entry would otherwise race: hold
-    // the lock across the fetch AND the copy.
+    // The ABI keeps the buffer valid only until the next call on this fetch_ctx (the SDK's LazyBox reuses one vector),
+    // and the store resolves with no lock held: the lock covers the fetch and the copy, or two readers race.
     const std::lock_guard lock(mutex_);
     const uint8_t* data = nullptr;
     uint64_t size = 0;  // matches PJ_lazy_fetch_fn_t out_size (uint64_t*)
@@ -2024,23 +2032,17 @@ class PluginFetchCtx {
   mutable std::mutex mutex_;
 };
 
-// Shared body of the source and parser push_lazy trampolines. fetch_ctx_destroy
-// runs only for an entry the store ACCEPTED (when it is evicted/removed): on
-// failure the plugin keeps ownership, because the SDK's pushLazy wrappers delete
-// their box when push_lazy returns false — destroying it here as well would
-// double-free it.
+// Shared body of the source and parser push_lazy trampolines. fetch_ctx_destroy runs only for an entry the store
+// accepted, when it is removed: on a rejected push the plugin keeps fetch_ctx, since the SDK's pushLazy wrappers delete
+// their box when push_lazy returns false, and destroying it here too would double-free it.
 Status pushPluginLazy(
     ObjectStore& store, ObjectTopicId topic, int64_t timestamp_ns, PJ_lazy_fetch_fn_t fetch_fn, void* fetch_ctx,
     void (*fetch_ctx_destroy)(void*)) {
-  // shared_ptr keeps the ctx holder alive as long as ObjectStore keeps the lambda
-  // (std::function needs a copyable target); its destructor runs destroy once.
   auto holder = std::make_shared<PluginFetchCtx>(fetch_fn, fetch_ctx, fetch_ctx_destroy);
-  // Plugins return raw bytes via the C ABI; wrap them as a PayloadView whose
-  // anchor is a shared_ptr<const vector<uint8_t>>, per the pushLazy contract.
   auto closure = [holder]() -> std::optional<sdk::PayloadView> {
     auto bytes = holder->invoke();
     if (!bytes.has_value()) {
-      return std::nullopt;  // plugin fetch failed -> entry resolves as fetch_failed
+      return std::nullopt;  // resolves as fetch_failed
     }
     return sdk::makePayloadView(std::move(*bytes));
   };
@@ -2070,9 +2072,8 @@ bool sourceObjectRegisterTopic(
     desc.dataset_id = impl->dataset_id;
     desc.topic_name = std::string(toStringView(topic_name));
     desc.metadata_json = std::string(toStringView(metadata_json));
-    // Find-or-register: a replace-refill re-registers the topics the eager
-    // ingest created; same-metadata reuse keeps the ObjectTopicId (and every
-    // curve bound to it) alive, while a metadata mismatch still fails loudly.
+    // Find-or-register: a reload's refill re-registers the topics the first ingest created and keeps their
+    // ObjectTopicIds; a metadata mismatch fails.
     auto result = target->findOrRegisterTopic(desc);
     if (!result) {
       impl->setError(result.error());
@@ -2135,8 +2136,6 @@ bool sourceObjectPushLazy(
     propagateError(out_error, "fetch_fn must not be null");  // fetch_ctx stays the plugin's
     return false;
   }
-  // Target pointer comes from the atomic swap layer (so writes follow the
-  // current target store, not a captured-at-construction one).
   auto* target = impl->target.load(std::memory_order_acquire);
   try {
     auto result =
@@ -2169,7 +2168,7 @@ void sourceObjectSetRetentionBudget(
     budget.max_memory_bytes = max_memory_bytes;
     target->setRetentionBudget(ObjectTopicId{topic.id}, budget);
   } catch (...) {
-    // Infallible by contract — swallow any exception from the store.
+    // void in the ABI: nothing to report, and no exception may cross it.
   }
 }
 
@@ -2177,9 +2176,8 @@ void sourceObjectSetRetentionBudget(
 // Toolbox object read host trampolines
 // ---------------------------------------------------------------------------
 
-// PJ_object_bytes_handle_t is a heap-allocated sdk::PayloadView: its anchor
-// keeps the buffer alive until the plugin calls release_bytes. No wrapper
-// struct needed — PayloadView already carries the Span + anchor.
+// PJ_object_bytes_handle_t is a heap-allocated sdk::PayloadView: its anchor keeps the buffer alive until the plugin
+// calls release_bytes.
 PJ_object_topic_handle_t toolboxObjectLookupTopic(void* ctx, PJ_string_view_t topic_name) noexcept {
   auto* impl = static_cast<DatastoreToolboxObjectReadHostState*>(ctx);
   try {
@@ -2195,8 +2193,7 @@ PJ_object_topic_handle_t toolboxObjectLookupTopic(void* ctx, PJ_string_view_t to
   return PJ_object_topic_handle_t{0};
 }
 
-// Dataset-scoped lookup: object-topic identity is (dataset, name), so this
-// resolves the topic owned by `dataset_id` rather than the first name match.
+// Object-topic identity is (dataset, name): this resolves the topic of `dataset_id`, not the first name match.
 PJ_object_topic_handle_t toolboxObjectLookupTopicOnDataset(
     void* ctx, uint32_t dataset_id, PJ_string_view_t topic_name) noexcept {
   auto* impl = static_cast<DatastoreToolboxObjectReadHostState*>(ctx);
@@ -2222,8 +2219,6 @@ bool toolboxObjectListTopics(
     const auto ids = impl->store.listTopics();
     *out_count = ids.size();
     if (out_buffer != nullptr) {
-      // buffer_capacity is uint64_t (ABI); ids.size() is size_t. Compare in
-      // uint64_t, then index with size_t (n <= ids.size(), so it fits).
       const std::size_t n = static_cast<std::size_t>(std::min<uint64_t>(buffer_capacity, ids.size()));
       for (std::size_t i = 0; i < n; ++i) {
         out_buffer[i] = PJ_object_topic_handle_t{ids[i].id};
@@ -2244,9 +2239,6 @@ bool toolboxObjectListTopics(
 const char* toolboxObjectTopicMetadata(void* ctx, PJ_object_topic_handle_t topic) noexcept {
   auto* impl = static_cast<DatastoreToolboxObjectReadHostState*>(ctx);
   try {
-    // descriptor() returns a copy; stash it on the host so the returned pointer
-    // outlives this call (stable until the next call on this host) rather than
-    // dangling into a destroyed temporary.
     impl->last_metadata = impl->store.descriptor(ObjectTopicId{topic.id}).metadata_json;
     return impl->last_metadata.c_str();
   } catch (...) {
@@ -2484,26 +2476,20 @@ void DatastoreSourceWriteHost::flushPending() {
 }
 
 void DatastoreSourceWriteHost::setTarget(DataEngine* target) {
-  // Seal + commit any open chunk to the current engine so no rows are lost,
-  // then rebind to the new engine with a fresh WriteCore (its writer and
-  // per-engine caches must not carry over). Re-wire the new WriteCore's
-  // secondary_engine_ pointer to whichever engine is NOT the target so any
-  // new topic/field created while pointed at `target` mirrors back to the
-  // other side — both engines keep their TopicId/FieldId assignments in
-  // lockstep regardless of which one is currently active.
-  state_->core.load(std::memory_order_acquire)->flushPending();
-  // Build + fully wire the replacement BEFORE publishing it, so the ingest worker
-  // only ever observes a complete WriteCore. The atomic store (release) hands it
-  // off; a worker still inside the old core keeps it alive via its own strong
-  // reference until that call returns (in-flight appends finish on the old target,
-  // matching the object-store path's accepted semantics).
+  // Commits the open chunks to the current engine, then binds a fresh WriteCore (writer and caches are per engine)
+  // that mirrors to the other engine, so both keep the same TopicIds and FieldIds. Both under the old core's engine
+  // locks, which every worker call holds (pinCore()), so no row reaches the old core after its flush.
+  const auto pinned = pinCore(*state_);
+  pinned.core->flushPending();
+  // Fully wired before it is published, so the worker never sees a partial core. A worker call that loaded the old
+  // core keeps it alive until it returns.
   auto next = std::make_shared<WriteCore>(*target);
   if (target == state_->primary_engine) {
     next->secondary_engine = state_->secondary_engine;
   } else if (target == state_->secondary_engine) {
     next->secondary_engine = state_->primary_engine;
   } else {
-    // Unknown target (e.g. an in-place dataset replace) — no mirror.
+    // Unknown target (an in-place dataset replace): no mirror.
     next->secondary_engine = nullptr;
     state_->primary_engine = target;
   }
@@ -2511,16 +2497,10 @@ void DatastoreSourceWriteHost::setTarget(DataEngine* target) {
 }
 
 void DatastoreSourceWriteHost::setSecondaryEngine(DataEngine* secondary) {
-  // Wire the secondary engine for streaming pause/resume lockstep. Mirroring
-  // is bidirectional: the active WriteCore mirrors to whichever engine is
-  // the other one. Called once by the streaming runtime host right after
-  // construction; passing nullptr disables mirroring.
+  // Call once, before any ingest worker runs: the live core's mirror changes in place, unsynchronized. The active core
+  // mirrors to whichever engine it does not write; nullptr disables mirroring.
   state_->secondary_engine = secondary;
-  // Called once right after construction, before any ingest worker runs, so
-  // mutating the live core's mirror target in place is safe (no concurrent reader
-  // yet); load() merely unwraps the atomic.
   if (auto core = state_->core.load(std::memory_order_acquire)) {
-    // Whichever direction we're currently pointed at, mirror to the other.
     core->secondary_engine = (&core->engine == state_->primary_engine) ? secondary : state_->primary_engine;
   }
 }
@@ -2540,15 +2520,9 @@ void DatastoreParserWriteHost::flushPending() {
 }
 
 void DatastoreParserWriteHost::setTarget(DataEngine* target) {
-  // Seal + commit any open chunk to the current engine so no rows are lost,
-  // then rebind to the new engine with a fresh WriteCore. The bound topic is
-  // expected to already exist in `target` with the same TopicId. Re-wires
-  // the new WriteCore's secondary_engine_ pointer to the OTHER engine for
-  // bidirectional lockstep mirroring (parsers that cache FieldHandle — e.g.
-  // parser_protobuf — would otherwise see stale ids after pause/resume).
-  state_->core.load(std::memory_order_acquire)->flushPending();
-  // Build + fully wire the replacement before publishing it atomically — see
-  // DatastoreSourceWriteHost::setTarget for the swap-safety rationale.
+  // As DatastoreSourceWriteHost::setTarget(). The bound topic must already exist in `target` with the same TopicId.
+  const auto pinned = pinCore(*state_);
+  pinned.core->flushPending();
   auto next = std::make_shared<WriteCore>(*target);
   if (target == state_->primary_engine) {
     next->secondary_engine = state_->secondary_engine;
@@ -2562,9 +2536,8 @@ void DatastoreParserWriteHost::setTarget(DataEngine* target) {
 }
 
 void DatastoreParserWriteHost::setSecondaryEngine(DataEngine* secondary) {
-  // See DatastoreSourceWriteHost::setSecondaryEngine — same semantics.
+  // As DatastoreSourceWriteHost::setSecondaryEngine().
   state_->secondary_engine = secondary;
-  // Construction-time only (no concurrent reader yet) — see the source host.
   if (auto core = state_->core.load(std::memory_order_acquire)) {
     core->secondary_engine = (&core->engine == state_->primary_engine) ? secondary : state_->primary_engine;
   }
@@ -2572,6 +2545,10 @@ void DatastoreParserWriteHost::setSecondaryEngine(DataEngine* secondary) {
 
 void setIngestWarningHandler(IngestWarningHandler handler) noexcept {
   g_ingest_warning_handler.store(handler, std::memory_order_release);
+}
+
+std::string normalizeTopicName(std::string_view name) {
+  return needsSlashNormalization(name) ? normalizeSlashes(name) : std::string(name);
 }
 
 DatastoreToolboxHost::DatastoreToolboxHost(DataEngine& engine, ObjectStore& object_store)

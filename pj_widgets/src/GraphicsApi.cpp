@@ -20,19 +20,24 @@
 #if QT_CONFIG(vulkan) && __has_include(<vulkan/vulkan.h>)
 #include <QtGui/private/qvulkandefaultinstance_p.h>
 #endif
+#include <array>
+#include <cstdlib>
 #include <memory>
 #include <utility>
 
 #include "pj_widgets/RhiTestHooks.h"
+
+#ifdef Q_OS_WASM
+#include <emscripten.h>
+#endif
 
 namespace PJ {
 namespace {
 
 Q_LOGGING_CATEGORY(lcGraphics, "pj.graphics")
 
-// Whether Qt can create a QRhi for `api` here, as the window's backing store
-// would. Creates and drops a context or device (Metal only checks for one):
-// tens of milliseconds.
+// Whether Qt can create a QRhi for `api` here, as the window's backing store would. Creates and drops a context or
+// device (Metal only checks for one): tens of milliseconds.
 bool canCreateRhi(QRhiWidget::Api api) {
   switch (api) {
     case QRhiWidget::Api::OpenGL: {
@@ -118,8 +123,8 @@ QRhiWidget::Api preferredGraphicsApi() {
       qCWarning(lcGraphics) << "PJ_GRAPHICS_API" << requested << "cannot start here; using" << native;
       chosen = native;
     }
-    // Qt's backing store gives up on Metal without a device (it only logs at debug
-    // level), which would leave every GPU widget blank; OpenGL 4.1 still works there.
+    // Qt's backing store gives up on Metal without a device (it logs only at debug level), which would leave every GPU
+    // widget blank; OpenGL 4.1 still works there.
     if (chosen == QRhiWidget::Api::Metal && !canCreateRhi(chosen)) {
       qCWarning(lcGraphics) << "Metal is unavailable; falling back to OpenGL";
       chosen = QRhiWidget::Api::OpenGL;
@@ -139,21 +144,86 @@ void prepareRhiComposition(QWidget& window) {
   marker->hide();
 }
 
+QString softwareRasterizerName(QByteArrayView renderer) {
+  // Needles as the drivers spell them: Mesa's llvmpipe/lavapipe/softpipe, Chromium's SwiftShader (also inside ANGLE's
+  // "ANGLE (Google, Vulkan ... (SwiftShader Device ...))"), D3D's WARP ("Microsoft Basic Render Driver"), macOS
+  // OpenGL without a GPU ("Apple Software Renderer").
+  struct Rasterizer {
+    QByteArrayView needle;
+    const char* name;
+  };
+  static constexpr std::array<Rasterizer, 6> kRasterizers{{
+      {"llvmpipe", "llvmpipe"},
+      {"lavapipe", "lavapipe"},
+      {"softpipe", "softpipe"},
+      {"swiftshader", "SwiftShader"},
+      {"microsoft basic render", "WARP"},
+      {"apple software renderer", "Apple Software Renderer"},
+  }};
+  const QByteArray lower = renderer.toByteArray().toLower();
+  for (const Rasterizer& rasterizer : kRasterizers) {
+    if (lower.contains(rasterizer.needle)) {
+      return QString::fromLatin1(rasterizer.name);
+    }
+  }
+  return {};
+}
+
+#ifdef Q_OS_WASM
+namespace {
+EM_JS_DEPS(pj_widgets_webgl_renderer, "$stringToNewUTF8");
+// clang-format off
+EM_JS(char*, pjUnmaskedWebGlRenderer, (), {
+  const gl = typeof GL !== 'undefined' && GL.currentContext ? GL.currentContext.GLctx : null;
+  const info = gl ? gl.getExtension('WEBGL_debug_renderer_info') : null;
+  const renderer = info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : null;
+  return typeof renderer === 'string' ? stringToNewUTF8(renderer) : 0;
+});
+// clang-format on
+}  // namespace
+#endif
+
+QString softwareRasterizerName(QRhi& rhi) {
+  const QRhiDriverInfo driver = rhi.driverInfo();
+  QString name = softwareRasterizerName(driver.deviceName);
+#ifdef Q_OS_WASM
+  // Only where the browser masks GL_RENDERER (Chromium): Firefox reports it unmasked and logs a deprecation warning
+  // for WEBGL_debug_renderer_info. Read once per page: the renderer does not change under it.
+  if (name.isEmpty() && rhi.backend() == QRhi::OpenGLES2 && driver.deviceName.contains("WebKit WebGL")) {
+    static const QByteArray unmasked = [] {
+      char* renderer = pjUnmaskedWebGlRenderer();
+      QByteArray copy(renderer);
+      free(renderer);
+      return copy;
+    }();
+    name = softwareRasterizerName(unmasked);
+  }
+#endif
+  if (name.isEmpty() && driver.deviceType == QRhiDriverInfo::CpuDevice) {
+    name = QString::fromUtf8(driver.deviceName);
+  }
+  return name;
+
+}
+
 void logGraphicsBackend(QWidget& widget, QRhi* rhi) {
-  // ponytail: keyed by address, so a new QRhi allocated where the widget's last
-  // one lived is not logged again; key on something else if that ever matters.
+  // ponytail: keyed by address, so a new QRhi allocated where the widget's last one lived is not logged again; key on
+  // something else if that ever matters.
   static constexpr char kLoggedRhi[] = "pjLoggedGraphicsRhi";
   const auto key = static_cast<qulonglong>(reinterpret_cast<quintptr>(rhi));
   if (rhi == nullptr || widget.property(kLoggedRhi).toULongLong() == key) {
     return;
   }
   widget.setProperty(kLoggedRhi, key);
-  qCInfo(lcGraphics).nospace() << widget.objectName() << ": " << rhi->backendName() << ", " << rhi->driverInfo();
+  const QString software = softwareRasterizerName(*rhi);
+  qCInfo(lcGraphics).nospace() << widget.objectName() << ": " << rhi->backendName() << ", " << rhi->driverInfo()
+                               << (software.isEmpty() ? QString{}
+                                                      : QStringLiteral(", software rasterizer ") + software);
 }
 
 void noteRhiAdoption(QRhiWidget& widget, const QRhi* held, QRhi* rhi) {
-  // Adoptions minus releases is the number of QRhis the widget holds resources
-  // on; "stale" is a new QRhi met while another one's resources were still held.
+  // Adoptions minus releases is the number of QRhis the widget holds resources on; "stale" is a new QRhi met while
+  // another one's resources were still held.
   if (held != nullptr && held != rhi) {
     rhiTestCount(widget, "pjTestRhiStale");
   }
@@ -194,8 +264,8 @@ RhiFailureLatch::Change RhiFailureLatch::set(QString reason) {
 }
 
 QShader loadRhiShader(const QString& path) {
-  // Every widget and every new QRhi (a float or redock) reuses the packs: the
-  // resources never change, so each is read and deserialized once per process.
+  // Every widget and every new QRhi (a float or redock) reuses the packs: the resources never change, so each is read
+  // and deserialized once per process.
   static QHash<QString, QShader> loaded;
   if (const auto cached = loaded.constFind(path); cached != loaded.cend()) {
     return *cached;
@@ -280,11 +350,12 @@ void grabPresentedFrame(QRhiWidget& widget, std::function<void(const QImage&)> d
       std::exchange(*pending, nullptr)(image);
     }
   };
-  // Queued: grab after frameSubmitted returns, never from inside the frame.
+  // Queued: grab after frameSubmitted returns, never from inside the frame. A widget hidden meanwhile (a layout restore
+  // detaching it) delivers no image: grabbing it broke the browser window's WebGL rendering (TECHNICAL_NOTES).
   QRhiWidget* target = &widget;
   *presented = QObject::connect(
-      target, &QRhiWidget::frameSubmitted, target, [target, deliver] { deliver(target->grabFramebuffer()); },
-      Qt::QueuedConnection);
+      target, &QRhiWidget::frameSubmitted, target,
+      [target, deliver] { deliver(target->isVisible() ? target->grabFramebuffer() : QImage()); }, Qt::QueuedConnection);
   QTimer::singleShot(2000, target, [target, pending, deliver] {
     if (*pending) {
       qCWarning(lcGraphics).nospace() << target->objectName()

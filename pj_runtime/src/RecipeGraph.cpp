@@ -174,7 +174,7 @@ Expected<RecipeGraph::Node> RecipeGraph::bind(Recipe recipe) const {
     const std::string& input = recipe.inputs[i];
     const auto recorded = recipe.recorded_upstreams.find(input);
     UpstreamOutput named = upstreamOutput(input);
-    // A qualifier no loaded source explains hides the producer: the recorded upstream names it.
+    // A qualifier no loaded dataset label explains hides the producer: the recorded upstream names it.
     if (named.producer == nullptr && recorded != recipe.recorded_upstreams.end()) {
       named = upstreamOutput(recorded->second.upstream + "/" + recorded->second.name);
     }
@@ -238,7 +238,7 @@ Expected<RecipeGraph::Node> RecipeGraph::bind(Recipe recipe) const {
     }
   }
 
-  // D7: exactly one dataset binds every input.
+  // Exactly one dataset binds every input.
   std::optional<std::vector<DatasetId>> common;
   for (const auto& input_candidates : candidates) {
     if (input_candidates.empty()) {

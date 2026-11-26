@@ -1,69 +1,111 @@
 # pj_app
 
-## Purpose
+The executable shell: `MainWindow`, `main.cpp`, the app dialogs, the left panel and curve list, the file loader, and
+the wiring between `pj_runtime`'s `AppSession` and the widget families. It also holds the concrete codecs the runtime
+reaches only through interfaces (`SceneImageDecoder`, `SceneVideoFrameSource`), the MCP server, and on WebAssembly the
+browser boundary (upload staging, file pickers, durable settings, presets). A class another Qt app could reuse goes
+to `pj_widgets`; business logic and data services go to `pj_runtime`. How the subsystems fit together:
+[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md).
 
-The executable shell. Owns `MainWindow`, the application menus/toolbars/status bar, the `AppSession` (from `pj_runtime`), and the wiring between runtime services and concrete widgets (`pj_plotting`, `pj_scene2D/widgets`, `pj_custom_widgets`, ...). On WebAssembly it also owns the browser boundary: upload staging/identity, asynchronous file selection, the deliberately narrow durable-settings bridge, source-aware layout replay, and the browser sample presets.
+## Invariants
 
-Host code stays domain-neutral (root `CLAUDE.md`): no plugin-specific terms or per-plugin policy here; the plugin supplies the domain meaning.
+- `~MainWindow` runs a fixed teardown order (recording, pending stream starts, toolboxes, MCP server, tabs, widgets,
+  loader disconnect, `delete ui_`); moving a step later leaves a slot or plugin pointing at something already
+  destroyed. The order and the reason for each step: ARCHITECTURE "Threads and teardown".
+- `MainWindow::toolboxes_` is the single toolbox registry, and `MainWindow::teardownToolbox` the only exit: it
+  extracts the entry first, and callbacks handed to Qt look the presenter up by id, so a callback landing mid-teardown
+  finds nothing instead of a dying presenter.
+- A toolbox panel is reparented once, at its destination; releasing it leaves its parent alone. Each reparent
+  re-polishes the whole tree, which is slow in the browser.
+- `ToolboxHostWiring.h` holds the wiring shared by `MainWindow::launchToolbox` and `HeadlessDescriptorProviderSession`;
+  changing it in one owner only gives a provider plugin a different host when it runs headless.
+- The Reload button is re-enabled only by `refreshReloadEnabled()`, from `FileLoader::loadFinished` and from a
+  refused `loadFile`. `fileLoaded` / `fileLoadFailed` stay silent on a rejected config dialog and a queued cancel, so
+  wiring the button to them leaves it disabled.
+- Load progress is wired only through `wireIngestProgress()`; a hand-made copy drifts from what the tests exercise.
+  The row's X/bin goes straight to `SessionManager::requestCancel(token, keep_partial)`; the producer honours the
+  flag, the shell never prompts.
+- Every DataSource plugin (file load, fan-out entry, stream) is bound with
+  `bind(handle, QSettingsBackend::forPlugin(manifest id))`, and its owner declares that host before the handle:
+  the plugin reaches the host's registry and services, its settings store included, up to its destructor, so a host
+  destroyed first is a use-after-free. Both toolbox owners take their store from `makeToolboxSettings`
+  (`ToolboxHostWiring.h`). Who gets which store: `pj_runtime` ARCHITECTURE "Plugin settings".
+- Recording is a runtime capability: Record affordances follow `RecordingService::isSupported()`, never a build flag.
+  A stream ending mid-capture finalizes only its own file (`RecordingService::onSourceEnded`); stopping the capture
+  there would cut every other source's file short.
+- `applyWorkspace` restores in order: read-only preflight, display offsets, processors, curve rebind. A processor
+  restored before the offsets reads an unsettled display frame; a preflight after any mutation can no longer refuse
+  cleanly. `syncCustomTopicsPanel` runs after every restore.
+- The `<data_processors>` entries a layout load skipped (`kept_derived_`, exactly the elements
+  `DerivedRestoreReport::skipped` names) are written back only by `layoutFileBytes`; in `xmlSaveState` they would
+  reach undo snapshots and `kExact` rollback targets, which then fail on the same missing input.
+- Layout import (`LayoutImportBatch`, `HeadlessDescriptorProviderSession`, `SourcePromotionHost`, the
+  rewrite-then-classify load path, the growing-import binder) implements host-side invariants defined in
+  `docs/layout-import-architecture.md` of the `pj-mcap-server` repository; read it before changing them.
+- Only `BrowserPersistence` writes durable browser storage, and only its preference allowlist, bounded source-free
+  layout recipes and the bounded string plugin settings a plugin put under its own `durable/` keys. File paths,
+  upload identities, the host's `PluginConfig/` JSON, URL passwords, secret-like plugin keys, source-bound layouts,
+  stream records and every other plugin setting never enter it: it outlives the page in clear text, where paths and upload identities mean
+  nothing on the next load and credentials would be exposed. Each envelope's size cap holds on write and on read, or
+  a write could produce an envelope the next load rejects; a rejected stored envelope is left intact and not imported.
+- A Preferences nav row's position is its stack page index: adding or hiding a row without its page shows the wrong
+  page.
+- A user-visible feature added, removed or moved updates `resources/feature_catalog.json` in the same change.
+  `FeatureCatalogResourceTest` fails when an entry point stops naming the live labels or an `evidence` citation
+  (`path#token`) stops appearing in its file, so editing a cited comment or string breaks it.
+- Custom Topics deletion rights come from `pj_runtime`'s `CustomTopicsPolicy.h`, asked again after a prompt is
+  answered; derived-recipe persistence stays in `pj_runtime`'s `DerivedObjects`. The shell only words refusals, runs
+  prompts and owns what is UI.
+- MCP: the server talks to `MainWindow` only through its public "agent control" block, never as a friend. Public
+  owners are server-assigned (`mcp::ownerFor`, `agent-<client>`) and disjoint from plugin ids
+  (`PJ::kAgentIdPrefix`); a plugin token acts as its plugin whatever the client claims. App work left for later asks
+  `McpServer::stillAuthorized` before applying anything; every request gets exactly one response. Jobs, revocation
+  and the user-first rules: [`../docs/MCP_SERVER.md`](../docs/MCP_SERVER.md).
+- GUI tests: the shell leaks process-global widget state across `MainWindow` instances, so each `pj_app_gui_tests`
+  case runs in its own process; run them through ctest, not the bare binary.
 
-How the subsystems fit together (window frame, file loading and progress, streaming, recording, layouts, owned views, toolbox presentation, Custom Topics, browser persistence, test suites): [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md). The derived-data design the shell wires up: [../docs/derived_objects/ARCHITECTURE.md](../docs/derived_objects/ARCHITECTURE.md).
+## Key files (`src/`)
 
-## What belongs here
-
-- `MainWindow` and its `.ui` file; `main.cpp`.
-- App-level dialogs (`PreferencesDialog`, `DiagnosticsDialog`, ...) and their navigation rows.
-- The shell's left panel, curve list, file loader, theme manager, title bar.
-- Glue code that constructs an `AppSession`, then wires it to docked widgets.
-- Concrete codecs the runtime reaches only through an interface (`SceneImageDecoder`, `SceneVideoFrameSource`), so `pj_runtime` links no Scene2D library.
-- Browser-only host integration (`BrowserFileStore`, `FileSelectionService`, `BrowserPersistence`, `PresetController`, `WelcomePresetsDialog`) whose lifetime and policy are tied to the executable.
-
-## What does NOT belong here
-
-- **Reusable Qt controls** -> `pj_widgets`.
-- **Business logic / data services** -> `pj_runtime`.
-- **Plotting / 2D / 3D widgets** -> the owning widget-family module.
-- **Plugin dialog runtime** -> `pj_dialog_host`.
-
-If you're tempted to add a class here that could be reused by another Qt app, move it to `pj_widgets` instead.
-
-## UI convention
-
-Per root CLAUDE.md: **prefer `.ui` files** over programmatic widget construction. `pj_app/CMakeLists.txt` uses `AUTOUIC`. Drop to hand-written `QWidget` subclasses only for genuinely dynamic construction (plugin-driven widgets) or when explicitly requested.
-
-## Invariants and pitfalls
-
-- **Toolbox lifetime.** `MainWindow::toolboxes_` is the single registry (one `ToolboxPresenter` per plugin id). The only exit is `MainWindow::teardownToolbox`, which extracts the registry entry first; callbacks handed to Qt look the presenter up by id and never capture it. `~MainWindow` tears every toolbox down synchronously before its members die. Relocating a panel reparents it once, at the destination; releasing leaves its parent alone (every reparent re-polishes the whole tree).
-- **`ToolboxHostWiring.h`** holds wiring that must stay identical between `MainWindow::launchToolbox` and `HeadlessDescriptorProviderSession`; change it there, never in one owner.
-- **Load progress.** Wire it through `wireIngestProgress()`, never by hand. The row's X/bin choice goes straight to `SessionManager::requestCancel(token, keep_partial)`: the shell does not prompt; honouring `keep_partial` is the producer's job.
-- **Recording is a runtime capability, not a build flag.** Record affordances follow `RecordingService::isSupported()` (only `MainWindow` calls `LeftPanel::setRecordingSupported`). A stream ending mid-capture must NOT stop the capture (`RecordingService::onSourceEnded`). Per-source detail goes to the log, never into the stop toast.
-- **CLI startup.** `MainWindow::loadAtStartup` waits for all explicit file tickets before layout restore. Explicit files make the layout generic; unattended loads forbid dialogs. See `docs/ARCHITECTURE.md` "Command-line startup".
-- **Layout restore order.** `applyWorkspace`: preflight (`checkDataProcessorDependencies`, read-only) -> display offsets -> processors -> curve rebind. Diagnostics are reported under source "Layout". `syncCustomTopicsPanel` runs after every restore.
-- **Layout import (cloud sessions).** Before changing `LayoutImportBatch`, `HeadlessDescriptorProviderSession`, `SourcePromotionHost`, the rewrite-then-classify load path or the growing-import binder, read `docs/layout-import-architecture.md` in the `pj-mcap-server` repository: several invariants (I-1 to I-16: delivery order, teardown orders, strict in-place promotion, strip displayed-owner arbitration) are host-side and not derivable from PJ4 alone. The operations guide is `docs/layout-sharing-runbook.md` in that repository.
-- **Browser storage.** Only `BrowserPersistence` writes durable browser storage, and only its typed preference allowlist plus bounded source-free layout recipes. File paths, upload identities, plugin configuration, credentials, source-bound layouts and stream records (`pj-stream://` identities) must never enter it; an unreadable stored envelope is left intact, never deleted or imported.
-- **Browser presets.** The UI is browser-only (`PJ_TARGET_WASM`), but the replay path builds on the desktop too, for tests. `PresetController` downloads a preset's files (http(s) only, capped at `kMaxPresetDownloadBytes`, a recording at `kMaxPresetDataBytes`; through `pj_runtime`'s `fetchBytesWithLimit()`; a browser recording streams through `BrowserFetch.h`) and discovers `presets/index.json`; `WelcomePresetsDialog` is a view only. `MainWindow::loadLayoutFromUrl` runs the upload replay's byte-level path (`loadLayoutFromBytes`: its imports, remapping and rollback): each `<fileInfo>` downloads from `layout_xml::resolveFileSourceUrl`, is written into a `BrowserFileStore::reserve()`d file and checked against `content_sha256` and the preset's cumulative cap, and Scene3D's `resolveLayoutResourceUrls` anchors robot resources at the layout URL. In WASM a redirect leaves the final URL the requested one, so a preset must not rely on a redirect to another directory. Every call ends in exactly one `layoutUrlLoadFinished(url, ok, reason)`, and each source download reports `layoutUrlLoadProgress(url, received, total)` (throttled, ending at received == total), which the dialog shows as a determinate bar; a success replaces only what the previous successful preset load brought (`BrowserLayoutRuntime::preset_data`). A layout may record streaming sources (`<previouslyLoaded_StreamingSources>`, `pj4_version="5"`, `pj-stream://<id>` qualifiers): the configuration is a template (`${deployment.ws_origin}` expands from the page URL through `pj_runtime`'s `expandSourceConfigVariables`), the replay starts it via `StreamingSourceManager::startFromLayout` with no dialog, and a re-save writes it back unexpanded; only "Save Layout with Sources" writes the records, never `xmlSaveState`. Authoring contract, packaging and hosting: [`../docs/WASM_PRESETS.md`](../docs/WASM_PRESETS.md).
-- **Preferences.** A nav row's position IS its stack page index: add or hide a row and its page together.
-- **Feature catalog.** A PR that adds, removes or moves a user-visible feature updates `resources/feature_catalog.json` in the same PR; `FeatureCatalogResourceTest` (`tests/feature_catalog_test.cpp`) fails when an entry point stops naming the live labels or an `evidence` citation (`path#token`) stops appearing in its file. `MainWindow` builds `pj_runtime`'s `FeatureCatalogHost` from its live services and hands it the resource bytes (`featureCatalogResource()`, since `pj_runtime` links no resources).
-- **Custom Topics.** `pj_runtime`'s `CustomTopicsPolicy.h` decides who may delete what (asked again after a prompt is answered); this shell only words refusals and runs prompts.
-- **Derived-recipe persistence** stays in `pj_runtime`'s `DerivedObjects`; `MainWindow` keeps thin wrappers and owns only what is UI.
-- **GUI tests: one `MainWindow` per process.** The shell leaks process-global widget state across instances, so `pj_app_gui_tests` cases run one per process under ctest (run them through ctest, not the bare binary), and standalone suites keep a single shared window that each scenario cleans up after.
-- **Test binaries that touch shell icons link `pj_resources`**, an OBJECT library built from `resources.qrc`, so its objects join the binary directly; the shell makes no `Q_INIT_RESOURCE` calls.
-
-## Layout
-
-- `src/MainWindow.{h,cpp,ui}`, `src/main.cpp`: the window and its wiring; startup, CLI flags, crash handler.
-- `src/*.ui`: `MainWindow`, `PreferencesDialog`, `TitleBar`, `ToolboxBanner`. `src/ui/`: embedded sub-widgets (`LeftPanel`, `CurveListPanel`, `TimelineWidget`, `DiagnosticsDialog`, `AboutDialog`, `DatasetInfoDialog`, `Scene2DConfigPanel`, `Scene3DConfigPanel`, and the Custom Widget pages `CustomWidgetPickerPanel`, `CustomWidgetConfigPanel`).
-- `FileLoader`, `LoadInput.h`, `FanoutConfig`, `DialogPresenter`: file loading. `IngestProgress*`, `SeriesProgressController`: progress rows.
-- `StreamingSourceManager`, `TopicDemandController`, `PendingDisplayBinder`: streaming sources and demand.
-- `LayoutXml`, `LayoutReplayHints.h`, `LayoutImportBatch`, `HeadlessDescriptorProviderSession`, `SourcePromotionHost`, `LayoutExitWatch`: layout files and the cloud import.
-- `CustomWidgetController`: the Custom Widget pages, the pending target panel, the `ActiveWidgetsMarker` and the startup crash review ([docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) "Custom Widget panels").
-- `ToolboxPresenter`, `ToolboxChrome`, `ToolboxHostWiring.h`, `PluginPlotTabsController`, `PluginSceneViewsController`: toolbox presentation and plugin-owned views.
+- `MainWindow.{h,cpp,ui}`, `main.cpp`: the window and its wiring; startup, CLI flags, crash handler.
+- `ui/`: embedded sub-widgets and app dialogs (`LeftPanel`, `CurveListPanel`, `TimelineWidget`, `DiagnosticsDialog`,
+  the Scene2D/Scene3D config panels, the Custom Widget picker menu and config page, `McpJobsDialog`).
+- `FileLoader`, `LoadInput.h`, `FanoutConfig`, `DialogPresenter`, `DialogWatch.h`, `ui/BatchLoadDialog`: file loading,
+  plugin dialogs and the question asked once for a batch of files.
+- `IngestProgressController`, `IngestProgressWiring.h`, `SeriesProgressController`: progress rows in the curve tree.
+- `StreamingSourceManager`, `TopicDemandController`, `PendingDisplayBinder`: streaming sessions and topic demand.
+- `LayoutXml`, `LayoutReplayHints.h`: layout files. `LayoutImportBatch`, `HeadlessDescriptorProviderSession`,
+  `SourcePromotionHost`, `LayoutExitWatch`: the cloud layout import.
+- `ToolboxPresenter`, `ToolboxChrome`, `ToolboxHostWiring.h`, `PluginPlotTabsController`,
+  `PluginSceneViewsController`: toolbox presentation and plugin-owned views.
+- `CustomWidgetController`: the Custom Widget picker menu, its config page and the startup crash review.
 - `SourceTimelineController`, `DatasetMergeActions`: Source Timeline binding and dataset merge.
-- `BrowserFileStore`, `FileSelectionService`, `BrowserPersistence`: WebAssembly boundary. `PresetController`, `WelcomePresetsDialog{.h,.cpp,.ui}`: browser presets (tests: `PresetControllerTest`, `WelcomePresetsDialogTest`, `RemotePresetReplayTest`, `StreamingPresetTest` with `tests/mock_layout_stream_plugin.cpp`).
-- `Theme`, `WidgetTuner`, `DebugMode`/`DebugUi`, `Splashscreen`, `DiagnosticDump`, `BuiltinPlugins`, `scene_object_classification`, `SceneImageDecoder`, `SceneVideoFrameSource`, `KeySequence`, `RasterKeyMap`: app services and helpers.
-- `tests/`, `tests/support/`, `tests/fixtures/layouts/`, `benchmarks/`: tests, shared fixtures, frozen layouts, the mixed-layout benchmark. `tests/wasm_*probe*`: acceptance-build-only WebAssembly probes, never part of desktop or production behavior (`docs/ARCHITECTURE.md` "Acceptance probes").
+- `BrowserFileStore`, `FileSelectionService`, `BrowserPickedFile` (+ `browser_picked_file.js`), `BrowserPersistence`,
+  `PresetController`, `WelcomePresetsDialog`: the WebAssembly boundary and presets.
+- `mcp/`: `McpProtocol`, `McpBridge.cpp` (`--mcp-bridge`), `McpServer` (+ `McpEndpointHost`), `McpServerTools.cpp`,
+  `McpWidgetState.cpp` (`widget_state`, `set_widget_state`), `McpUiTools` (`--mcp-ui-tools`), `McpBrowserLink`.
+- `Theme`, `WidgetTuner`, `DebugMode`/`DebugUi`, `Splashscreen`, `DiagnosticDump`, `BuiltinPlugins`,
+  `scene_object_classification`, `SceneImageDecoder`, `SceneVideoFrameSource`, `KeySequence`, `RasterKeyMap`: app
+  services and helpers.
 
 ## Tests
 
-- Runners (`pj_add_test_runner`): `pj_app_gui_tests` (links `pj_app_shell` + `pj_resources`), `pj_app_unit_tests` (Qt-only helpers), `pj_app_media_codec_tests` (the two codecs over `pj_scene2d_core`; run from the source root). Each case registers as `<runner>.<Suite>.<Case>` and runs in its own process (120 s timeout): `ctest -R '^pj_app_gui_tests\.' --test-dir build`.
-- Suites with their own ctest entry (QRhi display passes, layout-import suites, `file_loader_test`, `source_promotion_host_test`, `headless_descriptor_provider_session_test`, `layout_import_batch_test`, `splash_meme_pool_test`, `ExportedSymbolsGuard`): the reasons and what each guards are in `docs/ARCHITECTURE.md` "Tests". Their per-suite plugin-path definitions must not propagate to other sources.
-- A runner's shared GUI main owns its only `QApplication`; its cases do not define a `main()` or create another application.
+`./test.sh -R '^pj_app_gui_tests\.'` (links `pj_app_shell` + `pj_resources`), `'^pj_app_unit_tests\.'` (Qt-only
+helpers), `'^pj_app_media_codec_tests\.'` (the two codecs; run from the source root). Each case registers as
+`<runner>.<Suite>.<Case>` and runs in its own process. The runner's shared GUI main
+(`cmake/test_mains/pj_test_main_gui.cpp`) owns the only `QApplication` and gives each process its own application name,
+so settings and data folders are never shared between tests. Suites with their own executable (QRhi display passes,
+layout import, loader suites, MCP bridge) and why: ARCHITECTURE "Tests". Test binaries that touch shell icons link
+`pj_resources`, an OBJECT library, because the shell makes no `Q_INIT_RESOURCE` calls. `tests/wasm_*probe*` are
+acceptance-build-only browser probes. Tests answer modal dialogs through `tests/support/modal_answerer.h`; the
+exceptions are listed in ARCHITECTURE "Tests". `benchmarks/` holds the mixed-layout benchmark (`PJ_BUILD_DEMOS`).
+
+## Docs
+
+- [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md): threads and teardown, startup, file loading and progress, streaming,
+  recording, layouts, cloud import, owned views, toolbox presentation, Custom Topics, Custom Widgets, Log panels,
+  browser boundary and presets, MCP, tests, known gaps.
+- [docs/TECHNICAL_NOTES.md](./docs/TECHNICAL_NOTES.md): the measurements and incidents behind browser, linking, export
+  and packaging choices.
+- Cross-module: [derived objects](../docs/derived_objects/ARCHITECTURE.md),
+  [recording](../docs/RECORDING_AND_CACHING.md), [MCP server](../docs/MCP_SERVER.md),
+  [browser presets](../docs/WASM_PRESETS.md), [browser deployment](../docs/WASM_DEPLOYMENT.md).

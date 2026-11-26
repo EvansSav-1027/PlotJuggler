@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <QApplication>
 #include <QDomDocument>
 #include <QSignalSpy>
 #include <memory>
@@ -182,6 +183,52 @@ TEST_F(StateTransitionsDockWidgetTest, UnresolvedSeriesSurvivesSaveLoadCycles) {
   EXPECT_EQ(kept.attribute(u"topic"_s), u"/other/state"_s);
 }
 
+// set_widget_state loads an edited copy of the strip's own saved state into the same dock.
+TEST_F(StateTransitionsDockWidgetTest, ReloadIntoTheSameDockReplacesItsRows) {
+  const auto saved_text = [](const StateTransitionsDockWidget& dock) {
+    QDomDocument doc;
+    doc.appendChild(dock.xmlSaveState(doc));
+    return doc.toString();
+  };
+  auto dock = makeDock();
+  ASSERT_TRUE(dock->tryAcceptSeriesKeys({string_key_, estop_key_}));
+  const QString before = saved_text(*dock);
+  QDomDocument doc;
+  ASSERT_TRUE(doc.setContent(before));
+
+  ASSERT_TRUE(dock->xmlLoadState(doc.documentElement()));
+  EXPECT_EQ(saved_text(*dock), before);
+
+  QDomElement first = doc.documentElement().firstChildElement(u"series"_s);
+  first.setAttribute(u"visible"_s, u"0"_s);
+  ASSERT_TRUE(dock->xmlLoadState(doc.documentElement()));
+  auto entries = dock->controller()->seriesEntries();
+  ASSERT_EQ(entries.size(), 2U);
+  EXPECT_FALSE(entries[0].visible);
+  EXPECT_TRUE(entries[1].visible);
+
+  doc.documentElement().removeChild(first.nextSiblingElement(u"series"_s));
+  ASSERT_TRUE(dock->xmlLoadState(doc.documentElement()));
+  const auto series = dock->controller()->currentSeries();
+  ASSERT_EQ(series.size(), 1U);
+  EXPECT_EQ(series[0].topic_name, u"/robot/state"_s);
+  EXPECT_TRUE(dock->unresolvedRestores().isEmpty());
+}
+
+TEST_F(StateTransitionsDockWidgetTest, UnresolvedRestoresNamesEachPendingSeries) {
+  QDomDocument doc;
+  ASSERT_TRUE(doc.setContent(
+      u"<state_transitions><series dataset_id=\"999\" dataset_source=\"late.mcap\" topic=\"/late/state\" field=\"\"/>"
+      "<series dataset_id=\"999\" dataset_source=\"late.mcap\" topic=\"/late/mode\" field=\"value\"/>"
+      "</state_transitions>"_s));
+  auto dock = makeDock();
+  ASSERT_TRUE(dock->tryAcceptSeriesKeys({string_key_}));
+  EXPECT_TRUE(dock->unresolvedRestores().isEmpty());
+  ASSERT_TRUE(dock->xmlLoadState(doc.documentElement()));
+  EXPECT_EQ(dock->controller()->rowCount(), 0);
+  EXPECT_EQ(dock->unresolvedRestores(), (QStringList{u"/late/state"_s, u"/late/mode/value"_s}));
+}
+
 TEST_F(StateTransitionsDockWidgetTest, PendingSeriesResolvesWhenDatasetLoadsLater) {
   // Restore a layout whose dataset is NOT loaded: the row stays pending...
   auto dock = makeDock();
@@ -277,6 +324,29 @@ TEST_F(StateTransitionsDockWidgetTest, TrackerTimeDrivesPlayhead) {
   auto dock = makeDock();
   dock->onTrackerTime(2.5);
   EXPECT_EQ(dock->view()->playheadNsForTest(), 2'500'000'000LL);
+}
+
+// A layout restores before its dock is shown; the first show/resize must not
+// fit-all over the saved zoom and pan.
+TEST_F(StateTransitionsDockWidgetTest, RestoredZoomAndPanSurviveTheFirstShow) {
+  auto source = makeDock();
+  ASSERT_TRUE(source->tryAcceptSeriesKeys({string_key_}));
+  QDomDocument doc;
+  QDomElement saved = source->xmlSaveState(doc);
+  // Data spans 0..3 s: at 1e-6 px/ns that is 3000 px, so a 1 s left edge is
+  // reachable in a 600 px wide view.
+  saved.setAttribute(u"zoom_px_per_ns"_s, u"1e-06"_s);
+  saved.setAttribute(u"viewport_left_ns"_s, u"1000000000"_s);
+
+  auto restored = makeDock();
+  ASSERT_TRUE(restored->xmlLoadState(saved));
+  restored->resize(600, 200);
+  restored->show();
+  QApplication::processEvents();
+
+  const QDomElement resaved = restored->xmlSaveState(doc);
+  EXPECT_DOUBLE_EQ(resaved.attribute(u"zoom_px_per_ns"_s).toDouble(), 1e-6);
+  EXPECT_EQ(resaved.attribute(u"viewport_left_ns"_s).toLongLong(), 1'000'000'000LL);
 }
 
 }  // namespace

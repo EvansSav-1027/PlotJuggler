@@ -9,15 +9,15 @@ name: Release Windows Packages
 #
 # Cache/repository layers shared with windows-ci.yml:
 #   - Qt kit via actions/cache
-#   - compiler objects via sccache on GitHub's Actions cache
-#   - Conan packages via the Actions cache, then ConanCenter
+#   - compiler objects via sccache on the Actions cache
+#   - Conan packages via the shared Actions cache, then ConanCenter
 #
 # Triggers:
 #   - workflow_dispatch     -> build both packages from any branch (artifacts only);
 #     with `update_url`, also build + publish an update repository there, to
 #     rehearse the maintenance-tool update path against a staging prefix
 #   - push of a version tag -> build + attach both packages to that tag's Release
-#     (e.g. `3.9.1` — no leading 'v')
+#     (e.g. `4.2.0` — no leading 'v')
 
 on:
   workflow_dispatch:
@@ -54,8 +54,7 @@ concurrency:
 
 jobs:
   windows-installer:
-    # GitHub-hosted runner, free for public repositories: same Windows Server 2022 /
-    # VS 2022 toolchain as the paid Depot runner this workflow was written for.
+    # Match windows-ci.yml and the toolchain used for the published plugin artifacts.
     runs-on: windows-2022
     # Backstop against hangs — app build plus registry download/validation/packaging.
     # A cold run (empty Conan/Qt/sccache caches) is slow on a GitHub-hosted runner; 350
@@ -67,6 +66,9 @@ jobs:
       update_url: ${{ env.PJ_WINDOWS_UPDATE_URL }}
 
     env:
+      # sccache's GitHub Actions cache backend (the action exports the cache
+      # token). Every object is one cache entry in the repo's shared 10 GB.
+      SCCACHE_GHA_ENABLED: "true"
       # The one URL the installer is built against and the repository is
       # published to: the production variable on a tag push, the staging input
       # on a dispatch (even one started from a tag), empty otherwise. Both steps read it, so they cannot disagree.
@@ -141,14 +143,14 @@ jobs:
 
       - name: Set up MSVC environment
         # Conan's package ID includes the detected compiler settings, so activate
-        # MSVC before detecting the profile or resolving Artifactory binaries.
+        # MSVC before detecting the profile or resolving prebuilt Conan binaries.
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
       # ─────────────────────────── Conan binaries ───────────────────────────
       # The Actions cache closure maintained by windows-ci.yml is the Conan
-      # binary store (same windows-2022 MSVC/RelWithDebInfo graph, same key).
+      # binary store (same windows-2022 MSVC/Release graph, same key).
       # ConanCenter source builds cover any residual miss — all of it on the
       # first run of a fresh repository.
 
@@ -163,14 +165,14 @@ jobs:
           $fileHash = (Get-FileHash -InputStream $stream -Algorithm SHA256).Hash.Substring(0, 16).ToLower()
           $hash = "$cacheVersion-$fileHash"
           "hash=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "restore_prefix=conan-windows-msvc-relwithdebinfo-$cacheVersion-" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "restore_prefix=conan-windows-msvc-release-$cacheVersion-" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Restore Conan cache
         id: conan-gha-cache
         uses: actions/cache/restore@v5
         with:
           path: ~/.conan2
-          key: conan-windows-msvc-relwithdebinfo-${{ steps.public_conan_cache.outputs.hash }}
+          key: conan-windows-msvc-release-${{ steps.public_conan_cache.outputs.hash }}
           restore-keys: |
             ${{ steps.public_conan_cache.outputs.restore_prefix }}
 
@@ -180,7 +182,7 @@ jobs:
         # under .github/conan/source-backup/, addressed by sha256, and copied
         # into Conan's source download cache here so source() fetches are
         # served locally. The source cache is separate from the binary packages
-        # resolved through Artifactory.
+        # (Actions-cached ~/.conan2, the plotjuggler-conan remote, ConanCenter).
         shell: pwsh
         run: |
           $cacheDir = (Join-Path $env:RUNNER_TEMP "conan-source-cache").Replace('\', '/')
@@ -288,11 +290,8 @@ jobs:
       # ─────────────────────────── Compiler cache ───────────────────────────
 
       - name: Install sccache
-        # sccache is a compile-cache speedup, NOT load-bearing: the build is
-        # correct without it, just slower. v0.16 supports GitHub's current cache
-        # service; the action exports its short-lived runtime credentials.
-        id: setup_sccache
-        continue-on-error: true
+        # v0.16 supports GitHub's current cache service; the action exports its
+        # short-lived runtime credentials.
         uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: "v0.16.0"
@@ -308,14 +307,13 @@ jobs:
           conan profile detect --force
           scripts/configure_conan_remote.sh
           # cpython shared: its Conan recipe disables the static MSVC build (>=3.10),
-          # so the embedded interpreter must link shared (Release CRT, matching the
-          # RelWithDebInfo /MD graph). Ninja Multi-Config so sccache's compiler
-          # launcher is honoured (VS/MSBuild ignores it).
+          # so the embedded interpreter must link shared. Ninja Multi-Config so
+          # sccache's compiler launcher is honoured (VS/MSBuild ignores it).
           conan_log="${RUNNER_TEMP}/pj4-conan-install.log"
           conan install . --output-folder=build --build=missing -r=plotjuggler-conan -r=conancenter \
             --lockfile=conan.lock --lockfile-partial \
-            -s build_type=RelWithDebInfo -s compiler.cppstd=20 \
-            -o "cpython/*:shared=True" -s "cpython/*:build_type=Release" \
+            -s build_type=Release -s compiler.cppstd=20 \
+            -o "cpython/*:shared=True" \
             -c tools.cmake.cmaketoolchain:generator="Ninja Multi-Config" \
             2>&1 | tee "$conan_log"
           if grep -q "Building from source" "$conan_log"; then
@@ -334,30 +332,24 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ~/.conan2
-          key: conan-windows-msvc-relwithdebinfo-${{ steps.public_conan_cache.outputs.hash }}
+          key: conan-windows-msvc-release-${{ steps.public_conan_cache.outputs.hash }}
 
       - name: Build PlotJuggler 4 (app)
         shell: bash
         env:
-          SCCACHE_AVAILABLE: ${{ steps.setup_sccache.outcome == 'success' }}
+          # Release-only: the key that decrypts the empty-dock easter egg GIFs (pj_widgets). Absent on forks: no easter egg.
+          PJ_EASTER_EGG_KEY: ${{ secrets.PJ_EASTER_EGG_KEY }}
         run: |
-          # CMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded forces /Z7 (embedded)
-          # over /Zi (shared PDB). /Zi writes via mspdbsrv.exe which sccache
-          # cannot cache and which races between parallel cl.exe workers
-          # (fatal C1041 on pj_base.pdb). Requires CMP0141=NEW.
-          launcher_args=()
-          if [[ "$SCCACHE_AVAILABLE" == "true" ]]; then
-            launcher_args=(-DCMAKE_C_COMPILER_LAUNCHER=sccache \
-                           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache)
-          else
-            echo "::warning::sccache unavailable; building without a compiler cache"
-          fi
+          # Same debug format as windows-ci.yml (see its Build step), so the
+          # two share sccache objects: no debug information in Release
+          # objects. The installer ships no PDB. Requires CMP0141=NEW.
+          launcher_args=(-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache)
 
           cmake -S . -B build -G "Ninja Multi-Config" \
             -DCMAKE_TOOLCHAIN_FILE="build/conan_toolchain.cmake" \
             -DCMAKE_PREFIX_PATH="$(pwd)/.qt/${PJ_QT_VERSION}/msvc2022_64" \
             -DCMAKE_POLICY_DEFAULT_CMP0141=NEW \
-            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded \
+            '-DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=$<$<CONFIG:Debug>:Embedded>' \
             -DPJ_INSTALLATION=windows \
             -DPJ_BUILD_TESTS=OFF \
             "${launcher_args[@]}"
@@ -365,11 +357,9 @@ jobs:
           # This release only packages the application. PJ_BUILD_TESTS=OFF also
           # keeps the widgets' test-only fault injection (the PJ_RHI_TEST_HOOKS
           # definition) out of the shipped binaries.
-          cmake --build build --config RelWithDebInfo --target pj_app --parallel
+          cmake --build build --config Release --target pj_app --parallel
 
-          if [[ "$SCCACHE_AVAILABLE" == "true" ]]; then
-            sccache --show-stats
-          fi
+          sccache --show-stats
 
       - name: Build the SAV log loader plugin
         # In-repo plugin (plugins/data_load_savb), built with the same Conan graph and
@@ -405,7 +395,7 @@ jobs:
         # best-effort skips.
         # -CleanReleaseName only on a tag build: -Version is already the unique,
         # meaningful name there (matches the AppImage's plain naming); dispatch
-        # builds keep the date + main-commit stamp to stay distinguishable.
+        # builds keep the short-commit stamp to stay distinguishable.
         shell: pwsh
         run: |
           # Remote updates only when this run also publishes a repository at

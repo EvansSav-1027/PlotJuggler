@@ -6,10 +6,9 @@ name: Release Linux packages
 # artifacts the Windows installer bundles. The Linux sibling of
 # windows-release.yml.
 #
-# Architecture (2026-07 redesign, docs/plans/2026-07-16-appimage-ci-redesign.md;
-# .deb addition, docs/plans/2026-08-03-debian-packaging.md):
-#   * appimage job: runs INSIDE ghcr.io/plotjuggler/pj4-appimage-builder
-#     (Ubuntu 22.04 / glibc 2.35 — hosted 22.04 runners retire 2027-04,
+# Jobs:
+#   * appimage job: runs INSIDE the builder image appimage-builder-image.yml
+#     publishes (Ubuntu 22.04 / glibc 2.35 — hosted 22.04 runners retire 2027-04,
 #     actions/runner-images#14254, so the floor lives in the container, not the
 #     runner label). Third-party Conan binaries restore from the actions/cache
 #     closure (seeded by linux-ci), with ConanCenter source builds as fallback;
@@ -66,7 +65,7 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
       # Bind-mount the host's fat preinstalled-toolchain dirs so the first step
       # can empty them: a container job cannot run the usual host-side
-      # `sudo rm -rf`, and the RelWithDebInfo app build needs the space
+      # `sudo rm -rf`, and the Release app build needs the space
       # (linux-ci hit "ld: No space left on device" without the equivalent
       # cleanup).
       options: >-
@@ -133,14 +132,14 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ~/.conan2
-          key: conan-appimage-v2-${{ hashFiles('conanfile.txt', 'conan.lock') }}
+          key: conan-appimage-release-v2-${{ hashFiles('conanfile.txt', 'conan.lock') }}-luau-fpic
           # Prefix fallbacks: an older appimage closure first, else seed from
           # linux-ci's saved closure — same ubuntu-22.04 / gcc-11 /
-          # RelWithDebInfo / cppstd=20 profile, so its packages are directly
+          # Release / cppstd=20 profile, so its packages are directly
           # reusable here (ConanCenter source builds cover any residual miss).
           restore-keys: |
-            conan-appimage-
-            conan-linux-gcc-relwithdebinfo-v2-
+            conan-appimage-release-
+            conan-linux-gcc-release-v2-
 
       - name: Restore ccache
         # Explicit restore/save split: the plain action's post-job save is
@@ -157,13 +156,13 @@ jobs:
           # compiler_check=content, hash_dir=false, base_dir (below).
           restore-keys: |
             ccache-appimage-
-            ccache-linux-build-main-
+            ccache-linux-g1-main-
 
       - name: Configure ccache
         # compiler_check=content + hash_dir=false + base_dir make object hashes
         # independent of the compiler binary's mtime and of the workspace root,
-        # so this container job (/__w/PJ4/PJ4) and linux-ci's runner job
-        # (/home/runner/work/PJ4/PJ4) hit each other's objects. Trade-off:
+        # so this container job (/__w/PlotJuggler/PlotJuggler) and linux-ci's runner job
+        # (/home/runner/work/PlotJuggler/PlotJuggler) hit each other's objects. Trade-off:
         # cached objects may embed the sibling workspace path in debug info.
         shell: bash
         run: |
@@ -204,7 +203,7 @@ jobs:
 
       - name: Conan install (app graph)
         # Resolve/build the app dependency graph up front so it can be
-        # published immediately — a later compile failure must not discard an
+        # saved to the cache immediately — a later compile failure must not discard an
         # otherwise reusable closure. The ./build.sh below re-resolves the
         # same graph, which is then a fast no-op.
         id: conan_install
@@ -213,9 +212,13 @@ jobs:
           set -euo pipefail
           conan profile detect --force
           scripts/configure_conan_remote.sh
+          # luau: ConanCenter's Release binary is not PIC (no fPIC option); -fPIC in
+          # its package_id makes Conan build it instead. Same flags as build.sh.
           conan install . --output-folder=build --build=missing -r=plotjuggler-conan -r=conancenter \
             --lockfile=conan.lock --lockfile-partial \
-            -s build_type=RelWithDebInfo -s compiler.cppstd=20
+            -s build_type=Release -s compiler.cppstd=20 \
+            -c "luau/*:tools.build:cxxflags=['-fPIC']" \
+            -c "luau/*:tools.info.package_id:confs=['tools.build:cxxflags']"
 
       - name: Link pinned linuxdeploy/appimagetool into packaging/appimage/
         # build_appimage.sh uses a pre-existing packaging/appimage/<tool>.AppImage instead
@@ -280,6 +283,8 @@ jobs:
           PJ_BUILD_DEMOS: "OFF"
           PJ_BUILD_RASTER_HELPER: "ON"
           PJ_INSTALLATION: "appimage"
+          # Release-only: the key that decrypts the empty-dock easter egg GIFs (pj_widgets). Absent on forks: no easter egg.
+          PJ_EASTER_EGG_KEY: ${{ secrets.PJ_EASTER_EGG_KEY }}
         shell: bash
         run: |
           set -euo pipefail
@@ -304,11 +309,11 @@ jobs:
           echo "appimage_name=$(basename "$appimage_path")" >> "$GITHUB_OUTPUT"
 
       - name: Self-test the packaged Python backend
-        # The only step in any release flow that RUNS the AppImage. Everything else
-        # inspects it statically, which is why a Python backend that could not import
-        # its own stdlib shipped unnoticed. Covers the whole packaging contract at
-        # once: the bundled libpython resolves, PYTHONHOME points at the bundled
-        # stdlib, lib-dynload made it into the AppDir, and the import allowlist holds.
+        # The only step in this job that RUNS the AppImage; the others inspect it
+        # statically, which cannot catch a Python backend that fails to import its own
+        # stdlib. Covers the whole packaging contract at once: the bundled libpython
+        # resolves, PYTHONHOME points at the bundled stdlib, lib-dynload made it into
+        # the AppDir, and the import allowlist holds.
         # No display or QT_QPA_PLATFORM needed: --selftest-python is handled
         # before QApplication exists (see pj_app/src/main.cpp).
         shell: bash
@@ -348,16 +353,16 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ~/.conan2
-          key: conan-appimage-v2-${{ hashFiles('conanfile.txt', 'conan.lock') }}
+          key: conan-appimage-release-v2-${{ hashFiles('conanfile.txt', 'conan.lock') }}-luau-fpic
 
       - name: Save ccache
         # always(): keep the objects even when a late step fails.
         #
         # Re-seed only when the restore found nothing at all. The key carries
         # the SHA (cache keys are immutable), so saving whenever the exact key
-        # missed wrote a new ~2 GB blob per dispatch into per-GB-month billed
-        # Depot Cache storage. The restore-keys above fall back to CI's
-        # ccache-linux-build-main-, which every push to main refreshes, and
+        # missed wrote a new ~2 GB blob per dispatch into the repo's shared
+        # 10 GB Actions cache. The restore-keys above fall back to CI's
+        # ccache-linux-g1-main-, which every push to main refreshes, and
         # hash_dir=false + base_dir make those objects valid here — so the warm
         # path survives without this workflow keeping its own generation.
         if: always() && github.ref_type != 'tag' && steps.ccache-restore.outputs.cache-matched-key == ''
@@ -442,6 +447,8 @@ jobs:
           # build tree; the .deb's own copy comes from the AppDir either way.
           PJ_BUILD_RASTER_HELPER: "ON"
           PJ_INSTALLATION: "deb"
+          # Release-only: the key that decrypts the empty-dock easter egg GIFs (pj_widgets). Absent on forks: no easter egg.
+          PJ_EASTER_EGG_KEY: ${{ secrets.PJ_EASTER_EGG_KEY }}
         shell: bash
         run: ./build.sh
 

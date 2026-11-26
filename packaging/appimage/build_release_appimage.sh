@@ -15,15 +15,15 @@
 #                          orchestrator then extracts the produced AppImage,
 #                          drops non-MUST .so from the plugins dir, and repacks
 #                          so the released AppImage carries exactly the curated
-#                          20 (matching --host-build).
-#                          With --host-build: ./build.sh + pj_ported_plugins/
-#                          build.sh on the host, curated 20-plugin filter, then
+#                          set (matching --host-build).
+#                          With --host-build: ./build.sh + the plugin repo's
+#                          build.sh on the host, curated-plugin filter, then
 #                          packaging/appimage/build_appimage.sh --plugins-dir.
 #
 # DEFAULT = docker (portable). The AppImage inherits the container's glibc 2.35
 # floor and runs on any distro with glibc >= 2.35 (Ubuntu 22.04 and newer, and
 # equivalents on other families). Ros2 is ALWAYS Docker-per-distro either way.
-# Both modes produce the same curated 20-plugin bundle.
+# Both modes produce the same curated bundle.
 #
 # --host-build (opt-in) = host build (fast, this machine). The resulting AppImage
 # inherits the HOST glibc floor (e.g. Ubuntu 24.04 => glibc 2.38), so it only
@@ -37,7 +37,7 @@
 #                             [--ros2-distros "humble iron jazzy rolling"]
 #
 #   --host-build                            opt into the legacy host-build flow
-#                                           (curated 20 plugins, non-portable).
+#                                           (curated plugins, non-portable).
 #   --fresh                                 (docker mode only) drop the
 #                                           persistent Conan + ccache Docker
 #                                           volumes so app+plugins compile from
@@ -161,6 +161,14 @@ RELEASE_FLAT_SOS=(
   libtoolbox_quaternion_plugin.so
   libtoolbox_transform_editor_plugin.so
   libtoolbox_mosaico_plugin.so
+  libtoolbox_fft_plugin.so
+  libtoolbox_anomaly_detector_plugin.so
+  libtoolbox_data_exporter_plugin.so
+  libparser_influx_plugin.so
+  libparser_navmap_plugin.so
+  libcandump_source_plugin.so
+  libblf_source_plugin.so
+  libmf4_source_plugin.so
   # Linux-only in the bundle (POSIX-only CLI backends); see BUNDLE_IDS.
   libtoolbox_assistant_agent_plugin.so
 )
@@ -209,7 +217,7 @@ else
     { echo "ERROR: app binary missing (build/pj_app/plotjuggler4) — drop --skip-app" >&2; exit 1; }
 
   # toolbox_mosaico, toolbox_transform_editor and parser_arrow are all part of
-  # the aggregate's `else()` add_subdirectory list (pj_ported_plugins/CMakeLists.txt
+  # the aggregate's `else()` add_subdirectory list (the plugin repo's CMakeLists.txt
   # in standalone mode) — a plain `./build.sh` already produces every .so below,
   # no per-plugin standalone build needed.
   if [[ "${SKIP_PLUGINS}" == 0 ]]; then

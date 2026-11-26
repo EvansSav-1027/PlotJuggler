@@ -3,7 +3,8 @@
 # PlotJuggler 4 as a conda package, for the PlotJuggler prefix.dev channel.
 # It installs next to RoboStack's ROS 2 packages in one environment, which is
 # how ROS users on conda get PJ4. Built by build_conda.sh, which supplies
-# PJ_QT_VERSION and PJ_VERSION from versions.env (or the release tag).
+# PJ_VERSION from versions.env (or the release tag); Qt and Python come from
+# variants.yaml, like the rest of the pins.
 
 context:
   version: ${{ env.get("PJ_VERSION") }}
@@ -19,6 +20,13 @@ build:
   number: 0
   skip:
     - win
+  script:
+    file: build.sh
+    env:
+      PJ_QT_MIN_VERSION: ${{ qt6_main }}
+      # The script's environment is isolated from the caller's, so the
+      # compiler cache directory is forwarded by name; empty builds uncached.
+      CCACHE_DIR: ${{ env.get("CCACHE_DIR", default="") }}
 
 requirements:
   build:
@@ -29,15 +37,17 @@ requirements:
     - cmake >=3.28
     - ninja
     - pkg-config
+    - ccache
   host:
-    - qt6-main ${{ env.get("PJ_QT_VERSION") }}.*
+    # The Qt 6 of the environment it installs into (variants.yaml).
+    - qt6-main ${{ qt6_main }}.*
     - qwt 6.3.*
     - fmt
     - tsl_robin_map 1.4.*
     - glm 1.0.*
     - nlohmann_json 3.12.*
-    - python 3.12.*
-    - pybind11 2.13.*
+    - python
+    - pybind11 3.1.*
     - zstd 1.5.*
     - lz4-c
     - fast_float 8.*
@@ -61,20 +71,30 @@ requirements:
     # OpenCV and VTK, which need the codecs and libraries it leaves out.
     - ffmpeg ${{ ffmpeg }}.* lgpl_*
     # PJ4's own packages (recipes/), from the plotjuggler channel.
-    - luau 0.700.*
+    - luau 0.747.*
     - libmcap 2.1.*
-    - cloudini 1.4.*
-    - kissfft 131.1.*
-    - libnanoarrow 0.7.*
+    # conda-forge builds 1.5 only against lz4-c 1.11, which the lz4_c 1.10 pin (variants.yaml) excludes; 1.4.1 has
+    # builds for both, and both read the same V6 wire format.
+    - cloudini >=1.4.1,<1.6
+    - libnanoarrow >=0.9
+    # PJ_SYSTEM_ADS: builds from 3 on carry the fork's "keep inactive tabs parented" patch (see the root CMakeLists).
+    - qt6-advanced-docking-system[version='>=5.1.1', build_number='>=3']
   # ffmpeg's run_export demands at least the patch release built against,
   # often newer than a RoboStack snapshot's; the ABI holds within a major.
   ignore_run_exports:
     from_package:
       - ffmpeg
   run:
+    # PJ4 compiles against Qt's private headers (QRhi, qguiapplication_p.h,
+    # qhighdpiscaling_p.h, ...), whose ABI changes every minor release: the
+    # package loads only with the Qt minor it was built against.
+    - ${{ pin_compatible('qt6-main', upper_bound='x.x') }}
+    # The exact host build: its run_exports pin only the version, which older
+    # unpatched builds share, and a build_number bracket breaks mamba's solver.
+    - ${{ pin_compatible('qt6-advanced-docking-system', exact=True) }}
     # The embedded interpreter links libpython and loads the stdlib from the
     # env; python's run_exports only pin the ABI, not the package itself.
-    - python 3.12.*
+    - python
     - ${{ pin_compatible('ffmpeg', lower_bound='x.x', upper_bound='x') }}
     # PJ4 ships MPL-2.0 and must not pull GPL builds into the environment.
     - ffmpeg * lgpl_*
@@ -89,7 +109,11 @@ tests:
         # The embedded interpreter's PYTHONHOME is baked at build time; this
         # proves conda's prefix relocation rewrote it to the installed env.
         - plotjuggler4 --selftest-python
+        # Dock tabs must stay parented when hidden (the fork's "keep inactive tabs parented" patch).
+        - plotjuggler4 --selftest-docking
         - test -x "$PREFIX/bin/pj-plugin-check"
+        - if: linux
+          then: test -f "$PREFIX/share/applications/plotjuggler4.desktop"
 
 about:
   homepage: https://plotjuggler.io

@@ -1,24 +1,20 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 //
-// The QRhi view's failure contract, driven by the pipeline fault injection of
-// builds with tests (PJ_RHI_TEST_FAIL_SHADER, see createPipeline()):
+// The QRhi view's failure contract, driven by the pipeline fault injection of builds with tests
+// (PJ_RHI_TEST_FAIL_SHADER, see createPipeline()):
 //
-//  - a base pipeline that cannot be created puts the view in its failure state:
-//    no crash, only the backdrop, the reason in the dock's warning label and
-//    renderFailed() once; a sibling QRhiWidget in the same window keeps
-//    rendering; clearing the fault and re-initializing (a resize) recovers.
-//    The pipelines are created as frames first draw with them, so the failure
-//    comes with the first frames; none of them is presented with a pipeline
-//    missing (each keeps the last full frame, or the backdrop);
-//  - so does a family's pipeline built when its first layer arrives (the
-//    families are built on demand, and of their pipelines only the variants a
-//    frame binds), and a base pipeline first needed by a direct frame after HDR
-//    frames;
+//  - a base pipeline that cannot be created puts the view in its failure state: no crash, only the backdrop, the reason
+//    in the dock's warning label and renderFailed() once; a sibling QRhiWidget in the same window keeps rendering;
+//    clearing the fault and re-initializing (a resize) recovers. Pipelines are created as frames first draw with them,
+//    so the failure comes with the first frames; none of them is presented with a pipeline missing (each keeps the last
+//    full frame, or the backdrop);
+//  - so does a family's pipeline built when its first layer arrives (families are built on demand, and of their
+//    pipelines only the variants a frame binds), and a base pipeline first needed by a direct frame after HDR frames;
 //  - the same holds after a recovery in a new top-level (a new QRhi);
 //  - Qt's own failure (no QRhi for the window) reaches the warning too;
-//  - optional stages drop alone: the overlays, the HDR chain when a pipeline
-//    has no HDR variant, and each quality stage whose allocation fails.
+//  - optional stages drop alone: the overlays, the HDR chain when a pipeline has no HDR variant, and each quality
+//    stage whose allocation fails.
 //
 // Needs a real display like the render harness (see scene3d_render_test_support.h).
 
@@ -42,6 +38,7 @@
 #include "../rhi/passes/marker_rhi_pass.h"
 #include "../rhi/scene_view_widget_rhi_quality_p.h"
 #include "pj_base/builtin/scene_entities_codec.hpp"
+#include "pj_bench_probes.h"
 #include "pj_widgets/GraphicsApi.h"
 #include "scene3d_render_test_support.h"
 #include "scene_view_test_access.h"
@@ -56,8 +53,11 @@ using pj::scene3d::test::grab;
 using pj::scene3d::test::PipelineFault;
 
 constexpr QSize kViewSize{320, 240};
+// Fails the grid line pipelines on every rasterizer: their vertex shader differs on a software one
+// (grid_segment.vert), the cell pipelines exist only for the filled style, and no failure scene has the markers that
+// share this shader.
+constexpr char kGridLineShader[] = "/scene.frag.qsb";
 
-// A GPU sibling sharing the window's QRhi: clears to green, counting its frames.
 class ClearWidget : public QRhiWidget {
  public:
   ClearWidget() {
@@ -74,7 +74,6 @@ class ClearWidget : public QRhiWidget {
   }
 };
 
-// Nothing but one colour: the cleared backdrop.
 bool uniform(const QImage& image) {
   for (int y = 0; y < image.height(); ++y) {
     for (int x = 0; x < image.width(); ++x) {
@@ -86,7 +85,6 @@ bool uniform(const QImage& image) {
   return true;
 }
 
-// A Scene3D dock with a point block (grid on) and a count of its view's renderFailed().
 class FailureScene {
  public:
   FailureScene() {
@@ -121,12 +119,10 @@ class FailureScene {
     fixture_.window().show();
     return QTest::qWaitForWindowExposed(&fixture_.window());
   }
-  // A new output size: QRhiWidget runs initialize() again. Grows by `grow`,
-  // since the view's minimum size is kViewSize.
+  // A new output size: QRhiWidget runs initialize() again. Grows by `grow` since the view's minimum size is kViewSize.
   void resize(QSize grow = {40, 40}) {
     dock()->setFixedSize(kViewSize + grow);
   }
-  // Renders until `done` holds (true) or 3 s pass (false).
   bool renderUntil(const std::function<bool()>& done) {
     return QTest::qWaitFor(
         [&] {
@@ -136,8 +132,7 @@ class FailureScene {
         3000);
   }
 
-  // A local URDF robot with one box link over the point block: a mesh shadow
-  // caster, whose TF buffer is what enables shadows.
+  // A local URDF robot with one box link over the point block: a mesh shadow caster whose TF buffer enables shadows.
   void addRobot() {
     ASSERT_TRUE(urdf_dir_.isValid());
     const QString path = urdf_dir_.filePath(u"caster.urdf"_s);
@@ -151,7 +146,6 @@ class FailureScene {
     EXPECT_NE(dock()->addRobotModelLayer(path).id, 0U);
   }
 
-  // A SceneEntities layer with one cube at the point block: the view's first marker layer.
   void addCube() {
     PJ::sdk::SceneEntity entity;
     entity.frame_id = "map";
@@ -181,7 +175,7 @@ class Scene3dRhiFailureTest : public ::testing::Test {
 };
 
 TEST_F(Scene3dRhiFailureTest, BasePipelineFailureClearsWarnsAndRecovers) {
-  PipelineFault fault("/grid.vert.qsb");
+  PipelineFault fault(kGridLineShader);
   FailureScene scene;
   SceneViewWidget* view = scene.view();
   ClearWidget* sibling = scene.addSibling();
@@ -307,6 +301,77 @@ TEST_F(Scene3dRhiFailureTest, FamiliesAndVariantsAreBuiltOnDemand) {
   }
 }
 
+// The software default for one case: the GUI test main keeps the HDR chain on CI's software rasterizers.
+class SoftwareDefault {
+ public:
+  SoftwareDefault() {
+    qputenv("PJ_SCENE3D_SOFTWARE_HDR", "0");
+  }
+  ~SoftwareDefault() {
+    qputenv("PJ_SCENE3D_SOFTWARE_HDR", "1");
+  }
+  SoftwareDefault(const SoftwareDefault&) = delete;
+  SoftwareDefault& operator=(const SoftwareDefault&) = delete;
+};
+
+// Whether `view` runs on a CPU rasterizer, judged without PJ::softwareRasterizerName() so a regression there fails
+// the cases below instead of skipping them: CI's lanes are llvmpipe (OpenGL), lavapipe and WARP (CpuDevice).
+bool onCpuRasterizer(const SceneViewWidget& view) {
+  const QRhi* rhi = pj_bench::rhiOf(view);
+  if (rhi == nullptr) {
+    return false;
+  }
+  const QRhiDriverInfo driver = rhi->driverInfo();
+  return driver.deviceType == QRhiDriverInfo::CpuDevice || driver.deviceName.toLower().contains("llvmpipe");
+}
+
+// A software rasterizer draws the single-sample direct pass and says why, as a notice: the HDR chain's first frame held
+// a GPU-less browser's main thread for seconds.
+TEST_F(Scene3dRhiFailureTest, SoftwareRasterizerDrawsTheDirectPass) {
+  SoftwareDefault software_default;
+  FailureScene scene;
+  SceneViewWidget* view = scene.view();
+  ASSERT_TRUE(scene.show());
+  const QImage frame = grab(*view);
+  if (frame.isNull() || view->rhiBackendName().isEmpty()) {
+    PJ_SKIP_WITHOUT_GPU("no QRhi frame presented");
+  }
+  if (!onCpuRasterizer(*view)) {
+    GTEST_SKIP() << "a hardware device keeps the HDR chain";
+  }
+  const QString rasterizer = PJ::softwareRasterizerName(*pj_bench::rhiOf(*view));
+  ASSERT_FALSE(rasterizer.isEmpty()) << "a CPU rasterizer went undetected";
+  EXPECT_FALSE(SceneViewTestAccess::stage(*view, SceneViewTestAccess::Stage::kHdr).last_active);
+  EXPECT_FALSE(uniform(frame)) << "the direct pass drew nothing";
+  EXPECT_TRUE(view->renderingWarning().startsWith(u"Software rendering (%1)"_s.arg(rasterizer)))
+      << view->renderingWarning().toStdString();
+  EXPECT_TRUE(view->renderingWarningIsNotice());
+  EXPECT_EQ(view->sampleCount(), 1);
+}
+
+// The notice ranks below every failure: an overlay failure on a software rasterizer still shows as the warning.
+TEST_F(Scene3dRhiFailureTest, FailureOutranksTheSoftwareNotice) {
+  SoftwareDefault software_default;
+  PipelineFault fault("/overlay.frag.qsb");
+  FailureScene scene;
+  SceneViewWidget* view = scene.view();
+  view->setShowPerfHud(true);
+  ASSERT_TRUE(scene.show());
+  if (grab(*view).isNull()) {
+    PJ_SKIP_WITHOUT_GPU("no QRhi frame presented");
+  }
+  if (!onCpuRasterizer(*view)) {
+    GTEST_SKIP() << "a hardware device shows no software notice";
+  }
+  EXPECT_TRUE(view->renderingWarning().contains(u"overlays"_s)) << view->renderingWarning().toStdString();
+  EXPECT_FALSE(view->renderingWarningIsNotice());
+
+  fault.clear();
+  scene.resize();
+  ASSERT_TRUE(scene.renderUntil([&] { return !SceneViewTestAccess::lastOverlayRects(*view)[0].isNull(); }));
+  EXPECT_TRUE(view->renderingWarningIsNotice()) << view->renderingWarning().toStdString();
+}
+
 // A base pipeline the HDR frames never needed (the grid's direct pipelines are
 // created only for a frame without the HDR chain) fails on the first
 // direct frame: that frame is withheld (its target keeps the last HDR frame),
@@ -324,7 +389,7 @@ TEST_F(Scene3dRhiFailureTest, BaseTemplateFailsOnTheFirstDirectFrame) {
   }
   ASSERT_FALSE(uniform(hdr));
 
-  PipelineFault fault("/grid.vert.qsb");
+  PipelineFault fault(kGridLineShader);
   const auto& t = SceneViewTestAccess::stageTimes(*view);
   const std::uint64_t withheld = t.frames_withheld;
   SceneViewTestAccess::forceStageFallback(*view, SceneViewTestAccess::Stage::kHdr, true);
@@ -358,7 +423,7 @@ TEST_F(Scene3dRhiFailureTest, WithheldFrameKeepsThePickCamera) {
   }
   const glm::mat4 shown = SceneViewTestAccess::lastViewProjection(*view);
 
-  PipelineFault fault("/grid.vert.qsb");
+  PipelineFault fault(kGridLineShader);
   const auto& t = SceneViewTestAccess::stageTimes(*view);
   const std::uint64_t withheld = t.frames_withheld;
   // A rotation, not a pan: the stored matrix is relative to the render origin,
@@ -543,8 +608,7 @@ TEST_F(Scene3dRhiFailureTest, EdlAllocationFailureDropsEdlAlone) {
       });
 }
 
-// Backend lines ("<widget>: <backend>, QRhiDriverInfo(...)", category
-// pj.graphics) logged while alive.
+// Backend lines ("<widget>: <backend>, QRhiDriverInfo(...)", category pj.graphics) logged while alive.
 class BackendLogCounter {
  public:
   BackendLogCounter() {
@@ -572,7 +636,7 @@ class BackendLogCounter {
 // it, but the backend is logged once per QRhi.
 TEST_F(Scene3dRhiFailureTest, RetriesLogTheBackendOncePerQRhi) {
   BackendLogCounter log;
-  PipelineFault fault("/grid.vert.qsb");
+  PipelineFault fault(kGridLineShader);
   FailureScene scene;
   SceneViewWidget* view = scene.view();
   ASSERT_TRUE(scene.show());
@@ -594,7 +658,7 @@ TEST_F(Scene3dRhiFailureTest, RetriesLogTheBackendOncePerQRhi) {
 // After a recovery the fault returns and the view moves to another top-level
 // (a new QRhi): it fails there once more, and recovers there once the fault is gone.
 TEST_F(Scene3dRhiFailureTest, FailureAfterRecoveryRecoversInANewWindow) {
-  PipelineFault fault("/grid.vert.qsb");
+  PipelineFault fault(kGridLineShader);
   FailureScene scene;
   SceneViewWidget* view = scene.view();
   ASSERT_TRUE(scene.show());
@@ -608,7 +672,7 @@ TEST_F(Scene3dRhiFailureTest, FailureAfterRecoveryRecoversInANewWindow) {
   ASSERT_TRUE(scene.renderUntil([&] { return view->renderingWarning().isEmpty(); }))
       << view->renderingWarning().toStdString();
 
-  PipelineFault again("/grid.vert.qsb");
+  PipelineFault again(kGridLineShader);
   QWidget other;
   auto* layout = new QVBoxLayout(&other);
   layout->setContentsMargins(0, 0, 0, 0);
@@ -686,7 +750,7 @@ TEST_F(Scene3dRhiFailureTest, MissingHdrPipelineVariantFallsBackToDirect) {
   // From now on the grid's HDR variants cannot be created; its direct pipelines,
   // created by the direct frames above, stand. The HDR frame that lost its grid
   // variant is not presented (the last frame stays); the next one draws directly.
-  PipelineFault fault("/scene.frag.qsb");
+  PipelineFault fault(kGridLineShader);
   const std::uint64_t withheld = SceneViewTestAccess::stageTimes(*view).frames_withheld;
   SceneViewTestAccess::forceStageFallback(*view, SceneViewTestAccess::Stage::kHdr, false);
   ASSERT_TRUE(scene.renderUntil([&] { return view->renderingWarning().contains(u"HDR variant"_s); }))

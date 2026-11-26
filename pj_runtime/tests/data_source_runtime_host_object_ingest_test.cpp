@@ -317,12 +317,10 @@ TEST_F(DataSourceRuntimeHostObjectIngestTest, PushMessagePureLazyDefersFetchAndD
   EXPECT_EQ(fetch_calls->load(), 1);
 }
 
-// Regression for the kPureLazy capture-order use-after-dlclose: the FetcherOwner
-// must OWN the DSO keepalive so that ~FetcherOwner's fetcher.release (plugin code)
-// runs BEFORE the producing .so is dlclosed — even when the stored lazy closure is
-// the LAST holder of the DSO token (post-evict / app close). Before the fix the
-// lazy closure captured the keepalive as a sibling of the FetcherOwner, so it
-// dropped first and release jumped into unmapped memory.
+// The FetcherOwner must own the DSO keepalive so ~FetcherOwner's fetcher.release (plugin code) runs before the
+// producing .so is dlclosed, even when the stored lazy closure is the last holder of the DSO token (post-evict / app
+// close). A closure holding the keepalive as a sibling of the FetcherOwner would drop it first, and release would jump
+// into unmapped memory.
 TEST_F(DataSourceRuntimeHostObjectIngestTest, PureLazyFetcherReleaseRunsWhileDsoStillMapped) {
   bool dso_mapped = true;
   bool released_while_mapped = false;
@@ -399,6 +397,54 @@ TEST_F(DataSourceRuntimeHostObjectIngestTest, PureLazyFetcherReleaseRunsWhileDso
   EXPECT_FALSE(dso_mapped) << "the keepalive drops once the stored closure is destroyed";
 }
 
+// A parser may register an object route and no scalar route (parser_ros does
+// for robot_description). Its parse() then has nothing to write and reports
+// the absent route as an error. That is not a failed message: under every
+// policy that parses scalars at ingest, the object must still be stored.
+TEST_F(DataSourceRuntimeHostObjectIngestTest, ObjectOnlySchemaStoresTheObjectUnderEveryEagerScalarPolicy) {
+  for (const auto policy :
+       {PJ::sdk::ObjectIngestPolicy::kLazyObjectsEagerScalars, PJ::sdk::ObjectIngestPolicy::kEager}) {
+    SCOPED_TRACE(static_cast<int>(policy));
+    const std::string topic = "/robot_description_" + std::to_string(static_cast<int>(policy));
+    host_->policyResolver().setForTopic(topic, policy);
+
+    auto binding = bindTopic(topic, "mock/object_only_image");
+    ASSERT_TRUE(binding.has_value()) << binding.error();
+
+    const std::vector<uint8_t> payload{0x3c, 0x72, 0x6f, 0x62};
+    auto status = runtime().pushMessage(*binding, 123, [payload]() -> std::vector<uint8_t> { return payload; });
+    EXPECT_TRUE(status.has_value()) << status.error();
+
+    host_->flushAll();
+    auto object_topic = object_store_.findTopic(dataset_id_, topic);
+    ASSERT_TRUE(object_topic.has_value());
+    EXPECT_EQ(object_store_.entryCount(*object_topic), 1U);
+    auto entry = object_store_.latestAt(*object_topic, 123);
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_EQ(std::vector<uint8_t>(entry->payload.bytes.begin(), entry->payload.bytes.end()), payload);
+  }
+  EXPECT_EQ(totalRowCount(), 0U) << "an object-only schema writes no scalar row";
+}
+
+// The tolerance above is for an ABSENT scalar route only. A parser that has a
+// scalar route and fails on a message still fails that push, and the object
+// is not stored.
+TEST_F(DataSourceRuntimeHostObjectIngestTest, FailingScalarRouteStillFailsThePush) {
+  host_->policyResolver().setDefault(PJ::sdk::ObjectIngestPolicy::kLazyObjectsEagerScalars);
+
+  auto binding = bindTopic("/camera/corrupt", "mock/failing_scalar_image");
+  ASSERT_TRUE(binding.has_value()) << binding.error();
+
+  auto status = runtime().pushMessage(*binding, 123, []() -> std::vector<uint8_t> { return {1, 2, 3}; });
+  ASSERT_FALSE(status.has_value());
+  EXPECT_NE(status.error().find("scalar decode failed"), std::string::npos) << status.error();
+
+  host_->flushAll();
+  auto object_topic = object_store_.findTopic(dataset_id_, "/camera/corrupt");
+  ASSERT_TRUE(object_topic.has_value());
+  EXPECT_EQ(object_store_.entryCount(*object_topic), 0U);
+}
+
 TEST_F(DataSourceRuntimeHostObjectIngestTest, PushMessageKeepsScalarOnlyTopicsEagerUnderLazyPolicy) {
   host_->policyResolver().setForTopic("/scalar/topic", PJ::sdk::ObjectIngestPolicy::kPureLazy);
 
@@ -433,11 +479,8 @@ TEST_F(DataSourceRuntimeHostObjectIngestTest, SetObjectRetentionBudgetAppliesToE
   }
 }
 
-// Regression for the streaming dual-store pause bug: object pushes must follow
-// setObjectStoreTarget so the primary is frozen (never written, never evicted)
-// while paused. Before the fix, cbPushMessage pushed straight to the primary
-// regardless of the swap, so paused frames slid the primary's retention window
-// and shrank the scrub-back range.
+// Object pushes must follow setObjectStoreTarget so the primary is frozen (never written, never evicted) while paused;
+// otherwise paused frames slide the primary's retention window and shrink the scrub-back range.
 TEST_F(DataSourceRuntimeHostObjectIngestTest, ObjectPushFollowsStoreTargetSwap) {
   PJ::DataEngine secondary_engine;
   PJ::ObjectStore secondary_object_store;
@@ -479,30 +522,25 @@ TEST_F(DataSourceRuntimeHostObjectIngestTest, ObjectPushFollowsStoreTargetSwap) 
   ASSERT_TRUE(primary_topic.has_value());
   ASSERT_TRUE(secondary_topic.has_value()) << "object topic must be lockstep-registered on both stores";
 
-  // Live: target defaults to the primary.
   push(100);
   EXPECT_EQ(object_store_.entryCount(*primary_topic), 1U);
   EXPECT_EQ(secondary_object_store.entryCount(*secondary_topic), 0U);
 
-  // Pause: swap to the secondary. New frames land on B; the primary is frozen.
   host.setObjectStoreTarget(&secondary_object_store);
   push(200);
   push(300);
   EXPECT_EQ(object_store_.entryCount(*primary_topic), 1U) << "primary must not grow while paused";
   EXPECT_EQ(secondary_object_store.entryCount(*secondary_topic), 2U);
 
-  // Resume: swap back to the primary.
   host.setObjectStoreTarget(&object_store_);
   push(400);
   EXPECT_EQ(object_store_.entryCount(*primary_topic), 2U);
   EXPECT_EQ(secondary_object_store.entryCount(*secondary_topic), 2U);
 }
 
-// Mode-B regression (amcl_test_bag): a topic interleaving publishers whose
-// embedded stamps disagree (amcl future-dates map->odom by seconds) must lose
-// NOTHING. Pre-fix, the datastore's monotonic append rejected every regressed
-// scalar row, which failed the whole pushMessage and silently dropped the
-// object entry with it — the 3D view's TF buffer then froze.
+// A topic interleaving publishers whose embedded stamps disagree (amcl_test_bag: amcl future-dates map->odom by
+// seconds) must lose nothing: the datastore's monotonic append rejects regressed scalar rows, which must not fail the
+// whole pushMessage and drop the object entry with it (the 3D view's TF buffer would freeze).
 TEST_F(DataSourceRuntimeHostObjectIngestTest, EmbeddedTimestampRegressionKeepsScalarsAndObjects) {
   host_->policyResolver().setDefault(PJ::sdk::ObjectIngestPolicy::kEager);
 
@@ -521,8 +559,6 @@ TEST_F(DataSourceRuntimeHostObjectIngestTest, EmbeddedTimestampRegressionKeepsSc
   }
   host_->flushAll();
 
-  // Every scalar row landed, timestamped by its embedded stamp and readable
-  // back in sorted order.
   EXPECT_EQ(totalRowCount(), embedded_stamps.size());
   PJ::DataReader reader(engine_);
   const auto topics = reader.listTopics(dataset_id_);
@@ -534,15 +570,9 @@ TEST_F(DataSourceRuntimeHostObjectIngestTest, EmbeddedTimestampRegressionKeepsSc
   cursor_or->forEach([&row_stamps](const PJ::SampleRow& row) { row_stamps.push_back(row.timestamp); });
   EXPECT_EQ(row_stamps, (std::vector<PJ::Timestamp>{901, 1000, 1001, 1100, 1101, 1200}));
 
-  // Every object entry landed too (the TF-buffer feed in the real pipeline).
   auto object_topic = object_store_.findTopic(dataset_id_, "/tf_like");
   ASSERT_TRUE(object_topic.has_value());
   EXPECT_EQ(object_store_.entryCount(*object_topic), embedded_stamps.size());
 }
-
-// NOTE: the two parser-binding TopicId-reuse pins that used to live here moved
-// to StreamParserSwapTest in data_source_runtime_host_stream_swap_test.cpp,
-// beside the sibling binding-reuse contract cases and that suite's ready-made
-// two-engine lockstep fixture.
 
 }  // namespace

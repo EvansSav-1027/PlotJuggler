@@ -56,17 +56,10 @@ struct QStringHash {
       return isPlottablePrimitive(field.logical_type);
     case SeriesCapability::kDiscrete:
       return isDiscreteField(field);
+    case SeriesCapability::kAny:
+      return true;
   }
   return false;
-}
-
-[[nodiscard]] QString baseDatasetLabel(const DatasetInfo* dataset) {
-  QString label = dataset != nullptr ? QString::fromStdString(dataset->source_name) : QString{};
-  if (label.isEmpty()) {
-    label = u"Dataset"_s;
-  }
-  label.replace('/', '_');
-  return label;
 }
 
 [[nodiscard]] QString makeCurveKey(DatasetId dataset_id, TopicId topic_id, std::size_t column_index) {
@@ -77,17 +70,14 @@ struct QStringHash {
   return u"dataset:%1/object_topic:%2"_s.arg(dataset_id).arg(object_topic_id.id);
 }
 
-// Key for a data-less advertised placeholder. Distinct namespace from the
-// curve/object keys so it never collides with a storage-backed entry.
+// Key for a data-less advertised placeholder; its own namespace so it never collides with a storage-backed key.
 [[nodiscard]] QString makeAdvertisedKey(DatasetId dataset_id, const QString& topic_name) {
   return u"dataset:%1/advertised:%2"_s.arg(dataset_id).arg(topic_name);
 }
 
-// True when `live_path` and `saved_path` name the same on-disk source. Replicates
-// pj_app's layout_xml::isSamePath semantics without depending on it (pj_runtime is
-// below pj_app): literal-equality short-circuit first, then a QFileInfo-based
-// normalisation fallback through SessionManager::normalizedSourcePath. Empty
-// inputs never match.
+// True when `live_path` and `saved_path` name the same on-disk source. Replicates pj_app's layout_xml::isSamePath
+// semantics without depending on it (pj_runtime is below pj_app): literal equality first, then a normalisation through
+// SessionManager::normalizedSourcePath. Empty inputs never match.
 [[nodiscard]] bool isSamePathLike(const QString& live_path, const QString& saved_path) {
   if (live_path.isEmpty() || saved_path.isEmpty()) {
     return false;
@@ -285,9 +275,6 @@ struct CatalogModel::Impl {
   // by the DatasetId the curve belonged to, so a reload (new DatasetId)
   // re-introduces the name.
   tsl::robin_map<DatasetId, NameSet> removed_names_per_dataset;
-  // Plugin-provided tree-root labels (issue #98), keyed by stable DatasetId so
-  // they survive rebuilds and clearAll/restoreDataset. Never holds empty values.
-  tsl::robin_map<DatasetId, QString> dataset_display_overrides;
 
   // Advertised (available-but-unsubscribed) topics per dataset: topic name →
   // a-priori classification. Merged into the catalog by rebuildNow as data-less
@@ -366,12 +353,15 @@ void CatalogModel::forEachItem(const std::function<void(const CatalogItem&)>& vi
 }
 
 std::vector<CatalogItem> CatalogModel::objectTopicsNamed(
-    const QString& topic_name, const QString& dataset_source) const {
+    const QString& topic_name, const QString& dataset_label) const {
   std::vector<CatalogItem> matches;
+  const std::optional<DatasetId> named = dataset_label.isEmpty() ? std::nullopt : datasetByLabel(dataset_label);
+  if (!dataset_label.isEmpty() && !named.has_value()) {
+    return matches;
+  }
   for (const auto& [key, item] : impl_->items) {
     (void)key;
-    if (isObjectTopic(item) && item.topic_name == topic_name &&
-        (dataset_source.isEmpty() || datasetSourceName(item.dataset_id) == dataset_source)) {
+    if (isObjectTopic(item) && item.topic_name == topic_name && (!named.has_value() || item.dataset_id == *named)) {
       matches.push_back(item);
     }
   }
@@ -462,8 +452,8 @@ std::optional<std::string> CatalogModel::pluginDropName(const QString& key) cons
   if (!isObjectTopic(item)) {
     return std::nullopt;
   }
-  // Only a source name addresses one of several same-named topics; a source loaded twice cannot, so it stays bare.
-  const QString source = datasetSourceName(item.dataset_id).value_or(QString{});
+  // Only a dataset label addresses one of several same-named topics.
+  const QString source = datasetLabel(item.dataset_id).value_or(QString{});
   if (!source.isEmpty() && objectTopicsNamed(item.topic_name, {}).size() > 1 &&
       objectTopicsNamed(item.topic_name, source).size() == 1) {
     return sdk::qualifiedSeriesName(source.toStdString(), topic_name);
@@ -499,19 +489,20 @@ std::optional<double> CatalogModel::scalarValueAt(const QString& key, double dis
   if (scalar == nullptr || !isPlottablePrimitive(scalar->logical_type)) {
     return std::nullopt;  // object topics carry no scalar value; strings → stringValueAt
   }
-  // Display-axis seconds -> raw ns through this dataset's display offset, then a
-  // null-aware latest-at-or-before point query (zero-order hold) read under the
-  // engine lock. latestNumericAt distinguishes a null cell from a real 0, so a
-  // sparsely-populated field shows "-" rather than a fabricated "0.000".
+  // The plot tracker's lookup, under the engine lock. The type was checked above,
+  // so read the storage directly rather than through DataReader::series, which
+  // copies the topic's column descriptors on every call (per visible row, 10 Hz).
   const DisplayOffset offset = impl_->session->displayOffset(it->second.dataset_id);
   const Timestamp raw_ns = displaySecondsToRaw(DisplaySeconds{display_seconds}, offset);
-  const DataReader reader(impl_->session->dataEngine());
-  const auto value_or =
-      reader.latestNumericAt(QueryPoint{.topic_id = scalar->topic_id, .t = raw_ns}, scalar->column_index);
-  if (!value_or.has_value() || !value_or->has_value()) {
-    return std::nullopt;  // read error, no row at/before the query time, or null cell
+  const DataEngine& engine = impl_->session->dataEngine();
+  const auto lock = engine.lockEngine();
+  const TopicStorage* storage = engine.getTopicStorage(scalar->topic_id);
+  if (storage == nullptr) {
+    return std::nullopt;
   }
-  return **value_or;
+  const SeriesReader series(storage->sealedChunks(), scalar->column_index, storage->retentionFloor());
+  const auto sample = series.sampleAtOrBeforeTime(raw_ns);
+  return sample.has_value() ? std::optional<double>{sample->value} : std::nullopt;
 }
 
 std::optional<TopicStats> CatalogModel::topicStats(const QString& key) const {
@@ -656,6 +647,21 @@ std::vector<DatasetId> CatalogModel::datasetIds() const {
   return {ids.begin(), ids.end()};
 }
 
+std::optional<QString> CatalogModel::datasetLabel(DatasetId dataset_id) const {
+  if (impl_->session == nullptr) {
+    return std::nullopt;
+  }
+  const std::string label = impl_->session->dataEngine().datasetLabel(dataset_id);
+  return label.empty() ? std::nullopt : std::optional{QString::fromStdString(label)};
+}
+
+std::optional<DatasetId> CatalogModel::datasetByLabel(const QString& label) const {
+  if (impl_->session == nullptr) {
+    return std::nullopt;
+  }
+  return impl_->session->dataEngine().datasetByLabel(label.toStdString());
+}
+
 std::optional<QString> CatalogModel::datasetSourceName(DatasetId dataset_id) const {
   if (impl_->session == nullptr) {
     return std::nullopt;
@@ -717,8 +723,8 @@ std::optional<QString> CatalogModel::resolveCurveKey(
   }
 
   // Legacy/generic unqualified layouts may target a structurally similar
-  // recording. Accept exactly one candidate; duplicates stay unresolved (the
-  // reported multi-dataset bug was this scan taking the first match).
+  // recording. Accept exactly one candidate; duplicates stay unresolved (taking the
+  // first match binds the layout to an arbitrary dataset).
   std::optional<QString> unique_match;
   for (const auto& [id, name] : datasets()) {
     (void)name;
@@ -770,23 +776,19 @@ std::optional<CurveDescriptor> CatalogModel::descriptorForPath(
 }
 
 void CatalogModel::rebuildFromDatastore() {
-  // Keep the samplesIngested gate's cache in sync after EVERY rebuild — whether
-  // triggered by the gate or by an explicit caller (load completion, dataset
-  // removal, display-name change) — so the next ingest can correctly skip. The
-  // fingerprint is taken BEFORE the rebuild: a worker commit landing while the
-  // rebuild reads the datastore then differs from the saved value, so the next
-  // ingest rebuilds again instead of skipping past a change the rebuild missed.
+  // Keep the samplesIngested gate's cache in sync after EVERY rebuild (gate-triggered or an explicit caller: load
+  // completion, dataset removal, display-name change) so the next ingest can skip correctly. The fingerprint is taken
+  // BEFORE the rebuild: a worker commit landing while the rebuild reads the datastore then differs from the saved
+  // value, so the next ingest rebuilds again instead of skipping past a change the rebuild missed.
   const std::uint64_t fingerprint = catalogFingerprint();
   rebuildNow();
   impl_->last_fingerprint = fingerprint;
 }
 
 void CatalogModel::rebuildIfChanged() {
-  // Gate for the high-frequency samplesIngested path: a full rebuild re-scans and
-  // re-allocates every curve key/label, but most ingest batches only append rows.
-  // Skip when nothing that affects catalog contents changed since the last
-  // rebuild. Stays synchronous (no timer), so callers that read the catalog right
-  // after a structural commit still see it updated.
+  // Gate for the high-frequency samplesIngested path: a full rebuild re-scans and re-allocates every curve key/label,
+  // but most ingest batches only append rows, so skip when nothing affecting catalog contents changed since the last
+  // rebuild. Synchronous (no timer), so callers reading the catalog right after a structural commit see it updated.
   const std::uint64_t fp = catalogFingerprint();
   if (impl_->last_fingerprint == fp) {
     return;
@@ -818,6 +820,8 @@ std::uint64_t CatalogModel::catalogFingerprint() const {
     const std::unordered_set<TopicId> ephemeral_outputs = impl_->session->derivedScalarTopics(/*ephemeral_only=*/true);
     for (const DatasetId dataset_id : reader.listDatasets()) {
       fp += mix(1, dataset_id);
+      // A relabel (setDatasetDisplayName) changes no topic, only the label.
+      fp += mix(7, (static_cast<std::uint64_t>(dataset_id) << 32) ^ qHash(engine.datasetLabel(dataset_id)));
       {
         // getTopicStorage() is raw + non-locking; hold the engine lock for the
         // scan. The object store has an INDEPENDENT lock that must never nest
@@ -832,6 +836,9 @@ std::uint64_t CatalogModel::catalogFingerprint() const {
           if (const TopicStorage* storage = engine.getTopicStorage(topic_id); storage != nullptr) {
             columns = storage->columnDescriptors().size();
             whole_numbers = storage->wholeNumbersSignature();
+            for (const FieldId field_id : storage->retiredColumns()) {
+              fp += mix(11, (static_cast<std::uint64_t>(topic_id) << 20) ^ field_id);
+            }
           }
           fp += mix(2, (static_cast<std::uint64_t>(topic_id) << 20) ^ columns);
           // A float field gaining its first chunk, or its first fractional value,
@@ -856,9 +863,6 @@ std::uint64_t CatalogModel::catalogFingerprint() const {
     for (const QString& name : names) {
       fp += mix(6, (static_cast<std::uint64_t>(dataset_id) << 32) ^ qHash(name));
     }
-  }
-  for (const auto& [dataset_id, label] : impl_->dataset_display_overrides) {
-    fp += mix(7, (static_cast<std::uint64_t>(dataset_id) << 32) ^ qHash(label));
   }
   // Advertised placeholders also change catalog output and are mutated outside
   // the samplesIngested path (setAdvertisedTopics), so fold them in to keep the
@@ -889,60 +893,13 @@ void CatalogModel::rebuildNow() {
   DataEngine& engine = impl_->session->dataEngine();
   ObjectStore& object_store = impl_->session->objectStore();
   std::vector<DatasetId> dataset_ids = reader.listDatasets();
-  // Deterministic order (ascending by id). listDatasets() iterates a robin_map
-  // whose order is unstable across create/delete/recreate. The duplicate-label
-  // ordinal below gives the un-suffixed BASE label to the FIRST dataset seen for
-  // a given name and " (N)" to the rest; an unstable order let that flip between
-  // two same-named datasets on successive rebuilds. A pre-existing dataset thus
-  // relabeled base->" (N)" is invisible to the key-only diff further down, and
-  // the tree view groups nodes by the label STRING — so the stale base-label node
-  // lingered and absorbed the other dataset's topics (duplicated fields, no "(N)"
-  // node). Sorting pins the base label to the oldest dataset, so no already-shown
-  // dataset is ever relabeled and the bug cannot arise.
+  // Deterministic order (ascending id): listDatasets() iterates a robin_map whose order is unstable across
+  // create/delete/recreate.
   std::sort(dataset_ids.begin(), dataset_ids.end());
   // Ephemeral (preview) transform outputs are intentionally NOT catalogued — the
   // Transform Editor's live preview materializes a real output topic, and it must
   // never surface in the Sources tree regardless of when a rebuild fires.
   const std::unordered_set<TopicId> ephemeral_outputs = impl_->session->derivedScalarTopics(/*ephemeral_only=*/true);
-
-  // issue #98: a plugin-provided display name (set via setDatasetDisplayName)
-  // overrides the file-derived source_name label, with the same '/'→'_'
-  // normalization as baseDatasetLabel so it participates in the duplicate-label
-  // ordinal disambiguation below. Absent/empty ⇒ the source_name label.
-  const auto effective_base_label = [this, &engine](DatasetId id) -> QString {
-    if (const auto it = impl_->dataset_display_overrides.find(id);
-        it != impl_->dataset_display_overrides.end() && !it->second.isEmpty()) {
-      QString label = it->second;
-      label.replace('/', '_');
-      return label;
-    }
-    return baseDatasetLabel(engine.getDataset(id));
-  };
-
-  tsl::robin_map<DatasetId, QString> dataset_labels;
-  tsl::robin_map<QString, int, QStringHash> label_counts;
-  for (const DatasetId dataset_id : dataset_ids) {
-    if (impl_->removed_datasets.count(dataset_id) > 0) {
-      continue;
-    }
-    ++label_counts[effective_base_label(dataset_id)];
-  }
-
-  tsl::robin_map<QString, int, QStringHash> label_ordinals;
-  for (const DatasetId dataset_id : dataset_ids) {
-    if (impl_->removed_datasets.count(dataset_id) > 0) {
-      continue;
-    }
-    const QString base_label = effective_base_label(dataset_id);
-    QString label = base_label;
-    if (label_counts[base_label] > 1) {
-      const int ordinal = ++label_ordinals[base_label];
-      if (ordinal > 1) {
-        label = u"%1 (%2)"_s.arg(base_label).arg(ordinal);
-      }
-    }
-    dataset_labels.insert_or_assign(dataset_id, std::move(label));
-  }
 
   for (const DatasetId dataset_id : dataset_ids) {
     if (impl_->removed_datasets.count(dataset_id) > 0) {
@@ -954,9 +911,7 @@ void CatalogModel::rebuildNow() {
       removed_names_for_dataset = &it->second;
     }
 
-    const auto dataset_label_it = dataset_labels.find(dataset_id);
-    const QString dataset_label =
-        dataset_label_it != dataset_labels.end() ? dataset_label_it->second : effective_base_label(dataset_id);
+    const QString dataset_label = QString::fromStdString(engine.datasetLabel(dataset_id));
 
     for (const TopicId topic_id : reader.listTopics(dataset_id)) {
       if (ephemeral_outputs.count(topic_id) > 0) {
@@ -977,6 +932,7 @@ void CatalogModel::rebuildNow() {
       // worker commit / createTopicField cannot then race the descriptor read.
       std::vector<ColumnDescriptor> columns;
       std::vector<bool> whole_numbers_only;
+      std::vector<bool> retired;
       {
         const auto lock = engine.lockEngine();
         const TopicStorage* storage = engine.getTopicStorage(topic_id);
@@ -985,7 +941,9 @@ void CatalogModel::rebuildNow() {
         }
         columns = topicColumns(*storage, type_tree);
         whole_numbers_only.reserve(columns.size());
+        retired.reserve(columns.size());
         for (const ColumnDescriptor& column : columns) {
+          retired.push_back(storage->isColumnRetired(column.field_id));
           const StorageKind kind = storageKindOf(column.logical_type);
           const bool is_float = kind == StorageKind::kFloat32 || kind == StorageKind::kFloat64;
           whole_numbers_only.push_back(is_float && storage->wholeNumbersOnly(column.field_id).value_or(false));
@@ -995,7 +953,8 @@ void CatalogModel::rebuildNow() {
         const ColumnDescriptor& column = columns[column_index];
         // Surface every column in a consumer family (plottable curves and/or
         // discrete state series); only kUnspecified stays out.
-        if (!isPlottablePrimitive(column.logical_type) && !isDiscretePrimitive(column.logical_type)) {
+        if (retired[column_index] ||
+            (!isPlottablePrimitive(column.logical_type) && !isDiscretePrimitive(column.logical_type))) {
           continue;
         }
 
@@ -1032,9 +991,8 @@ void CatalogModel::rebuildNow() {
       }
       const QString key = makeObjectTopicKey(dataset_id, object_topic_id);
       if (removed_names_for_dataset != nullptr && removed_names_for_dataset->count(key) > 0) {
-        // Honor the per-dataset removal blacklist for object topics too.
-        // Without this, dropping an image topic into the trash would silently
-        // come back on the next rebuildFromDatastore.
+        // Honor the per-dataset removal blacklist for object topics too, or a trashed image topic would come back on
+        // the next rebuildFromDatastore.
         continue;
       }
       next_items.insert_or_assign(
@@ -1067,9 +1025,7 @@ void CatalogModel::rebuildNow() {
       if (impl_->removed_datasets.count(dataset_id) > 0) {
         continue;
       }
-      const auto dataset_label_it = dataset_labels.find(dataset_id);
-      const QString dataset_label =
-          dataset_label_it != dataset_labels.end() ? dataset_label_it->second : effective_base_label(dataset_id);
+      const QString dataset_label = QString::fromStdString(engine.datasetLabel(dataset_id));
       const Impl::NameSet* removed_names_for_dataset = nullptr;
       if (const auto it = impl_->removed_names_per_dataset.find(dataset_id);
           it != impl_->removed_names_per_dataset.end()) {
@@ -1152,11 +1108,6 @@ void CatalogModel::clearAll(bool tombstone) {
   impl_->removed_names_per_dataset.clear();
   impl_->advertised.clear();
   impl_->per_topic_pause_capable_datasets.clear();
-  // Only a REAL delete (tombstone=false) drops the display-name overrides: a
-  // tombstoning clear keeps them so restoreDataset() re-applies the plugin name.
-  if (!tombstone) {
-    impl_->dataset_display_overrides.clear();
-  }
   emit cleared();
 }
 
@@ -1178,18 +1129,14 @@ void CatalogModel::restoreDataset(DatasetId dataset_id) {
 }
 
 void CatalogModel::setDatasetDisplayName(DatasetId dataset_id, const QString& display_name) {
-  if (display_name.isEmpty()) {
-    if (impl_->dataset_display_overrides.erase(dataset_id) > 0) {
-      rebuildFromDatastore();
-    }
+  if (impl_->session == nullptr) {
     return;
   }
-  const auto it = impl_->dataset_display_overrides.find(dataset_id);
-  if (it != impl_->dataset_display_overrides.end() && it->second == display_name) {
-    return;
+  DataEngine& engine = impl_->session->dataEngine();
+  const std::string before = engine.datasetLabel(dataset_id);
+  if (engine.setDatasetLabel(dataset_id, display_name.toStdString()) != before) {
+    rebuildFromDatastore();
   }
-  impl_->dataset_display_overrides.insert_or_assign(dataset_id, display_name);
-  rebuildFromDatastore();
 }
 
 void CatalogModel::setAdvertisedTopics(DatasetId dataset_id, const std::vector<AdvertisedTopic>& topics) {
@@ -1301,13 +1248,6 @@ bool CatalogModel::removeDataset(DatasetId dataset_id, bool tombstone) {
     impl_->removed_datasets.insert(dataset_id);
   }
   impl_->removed_names_per_dataset.erase(dataset_id);
-  // Drop the plugin-provided display-name override only on a REAL delete
-  // (tombstone=false); a tombstoning remove keeps it so restoreDataset()
-  // re-applies the name. Erasing on real delete avoids leaving stale overrides
-  // to accumulate (a latent hazard for the duplicate-label ordinal).
-  if (!tombstone) {
-    impl_->dataset_display_overrides.erase(dataset_id);
-  }
   for (const QString& key : keys) {
     impl_->items.erase(key);
   }

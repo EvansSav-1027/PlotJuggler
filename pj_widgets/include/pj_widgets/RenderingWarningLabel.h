@@ -8,9 +8,12 @@ class QWidget;
 
 namespace PJ {
 
-/// A hidden, word-wrapped label in the application theme's warning colours, for
-/// the reason a GPU view cannot render. The caller places it and toggles it. The
-/// theme is read once, here.
+/// A hidden, word-wrapped label in the theme's warning colours, for the reason a GPU view cannot render. The caller
+/// places and toggles it; the theme is read when it is styled (here and in setRenderingWarningSubtle()).
 [[nodiscard]] QLabel* createRenderingWarningLabel(QWidget* parent, const QString& object_name);
+
+/// Restyles a label from createRenderingWarningLabel(): `subtle` is a small, muted, single-line note on the HUD veil
+/// for a reduced-quality mode the user can keep working in (software rendering); otherwise the word-wrapped banner.
+void setRenderingWarningSubtle(QLabel* label, bool subtle);
 
 }  // namespace PJ

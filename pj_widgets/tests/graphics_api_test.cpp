@@ -27,6 +27,27 @@ TEST(GraphicsApiTest, RejectsUnknownNames) {
   EXPECT_EQ(parseGraphicsApi(QStringLiteral("null")), std::nullopt);
 }
 
+// The renderer strings as the drivers report them (CI runners, the browsers' unmasked WebGL renderer).
+TEST(GraphicsApiTest, NamesTheSoftwareRasterizers) {
+  EXPECT_EQ(
+      PJ::softwareRasterizerName("Mesa llvmpipe (LLVM 21.1.8, 256 bits) 4.5 (Compatibility Profile) Mesa 26.0.3"),
+      "llvmpipe");
+  EXPECT_EQ(PJ::softwareRasterizerName("llvmpipe (LLVM 15.0.7, 256 bits)"), "llvmpipe");
+  EXPECT_EQ(
+      PJ::softwareRasterizerName(
+          "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), "
+          "SwiftShader driver)"),
+      "SwiftShader");
+  EXPECT_EQ(PJ::softwareRasterizerName("Google SwiftShader"), "SwiftShader");
+  EXPECT_EQ(PJ::softwareRasterizerName("Microsoft Basic Render Driver"), "WARP");
+  EXPECT_EQ(PJ::softwareRasterizerName("Apple Software Renderer"), "Apple Software Renderer");
+  EXPECT_EQ(
+      PJ::softwareRasterizerName("Intel Intel(R) Iris(R) Xe Graphics (TGL GT2) 4.6 (Core Profile) Mesa 26.0.3"), "");
+  EXPECT_EQ(PJ::softwareRasterizerName("ANGLE (Intel, Mesa Intel(R) Iris(R) Xe Graphics (TGL GT2), OpenGL 4.6)"), "");
+  EXPECT_EQ(PJ::softwareRasterizerName("Apple M2"), "");
+  EXPECT_EQ(PJ::softwareRasterizerName(""), "");
+}
+
 TEST(GraphicsApiTest, EachPlatformUsesItsNativeApi) {
   EXPECT_EQ(nativeGraphicsApi(GraphicsPlatform::Windows), Api::Direct3D11);
   EXPECT_EQ(nativeGraphicsApi(GraphicsPlatform::MacOS), Api::Metal);
@@ -69,8 +90,8 @@ TEST(GraphicsApiTest, AnOverrideThatCannotStartFallsBackToTheBuildPolicy) {
       << static_cast<int>(preferred);
 }
 
-// A static upload issued in pieces lands in the buffer exactly as one upload
-// would, on either side of the 64 KiB split, with an offset.
+// A static upload issued in pieces lands in the buffer exactly as one upload would, on either side of the 64 KiB split,
+// with an offset.
 TEST(GraphicsApiTest, UploadStaticBufferInPiecesWritesEveryByte) {
   QRhiNullInitParams params;
   std::unique_ptr<QRhi> rhi(QRhi::create(QRhi::Null, &params));

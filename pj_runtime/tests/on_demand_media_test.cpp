@@ -1,10 +1,9 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 
-// Media for on-demand recipes (docs/archive/derived_objects/SCENARIOS.md, rows MED-01..04, MED-06..10, MED-21,
-// GAP-26): the real Luau run through OnDemandService, the decoder the session is given, and the annotations' pairing
-// as stored.
-// A raw-only fake stands in for the codec, which pj_app owns (its tests: pj_app/tests/scene_image_decoder_test.cpp).
+// Media for on-demand recipes: the real Luau run through OnDemandService, the decoder the session is given, and the
+// annotations' pairing as stored. A raw-only fake stands in for the codec, which pj_app owns (its tests:
+// pj_app/tests/scene_image_decoder_test.cpp).
 
 #include <gtest/gtest.h>
 
@@ -82,9 +81,8 @@ class RawDecoder final : public scripting::IImageDecoder {
   }
 };
 
-/// One dataset "log" whose object topics carry their builtin type in their metadata, the scalar series
-/// `threshold`, and an on-demand service running the real Luau engine with `decoder` injected. An input may be
-/// qualified "log:<topic>".
+/// One dataset "log" whose object topics carry their builtin type in their metadata, the scalar series `threshold`, and
+/// an on-demand service running the real Luau engine with `decoder` injected. An input may be qualified "log:<topic>".
 struct Fixture {
   Fixture() {
     dataset = engine.createDataset(DatasetDescriptor{.source_name = "log"}).value();
@@ -172,7 +170,7 @@ sdk::DepthImage depthImage(uint32_t width, const std::vector<uint16_t>& samples,
   return depth;
 }
 
-// ---- pairing as published (MED-01, MED-02, MED-03, MED-06, MED-08) ------------------------------------------
+// ---- pairing as published ------------------------------------------
 
 TEST(OnDemandMediaTest, CanonicalDepthDecodePreservesPairingAndPayloadTime) {
   Fixture fx;
@@ -186,7 +184,7 @@ TEST(OnDemandMediaTest, CanonicalDepthDecodePreservesPairingAndPayloadTime) {
   EXPECT_EQ(fx.decoder->calls, 1);  // one decode per input and run
   const auto annotations = test::decodeAt<sdk::ImageAnnotations>(fx.store, fx.output("pair"), 7 * kSec);
   EXPECT_EQ(annotations.image_topic, "depth");
-  EXPECT_EQ(annotations.timestamp, 3 * kSec);
+  EXPECT_EQ(annotations.timestamp_ns, 3 * kSec);
   ASSERT_EQ(annotations.points.size(), 1u);
   EXPECT_EQ(annotations.points[0].points.size(), 1u);
 }
@@ -210,7 +208,7 @@ TEST(OnDemandMediaTest, DatasetQualifiedImageInputAnnotatesWithTheStoreTopicName
     SCOPED_TRACE(index);
     const auto annotations = test::decodeAt<sdk::ImageAnnotations>(fx.store, fx.output("qualified", index), 7 * kSec);
     EXPECT_EQ(annotations.image_topic, "depth");
-    EXPECT_EQ(annotations.timestamp, 3 * kSec);
+    EXPECT_EQ(annotations.timestamp_ns, 3 * kSec);
   }
 }
 
@@ -241,7 +239,7 @@ TEST(OnDemandMediaTest, ImageAnnotationsOutputIsStampedAndMarkedSnapshot) {
     const auto annotations = test::decodeAt<sdk::ImageAnnotations>(fx.store, topic, 20 * kSec);
     // Paired with the image: its topic and its time, not the newer scalar's; no image input: the result's stamp.
     EXPECT_EQ(annotations.image_topic, index == 2 ? "/cam" : "depth");
-    EXPECT_EQ(annotations.timestamp, index == 2 ? 15 * kSec : 10 * kSec);
+    EXPECT_EQ(annotations.timestamp_ns, index == 2 ? 15 * kSec : 10 * kSec);
   }
 }
 
@@ -256,7 +254,7 @@ TEST(OnDemandMediaTest, AnEvaluationDecodesAndPairsLikeARequest) {
       test::onDemandRecipe("eval", {"depth", "threshold"}, {spec("width:number"), spec("stamp:number")});
   recipe.script = R"(local inputs = ...
     local other = pj.annotations.new{image_topic = "/cam"}:finish()
-    return {width = inputs.depth:decode().width, stamp = other.timestamp:to_number()})";
+    return {width = inputs.depth:decode().width, stamp = other.timestamp_ns:to_number()})";
   ASSERT_TRUE(fx.service->install(recipe).has_value());
   std::optional<GridRunner::Report> report;
   const auto job = fx.service->evaluations().submit(
@@ -309,7 +307,7 @@ TEST(OnDemandMediaTest, TheSessionDecodesThroughTheDecoderItIsGiven) {
   EXPECT_EQ(annotations.image_topic, "depth");
 }
 
-// ---- depth through a camera (MED-09) ---------------------------------------------------------------------------
+// ---- depth through a camera ---------------------------------------------------------------------------
 
 TEST(OnDemandMediaTest, DepthRecipeUnprojectsThroughTheCamera) {
   Fixture fx;
@@ -344,11 +342,11 @@ TEST(OnDemandMediaTest, CanonicalDepthThresholdKeepsPairing) {
       "local inputs = ...; return {overlay = inputs.depth:decode():threshold('>', 500)}", 100);
   const auto annotations = test::decodeAt<sdk::ImageAnnotations>(fx.store, fx.output("pair"), 100);
   EXPECT_EQ(annotations.image_topic, "depth");
-  EXPECT_EQ(annotations.timestamp, 123);
+  EXPECT_EQ(annotations.timestamp_ns, 123);
   ASSERT_EQ(annotations.points.size(), 1u);
 }
 
-// ---- video (MED-04, MED-07) -------------------------------------------------------------------------------------
+// ---- video -------------------------------------------------------------------------------------
 
 /// A video over the fixture's store: the frame at `t` is its newest entry at or before `t`, presented at that entry's
 /// stamp, one rgb8 pixel. Counts its calls (any thread); with `hold` set, the next call waits in it for `resume`.
@@ -421,7 +419,7 @@ void settle(Fixture& fx, const std::string& key, Timestamp t) {
 
 // A bound video's content revision joins the request's key: `frame_at` may read any packet of the topic, so a packet
 // added anywhere is a miss, and a cursor that stays on the same entries under the same content is a hit. A script
-// that reads the clock is keyed by the instant, as any other (ARCHITECTURE §10).
+// that reads the clock is keyed by the instant, as any other (docs/derived_objects/ARCHITECTURE.md "Cache identity").
 TEST(OnDemandMediaTest, VideoContentRevisionJoinsTheCacheKey) {
   Fixture fx;
   auto video = std::make_shared<StoreVideo>(fx.store);
@@ -449,10 +447,10 @@ TEST(OnDemandMediaTest, VideoContentRevisionJoinsTheCacheKey) {
   ASSERT_EQ(overlay.texts.size(), 1u);
   EXPECT_EQ(overlay.texts[0].text, std::to_string(10 * kSec));
   EXPECT_EQ(overlay.image_topic, "video");
-  EXPECT_EQ(overlay.timestamp, 10 * kSec) << "paired with the frame's presentation time";
+  EXPECT_EQ(overlay.timestamp_ns, 10 * kSec) << "paired with the frame's presentation time";
 }
 
-// The frame a run looks up joins its identity through the content (D30: a changed dependency is a miss, never an
+// The frame a run looks up joins its identity through the content (a changed dependency is a miss, never an
 // error): a future frame appearing republishes the overlay, and one appearing while the run decodes makes the run's
 // completion serve the request again.
 TEST(OnDemandMediaCacheTest, ActualVideoQueriesInvalidateCacheAndRepublishObjects) {
@@ -477,7 +475,7 @@ TEST(OnDemandMediaCacheTest, ActualVideoQueriesInvalidateCacheAndRepublishObject
   const auto republished = test::decodeAt<sdk::ImageAnnotations>(fx.store, fx.output("ahead"), 10 * kSec);
   ASSERT_EQ(republished.texts.size(), 1u);
   EXPECT_EQ(republished.texts[0].text, std::to_string(20 * kSec));
-  EXPECT_EQ(republished.timestamp, 20 * kSec);
+  EXPECT_EQ(republished.timestamp_ns, 20 * kSec);
 
   fx.push(topic, 15 * kSec, videoPacket(15 * kSec));
   video->hold = true;
@@ -489,7 +487,7 @@ TEST(OnDemandMediaCacheTest, ActualVideoQueriesInvalidateCacheAndRepublishObject
     fx.pool.waitIdle();
     QCoreApplication::processEvents();
   }
-  EXPECT_EQ(video->calls, 3) << "a packet arriving during the run does not supersede it (D30): it is shown";
+  EXPECT_EQ(video->calls, 3) << "a packet arriving during the run does not supersede it: it is shown";
   const auto state = fx.service->state(recipe.key());
   ASSERT_TRUE(state && state->status == NodeScheduler::NodeState::Status::kReady) << (state ? state->detail : "");
   settle(fx, recipe.key(), 10 * kSec);
@@ -556,7 +554,7 @@ TEST(OnDemandMediaTest, AnEvaluationReadsVideoFramesLikeARequest) {
 }
 
 // The shell gives the session its video source (pj_app's SceneVideoFrameSource); the session retires a dataset in it
-// before the dataset's storage changes, so no decoder outlives the packets it indexed (CON-13).
+// before the dataset's storage changes, so no decoder outlives the packets it indexed.
 TEST(OnDemandMediaTest, TheSessionDecodesVideoThroughItsSourceAndRetiresADatasetBeforeItsStorageChanges) {
   SessionManager session;
   auto video = std::make_shared<StoreVideo>(session.objectStore());
@@ -583,7 +581,7 @@ TEST(OnDemandMediaTest, TheSessionDecodesVideoThroughItsSourceAndRetiresADataset
 // ---- benchmarks -----------------------------------------------------------------------------------------------
 
 // PJ_BENCH=1: the GUI-thread cost of requesting a recipe that decodes and thresholds a 1080p image (µs, median of 51
-// cold requests). The decode runs on a worker, so the GUI cost does not depend on the image's size or codec (GAP-26);
+// cold requests). The decode runs on a worker, so the GUI cost does not depend on the image's size or codec;
 // the fake decodes raw rgb8, and pj_app's SceneImageDecoderBench measures the real codec.
 TEST(OnDemandMediaBench, GuiCostOfA1080pImageRequest) {
   if (!PJ::sdk::getEnv("PJ_BENCH")) {

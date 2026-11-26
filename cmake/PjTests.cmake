@@ -23,9 +23,8 @@ function(pj_add_test_runner target)
     # PROPERTIES: extra ctest properties for every discovered case (DISABLED, ENVIRONMENT, ...).
     set(multiValueArgs SOURCES LIBS DEFINES PROPERTIES)
     cmake_parse_arguments(R "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
-    # plain = no Qt at all. It exists because core was previously the floor, so a
-    # module with no Qt in any of its test sources still linked Qt6::Core purely to
-    # satisfy this parameter. Pick the least the runner actually needs.
+    # plain = no Qt at all, so a module with no Qt in any of its test sources does not
+    # link Qt6::Core. Pick the least the runner actually needs.
     if(NOT R_MAIN MATCHES "^(plain|core|gui)$")
         message(FATAL_ERROR "pj_add_test_runner(${target}): MAIN must be plain, core or gui")
     endif()
@@ -41,6 +40,17 @@ function(pj_add_test_runner target)
 
     add_executable(${target} ${R_SOURCES} "${PJ_TEST_MAINS_DIR}/pj_test_main_${R_MAIN}.cpp")
     target_link_libraries(${target} PRIVATE ${R_LIBS} GTest::gtest)
+    # backward-cpp's handler, as the app installs it: a crashing case prints its stack. Sanitizer lanes keep the
+    # sanitizer's own report, which this handler would replace. Not on Windows: gtest reports a crash there as an SEH
+    # exception itself, and the handler would change abort() and std::terminate for every case.
+    if(NOT EMSCRIPTEN AND NOT WIN32 AND NOT PJ_ENABLE_SANITIZERS AND NOT PJ_ENABLE_TSAN AND NOT PJ_ENABLE_MSAN)
+        if(NOT TARGET Backward::Backward)
+            find_package(Backward REQUIRED)
+        endif()
+        target_sources(${target} PRIVATE "${PJ_TEST_MAINS_DIR}/pj_test_crash_handler.cpp")
+        target_link_libraries(${target} PRIVATE Backward::Backward)
+        target_compile_definitions(${target} PRIVATE PJ_TEST_CRASH_HANDLER)
+    endif()
     # "plain" deliberately falls through linking no Qt target: an else() branch
     # here is what silently gave every runner a Qt dependency.
     set(lock)

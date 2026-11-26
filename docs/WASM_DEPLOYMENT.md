@@ -8,7 +8,9 @@ the packaged entrypoint then shows why on the page ("PlotJuggler cannot start:
 this page was not served over HTTPS." or "…is not cross-origin isolated.", with
 what the server must do) instead of loading the runtime. When the server does send
 the headers and the page still is not isolated, the browser itself cannot isolate
-it (an Android WebView, as in DuckDuckGo), and the page says to open another one. To serve the app from
+it (an Android WebView, as in DuckDuckGo), and the page says to open another one. The module is built with
+WebAssembly SIMD, so it needs Chrome or Edge 91, Firefox 89 or Safari 16.4 (iOS 16.4) or later; an older engine gets
+"PlotJuggler cannot start in this browser: it does not support WebAssembly SIMD." To serve the app from
 a robot together with its PlotJuggler Bridge, see
 [`WASM_HOSTING.md`](./WASM_HOSTING.md).
 
@@ -47,35 +49,63 @@ node scripts/package_wasm.mjs \
   --presets resources/wasm-presets
 ```
 
+The whole module, including fetched dependencies, compiles and links with
+`-fexceptions` (root `CMakeLists.txt`): Emscripten drops the catch blocks of any
+translation unit built without it, so do not set it per target. These are
+Emscripten's JavaScript-based exceptions; `-fwasm-exceptions` would need a Qt
+kit built with `wasm_exceptions`, which the official kit is not.
+
 A public deployment also publishes the source offer
 ([licence and source offer](#licence-of-the-browser-bundle-and-the-source-offer)):
 `node scripts/wasm_source_offer.mjs --links --output build-wasm/deploy/sources`.
 
+A version tag builds this package in WASM CI too, stamped with the tag's version and with its source offer, and
+the `wasm-release` job attaches it to the tag's GitHub Release as `PlotJuggler4-web-bundle.zip` once the Chromium
+suite has passed. The name carries no version, so `releases/latest/download/PlotJuggler4-web-bundle.zip` reaches the
+copy of the release GitHub marks as latest, once that job has finished. A manual run of WASM CI on a branch builds
+the same archive as its `wasm-release` artifact, without the Release upload. Unzipped, it deploys to any host that
+meets the [Required HTTP contract](#required-http-contract); `app.plotjuggler.io` is published by hand
+([packaging/web/README.md](../packaging/web/README.md)).
+
 `--presets` is optional: it deploys a preset tree (the repository's samples
-here) under `presets/`; see [Presets](#presets).
+here) under `presets/`; see [Presets](#presets). The `app.plotjuggler.io`
+package is built without it ([`packaging/web/README.md`](../packaging/web/README.md)).
 
 ### Built-in plugins
 
 The browser cannot `dlopen` extensions, so a fixed set of official plugins is
 compiled from a pinned `pj-official-plugins` commit (`cmake/PjWasmDependencies.cmake`)
-and registered statically by `pj_app/src/BuiltinPlugins.cpp`. Each has a
-`cmake/PjWasm<Name>.cmake` recipe and an option, all `ON` by default:
+and registered statically by `pj_app/src/BuiltinPlugins.cpp`. Each plugin describes
+its own WebAssembly build in a `wasm.cmake` next to its sources (the contract with this
+build is in that repository's `cmake/PjWasmPlugin.cmake`); `cmake/PjWasmOfficialPlugins.cmake`
+lists the plugins, creates one option per entry, all `ON` by default, and generates
+their registration (the Arrow family builds Apache Arrow C++ through `PjWasmArrowDependencies`):
 
 | Option | Plugin |
 |---|---|
 | `PJ_WASM_WITH_CSV` | `data_load_csv` |
 | `PJ_WASM_WITH_MCAP` | `data_load_mcap` |
+| `PJ_WASM_WITH_ULOG` | `data_load_ulog` (PX4 ULog) |
+| `PJ_WASM_WITH_PARQUET` | `data_load_parquet` (named non-UTC time zones stay unadjusted: the browser has no tz database) |
+| `PJ_WASM_WITH_CANDUMP` | `data_load_candump` (SocketCAN logs) |
+| `PJ_WASM_WITH_BLF` | `data_load_blf` (Vector BLF) |
+| `PJ_WASM_WITH_MF4` | `data_load_mf4` (ASAM MDF4) |
 | `PJ_WASM_WITH_3D_LOADER` | `data_load_3d` (PCD/PLY) |
 | `PJ_WASM_WITH_DUMMY_STREAM` | `data_stream_dummy` |
 | `PJ_WASM_WITH_PJ_BRIDGE` | `data_stream_pj_bridge` (over the browser's WebSocket) |
+| `PJ_WASM_WITH_FOXGLOVE_BRIDGE` | `data_stream_foxglove_bridge` (over the browser's WebSocket; a robot's `ws://` bridge needs TLS in front of it on an `https://` page) |
 | `PJ_WASM_WITH_ROS` | `parser_ros` |
 | `PJ_WASM_WITH_PROTOBUF` | `parser_protobuf` |
 | `PJ_WASM_WITH_JSON` | `parser_json` |
 | `PJ_WASM_WITH_DATA_TAMER` | `parser_data_tamer` |
+| `PJ_WASM_WITH_INFLUX` | `parser_influx` (InfluxDB line protocol) |
+| `PJ_WASM_WITH_NAVMAP` | `parser_navmap` |
+| `PJ_WASM_WITH_ARROW_PARSER` | `parser_arrow` (Arrow IPC) |
 | `PJ_WASM_WITH_TRANSFORM_EDITOR` | `toolbox_transform_editor` |
 | `PJ_WASM_WITH_QUATERNION` | `toolbox_quaternion` |
 | `PJ_WASM_WITH_FFT` | `toolbox_fft` |
-| `PJ_WASM_WITH_ANOMALY_DETECTOR` | `toolbox_anomaly_detector` (the host runs its rules) |
+| `PJ_WASM_WITH_DATA_EXPORTER` | `toolbox_data_exporter` (the exported files download from the browser) |
+| `PJ_WASM_WITH_ANOMALY_DETECTOR` | `toolbox_anomaly_detector`, the Marker Editor (the host runs its rules) |
 
 Visualization families are on by default too: `PJ_WASM_WITH_SCENE2D` (images,
 depth, annotations, and with `PJ_WASM_WITH_VIDEO` software H.264/HEVC/AV1 video
@@ -87,11 +117,23 @@ Bridge needs none of them: it connects with the browser's own WebSocket, so a pa
 served over HTTPS reaches only `wss://` bridges (mixed content), and the browser
 reports a failed connection without its cause. Its stream presets are described
 in [`WASM_PRESETS.md`](./WASM_PRESETS.md#streaming-sources). Adding another
-plugin needs a recipe, a link block in `pj_app/CMakeLists.txt` and a
-registration in `BuiltinPlugins.cpp`; its export macros must name an
-unqualified class (or use the `_NAMED` variants) so the static getter symbol is
-valid. Every new static archive also needs the symbol-collision audit described
-in the root `CLAUDE.md`.
+plugin is described in the "WebAssembly build" section of the
+[pj-official-plugins README](https://github.com/PlotJuggler/pj-official-plugins#webassembly-build):
+a `wasm.cmake` in its directory there, one line in `PJ_WASM_OFFICIAL_PLUGIN_DIRS`
+here, and a pin that contains it.
+
+The pin is moved by `.github/workflows/wasm-plugins-pin.yml`, daily at 05:17 UTC, one pull
+request at a time. `scripts/bump_wasm_plugins.sh` resolves the head of `pj-official-plugins`
+`main` to a full commit sha, takes the sha-256 of its codeload archive and rewrites the two pin
+lines; the PR from `bot/wasm-plugins-pin` lists the plugin commits it brings. A head that is
+not ahead of the pin is never proposed, and while a PR from that branch is open the workflow
+does nothing. A PR made with `GITHUB_TOKEN` gets no checks, so the workflow dispatches WASM CI
+on the branch and links the run in a PR comment: that run must be green before the PR is
+merged by hand. Closing the PR without merging lets the next run open one for the plugins head
+of that day. `gh workflow run wasm-plugins-pin.yml -f ref=<branch, tag or full sha>` pins
+another ref (the PR body says when it is not ahead of the pin); `scripts/bump_wasm_plugins.sh
+[<ref>]` edits the pin in a local tree. To build against a plugins checkout without changing
+the pin, configure with `-DFETCHCONTENT_SOURCE_DIR_PJ_OFFICIAL_PLUGINS=<path>`.
 
 The packaging command refuses missing, invalid, or single-threaded build
 outputs. To prevent a mistyped `--output` from deleting unrelated data, it
@@ -168,11 +210,12 @@ precompressed variants automatically.
 ### Third-party notices
 
 `plotjuggler4.wasm` links every library statically. `cmake/PjWasmNotices.cmake`
-writes `THIRD_PARTY_NOTICES.txt` beside `plotjuggler4.js` at configure time: one
+(on the helpers of `cmake/PjNotices.cmake`, which also writes the desktop
+notices: [packaging/README.md](../packaging/README.md#licences)) writes `THIRD_PARTY_NOTICES.txt` beside `plotjuggler4.js` at configure time: one
 section per library with its SPDX licence expression and its licence text,
 copied from its source (Qt's modules, plugins and bundled third-party code from
 the kit's SBOM, `sbom/*.spdx.json`, followed by the text of every standard
-licence they name, one file each in `cmake/wasm_notices/<SPDX id>.txt`; the
+licence they name, one file each in `cmake/notices/<SPDX id>.txt`; the
 configure fails, naming the id, when one is missing), and CPython's notices when
 Python is on.
 `package_wasm.mjs` refuses a build without the file. `npm run test:package`
@@ -181,9 +224,10 @@ WASM build has no `pj_wasm_notice()` entry. What that test cannot see is kept
 by hand in the same file: a Qt module or plugin added to the link
 (`_PJ_QT_NOTICE_PACKAGES`), a vendored directory or font, third-party code
 bundled inside a dependency (assimp's `contrib/`, the plugins' `contrib/`,
-rosx_introspection's `contrib/`), and the Emscripten runtime. The About dialog's
-"Third-party licences" link (browser build only) opens `THIRD_PARTY_NOTICES.txt`
-by that relative name, so the package serves a copy at the deployment root
+rosx_introspection's `contrib/`), and the Emscripten runtime. In the browser build the About
+dialog states the bundle's GPL-3.0 licence, and its "Third-party licences" and
+"Source code" links open `THIRD_PARTY_NOTICES.txt` and `sources/SOURCE-OFFER.txt`
+by those relative names, so the package serves a copy at the deployment root
 (`no-cache`), beside the immutable one in the bundle directory;
 `tests/wasm/package_wasm.test.mjs` fails if the link and the package disagree.
 
@@ -223,8 +267,8 @@ node scripts/wasm_source_offer.mjs --links --output build-wasm/deploy/sources   
 ```
 
 `--links`, the mode `app.plotjuggler.io` publishes with (`packaging/web/`),
-archives only PlotJuggler 4, whose repository is private, and gives every other
-part its public address: the URL and SHA-256 of a hashed pin, the commit and
+archives only PlotJuggler 4 and gives every other part its public address: the
+URL and SHA-256 of a hashed pin, the commit and
 GitHub tarball of a git pin, the Qt Advanced Docking System fork's commit. The
 GPL v3 accepts source on another server when the object code carries clear
 directions to it, as long as it stays available there: every address is
@@ -267,14 +311,14 @@ pointer in the notices keeps working.
 
 On-demand Python scripts run in the browser through a static CPython 3.14 for
 Emscripten with pthreads. The option is `ON` by default, in the production
-build too (derived-objects slice P-d); `-DPJ_WASM_WITH_PYTHON=OFF` builds the
+build too; `-DPJ_WASM_WITH_PYTHON=OFF` builds the
 app without it, and a recipe in Python then fails to restore with "python is
 not available in this build". WASM CI's functional suite runs
 `tests/wasm/python.spec.js` (the lane's limits, per-call cost and main-thread
 gaps) and `tests/wasm/python_layout.spec.js` (a layout's Python recipes
 restored into a 3D scene, a broken one showing its compile error) in Chromium
 and Firefox. Python filters stay unavailable in the browser; what else remains
-is in `docs/derived_objects/ARCHITECTURE.md` §14.
+is in [`derived_objects/ARCHITECTURE.md`](./derived_objects/ARCHITECTURE.md) "Scripting languages".
 
 `cmake/PjWasmPython.cmake` builds CPython at configure time, from the SHA-256
 pinned release tarball (its only download) and the files in
@@ -299,16 +343,27 @@ cmake ... -DPJ_WASM_WITH_PYTHON=ON -DPJ_WASM_PYTHON_CACHE_DIR="$HOME/.cache/pj-w
 
 What to know before changing it:
 
-- **Size budget.** It adds about 1.9 MB to the Brotli download (2026-10-21,
-  the acceptance configuration with and without it), about 12 % of the
-  production package's 16.13 MB. CI fails the production package above
-  16,932,000 B, 5 % over that measurement (`scripts/wasm_size_budget.mjs`; the
-  sample `presets/` are fetched on demand and not counted): an absolute budget,
-  since both configurations now carry Python and a delta would need a third
-  build. About 0.67 MB of it is the stdlib zip, stored uncompressed
-  so the package's Brotli compresses it with the module.
+- **Size budget.** At startup it adds the interpreter linked into the module,
+  about 1.2 MB of Brotli download (measured 2026-11-15: production package
+  15.19 MB with Python). CI fails the production package's Brotli download above
+  the budget `wasm-ci.yml` passes to `scripts/wasm_size_budget.mjs` (the sample
+  `presets/` are fetched on demand and not counted). The budget is absolute
+  because every configuration carries Python: a delta would need a third build.
+  The stdlib zip (0.67 MB Brotli, stored uncompressed so the
+  package's Brotli compresses it) is not part of it: it is a separate asset,
+  `python_stdlib.zip` in the content-addressed bundle beside the module, which
+  the first Python use downloads (a synchronous request on the Python worker,
+  `python_sandbox.cpp`) to `/lib/python314.zip` before the interpreter boots.
+  The budget leaves it out. A failed download (the network, an HTTP error,
+  a body that is not a zip; a 404 means the app was redeployed since the page
+  loaded, so it says to reload) fails that use with the reason and is not
+  kept by the script: uses within 10 s of the failure get the same error
+  without a new request (a playback re-runs scripts every frame), the first
+  use after downloads again, the same recipe included; a 404 is answered
+  without a request for the rest of the session. A validate meanwhile reports
+  the script unchecked, not invalid (`tests/wasm/python.spec.js`).
 - **The stdlib zip** holds only the modules that importing the roots in
-  `stdlib_zip.py` loads (68 of them). A module the stdlib imports
+  `stdlib_zip.py` loads. A module the stdlib imports
   lazily is missed unless a root names it, and even one in the zip cannot be
   imported inside a strict run, whose audit hook refuses the file open: the
   sandbox loads the ones a strict script reaches at boot
@@ -371,18 +426,39 @@ must answer them with `Access-Control-Allow-Origin` for the page.
 ## Browser-local state
 
 Uploaded files are staged in the page's temporary filesystem and receive opaque
-browser identities; they are not persisted across refreshes. Ordinary
-`QSettings` callers are likewise redirected to page-lifetime storage. The only
-durable browser state is the typed preference allowlist and a bounded list of
-source-free generic layout recipes owned by `BrowserPersistence`. Source-bound
-layouts are downloaded with logical references and require explicit file
-reselection when replayed. Paths, upload identities, plugin configuration, and
-credentials are intentionally excluded from browser-local persistence.
+browser identities; they are not persisted across refreshes. A file opened from
+the picker is read from disk on demand rather than copied, so its size is not
+bounded by the tab's memory; it must stay unchanged on disk while it is open
+(a changed file reports that its data may be incomplete, see
+[`pj_app/docs/ARCHITECTURE.md`](../pj_app/docs/ARCHITECTURE.md#browser-webassembly-boundary)). Ordinary
+`QSettings` callers are likewise redirected to page-lifetime storage; what
+`BrowserPersistence` keeps durable, and what never enters durable storage:
+[`pj_app/docs/ARCHITECTURE.md`](../pj_app/docs/ARCHITECTURE.md#persistence).
+Source-bound layouts are downloaded with logical references and require
+explicit file reselection when replayed.
+
+A source's plugin may also read files picked in its own dialog (a CAN
+dictionary, say). "Save Layout with Sources" saves each such *side file* like
+the data file: every string of the plugin configuration that is a staged
+file other than the data file is replaced by a logical name relative to the
+data file's directory, and listed as
+`<sideFile filename="…" content_sha256="…"/>` under the source's `<fileInfo>`.
+The name is the file's basename, or the first free `pj4-side/<n>/<basename>`
+when that is already the data file's name or a string of the configuration.
+One file staged twice (same name and fingerprint) is one side file. The data
+file's staging folder, if the configuration names it, is saved as an empty
+string. Any other staged path still refuses the save. On replay the page asks
+for every side file after the data files (same name rule as a data file; the
+fingerprint tells same-named files apart), and a layout opened by URL
+downloads each one resolved against its data file's URL, checked against its
+fingerprint like a data file. Every configuration string equal to a
+`filename` is then rewritten to the staged copy before the import. On the
+desktop the same rewrite points each `filename` at that name in the loaded
+data file's folder. `<sideFile>` is optional.
 
 A layout opened by URL (a preset) replays its `<fileInfo>` sources without a
-picker instead. Each `filename` resolves against the layout's URL — the browser
-reports the requested URL even after a redirect, so a preset must not rely on a
-redirect to another directory — and only http(s) references are fetched: a local
+picker instead. Each `filename` resolves against the URL the layout was served
+from, after any redirect, and only http(s) references are fetched: a local
 path or another scheme, like a local robot model reference, fails the load.
 Sources download one at a time, straight into their staged files (never through
 the WebAssembly heap), must match their recorded `content_sha256`, and may stage
@@ -420,15 +496,25 @@ together.
 - **Malformed index** (bad JSON, an entry without `id` or `layout`, a duplicate
   id, a reference that is not http(s)): the same, plus one console warning,
   `PJ_PRESET_INDEX_INVALID url=… reason=…`.
-- **Deep link:** `?preset=<id>` opens that preset directly, the dialog showing
-  its progress. An id the index does not list, the `preset` key given twice, or
+- **Deep link:** `?preset=<id>` opens that preset directly: the dialog shows
+  only its progress and Cancel, never the list, which appears only if the load
+  fails or is cancelled. An id the index does not list, the `preset` key given twice, or
   a deep link on a page without a usable index reports an error and loads
   nothing. Other query keys are ignored.
 
-The repository ships three samples in `resources/wasm-presets/` (a car's gyro
-through a built-in filter; an ANYmal walking a forest trail; a self-driving car
-with its camera and lidar; their recordings and models load from
-`https://assets.plotjuggler.io`), deployed with `--presets`. Preset files are served `no-cache`. How to author a preset,
+The repository ships six samples, listed by `resources/wasm-presets/index.json`
+and deployed with `--presets` (a car's gyro through a built-in filter; an ANYmal
+walking a forest trail; a car from PandaSet with its six cameras, lidar and 3D
+boxes; an office robot from LILocBench with its camera, depth cloud and laser
+scans on the floor map; a racing quadrotor from UZH-FPV with its fisheye and event
+cameras and its racing line; Pollen Robotics' Microduck biped walking and falling,
+with a formula that labels what it is doing as text). The welcome dialog lists the
+first three; the office robot, the racing drone and the biped are unlisted and open
+from their links, `?preset=lilocbench`, `?preset=uzhfpv` and `?preset=microduck`,
+which the website's examples page uses. Their layouts, thumbnails, recordings and models load from
+`https://assets.plotjuggler.io`. Preset files are served `no-cache`. `app.plotjuggler.io`
+does not package the index but serves an uploaded copy
+([`packaging/web/README.md`](../packaging/web/README.md#sample-index)). How to author a preset,
 what the packager refuses, and the hosting limits are in
 [`WASM_PRESETS.md`](./WASM_PRESETS.md).
 
@@ -456,7 +542,15 @@ npx playwright install chromium
 PJ_WASM_PACKAGE_DIR="$PWD/../../build-wasm/deploy" npm run test:deployment
 ```
 
-The deployment test expects a package built with `--presets`: it also checks
-every deployed preset file and that the page fetches `presets/index.json`.
+The deployment test checks that the page requests `presets/index.json`; on a
+package built with `--presets` it also checks every deployed preset file, and
+with `PJ_WASM_DEPLOYMENT_URL` (a published `app.plotjuggler.io` Worker) the
+Worker's index route.
 Its response checks (`tests/wasm/support/deployment_contract.js`) also run
 against Caddy with `docs/wasm/Caddyfile`, in `robot_deployment.spec.js`.
+
+## Deterministic browser fixtures
+
+A browser test fixture must reproduce both the bytes and the UI's product state, not only the data. The Timeline
+prefers scalar and object bounds, and extra TF samples do not widen it, so a Scene3D seek fixture needs at least two
+object-bound samples.

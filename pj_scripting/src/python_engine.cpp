@@ -19,9 +19,11 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "pj_scripting/sandbox.h"
+#include "python_object_binder.h"
 #include "python_sandbox.h"
 
 namespace py = pybind11;
@@ -37,27 +39,22 @@ std::string memoryMessage(const native::MemoryBudget& budget) {
   return "MemoryError: script memory limit (" + native::describeBytes(budget.limit()) + ") exceeded";
 }
 
-// The imports a filter script may reach. Data Processors compute over timeseries —
-// trigonometry, constants, basic statistics — so the filesystem, the network and
-// subprocesses are out of scope, and a script that reaches for them is told so
-// instead of receiving whatever error the module itself would have raised.
+// The imports a filter script may reach: filters compute over time series (trigonometry, constants, statistics), and a
+// script that reaches for the filesystem, the network or a subprocess is told so, not given the module's own error.
 //
-// NOT a security boundary. CPython cannot be sandboxed from within: an object-graph
-// walk reaches past any namespace we hand the script. This is a guardrail against
-// scope creep, and filter sources remain trusted input. `open` stays a builtin; the
-// shared audit hook (python_sandbox.h) refuses the call while a filter runs.
+// Not a security boundary: CPython cannot be confined from within, and an object-graph walk reaches past any
+// namespace handed to a script. Filter sources are trusted input. `open` stays a builtin; the shared audit hook
+// (python_sandbox.h) refuses the call while a filter runs.
 constexpr std::array<std::string_view, 3> kAllowedImports{"math", "cmath", "statistics"};
 
-// Only the root package is matched — "math.foo" is governed by the "math" entry, and
-// `from x import y` arrives here as an import of "x".
+// Only the root package is matched: "math.foo" follows the "math" entry, and `from x import y` arrives as "x".
 bool importAllowed(std::string_view module) {
   const std::string_view root = module.substr(0, module.find('.'));
   return std::find(kAllowedImports.begin(), kAllowedImports.end(), root) != kAllowedImports.end();
 }
 
-// A module namespace whose __builtins__ is the real one with __import__ swapped for
-// the allowlist gate. Allowed modules still import their own dependencies freely:
-// their bodies execute under their own globals, which carry unrestricted builtins.
+// A module namespace whose __builtins__ is the real one with __import__ swapped for the allowlist gate. Allowed modules
+// import their own dependencies freely: their bodies run under their own globals, with unrestricted builtins.
 py::dict makeFilterNamespace() {
   py::dict gated = py::module_::import("builtins").attr("__dict__").attr("copy")();
   py::object real_import = gated["__import__"];
@@ -123,8 +120,13 @@ std::string attrString(const py::object& obj, const char* name, const std::strin
 class PythonFilterInstance final : public FilterInstance {
  public:
   PythonFilterInstance(
-      py::dict ns, py::object instance, std::shared_ptr<native::MemoryBudget> memory, std::uint64_t call_millis)
-      : ns_(std::move(ns)), instance_(std::move(instance)), memory_(std::move(memory)), call_millis_(call_millis) {}
+      py::dict ns, py::object instance, std::shared_ptr<native::MemoryBudget> memory, std::uint64_t call_millis,
+      bool text_output)
+      : ns_(std::move(ns)),
+        instance_(std::move(instance)),
+        memory_(std::move(memory)),
+        call_millis_(call_millis),
+        text_output_(text_output) {}
 
   // Dropping the instance and the namespace runs the script's finalizers: under the scope, like any script call.
   ~PythonFilterInstance() override {
@@ -137,12 +139,12 @@ class PythonFilterInstance final : public FilterInstance {
   PythonFilterInstance(const PythonFilterInstance&) = delete;
   PythonFilterInstance& operator=(const PythonFilterInstance&) = delete;
 
-  Result calculate(double t, double v) override {
-    return guarded("calculate()", Result{true, 0.0, std::nullopt}, [&]() { return runCalculate(t, v); });
+  Result calculate(double t, const InputValue& v) override {
+    return guarded("calculate()", Result{true, 0.0, std::nullopt, {}}, [&]() { return runCalculate(t, v); });
   }
 
-  MimoResult calculateMimo(double t, PJ::Span<const double> inputs) override {
-    return guarded("calculate()", MimoResult{true, {}}, [&]() { return runCalculateMimo(t, inputs); });
+  MimoResult calculateMimo(double t, PJ::Span<const InputValue> inputs) override {
+    return guarded("calculate()", MimoResult{true, {}, {}}, [&]() { return runCalculateMimo(t, inputs); });
   }
 
   void reset() override {
@@ -185,63 +187,117 @@ class PythonFilterInstance final : public FilterInstance {
     return failed_ ? on_fail : out;
   }
 
-  /// The script calls proper, run by guarded(). A Python error fails the instance.
-  Result runCalculate(double t, double v) {
-    try {
-      py::object r = instance_.attr("calculate")(t, v);
-      if (r.is_none()) {
-        return Result{true, 0.0, std::nullopt};
+  /// One returned value of the kind the class declares: a str for a text class (a number is refused, so a forgotten
+  /// label is not stored as "3"), else a value pybind11 casts to double. False when it is not.
+  bool readValue(const py::handle& item, double& value, std::string& text) const {
+    if (text_output_) {
+      if (!py::isinstance<py::str>(item)) {
+        return false;
       }
-      // (out_time, value) when the script returns a 2-sequence; otherwise a scalar
-      // emitted at the input time (mirrors the Luau one/two-number convention).
+      text = item.cast<std::string>();
+      return true;
+    }
+    if (py::isinstance<py::str>(item)) {
+      return false;
+    }
+    value = item.cast<double>();
+    return true;
+  }
+
+  [[nodiscard]] const char* wrongKindMessage() const {
+    return text_output_ ? "calculate() must return a str per output (the class declares output = \"string\")"
+                        : "calculate() must return a number per output (declare output = \"string\" to return text)";
+  }
+
+  /// A float, or a str for text; bytes that are not UTF-8 decode with U+FFFD rather than failing the instance.
+  static py::object toPython(const InputValue& v) {
+    if (const auto* text = std::get_if<std::string_view>(&v)) {
+      return detail::checked(PyUnicode_DecodeUTF8(text->data(), static_cast<Py_ssize_t>(text->size()), "replace"));
+    }
+    return detail::checked(PyFloat_FromDouble(std::get<double>(v)));
+  }
+
+  /// The script calls proper, run by guarded(). A Python error fails the instance.
+  Result runCalculate(double t, const InputValue& v) {
+    try {
+      py::object r = instance_.attr("calculate")(t, toPython(v));
+      if (r.is_none()) {
+        return Result{true, 0.0, std::nullopt, {}};
+      }
+      // A 2-sequence is (out_time, value); a scalar is emitted at the input time, as in Luau.
+      Result out{false, 0.0, std::nullopt, {}};
+      py::object value = r;
       if (py::isinstance<py::tuple>(r) || py::isinstance<py::list>(r)) {
         auto seq = r.cast<py::sequence>();
         if (seq.size() == 2) {
-          return Result{false, seq[1].cast<double>(), seq[0].cast<double>()};
+          out.out_time = seq[0].cast<double>();
+          value = seq[1];
+        } else if (seq.size() == 1) {
+          value = seq[0];
+        } else {
+          fail("calculate() returned a sequence of unexpected length (want 1 or 2)");
+          return Result{true, 0.0, std::nullopt, {}};
         }
-        if (seq.size() == 1) {
-          return Result{false, seq[0].cast<double>(), std::nullopt};
-        }
-        fail("calculate() returned a sequence of unexpected length (want 1 or 2)");
-        return Result{true, 0.0, std::nullopt};
       }
-      return Result{false, r.cast<double>(), std::nullopt};
-    } catch (const py::error_already_set& e) {
-      fail(e.what());
-      return Result{true, 0.0, std::nullopt};
-    } catch (const std::exception& e) {
-      fail(e.what());
-      return Result{true, 0.0, std::nullopt};
-    }
-  }
-
-  MimoResult runCalculateMimo(double t, PJ::Span<const double> inputs) {
-    try {
-      py::list args;
-      for (std::size_t i = 1; i < inputs.size(); ++i) {
-        args.append(inputs[i]);
-      }
-      const double primary = inputs.empty() ? 0.0 : inputs[0];
-      py::object r = instance_.attr("calculate")(t, primary, *py::tuple(args));
-      if (r.is_none()) {
-        return MimoResult{true, {}};
-      }
-      MimoResult out;
-      out.suppress = false;
-      if (py::isinstance<py::tuple>(r) || py::isinstance<py::list>(r)) {
-        for (auto item : r.cast<py::sequence>()) {
-          out.values.push_back(py::reinterpret_borrow<py::object>(item).cast<double>());
-        }
-      } else {
-        out.values.push_back(r.cast<double>());
+      if (!readValue(value, out.value, out.text)) {
+        fail(wrongKindMessage());
+        return Result{true, 0.0, std::nullopt, {}};
       }
       return out;
     } catch (const py::error_already_set& e) {
       fail(e.what());
-      return MimoResult{true, {}};
+      return Result{true, 0.0, std::nullopt, {}};
     } catch (const std::exception& e) {
       fail(e.what());
-      return MimoResult{true, {}};
+      return Result{true, 0.0, std::nullopt, {}};
+    }
+  }
+
+  MimoResult runCalculateMimo(double t, PJ::Span<const InputValue> inputs) {
+    try {
+      py::list args;
+      for (std::size_t i = 1; i < inputs.size(); ++i) {
+        args.append(toPython(inputs[i]));
+      }
+      const py::object primary = toPython(inputs.empty() ? InputValue{0.0} : inputs[0]);
+      py::object r = instance_.attr("calculate")(t, primary, *py::tuple(args));
+      if (r.is_none()) {
+        return MimoResult{true, {}, {}};
+      }
+      MimoResult out;
+      out.suppress = false;
+      const auto take = [&](const py::handle& item) {
+        double value = 0.0;
+        std::string text;
+        if (!readValue(item, value, text)) {
+          return false;
+        }
+        if (text_output_) {
+          out.texts.push_back(std::move(text));
+        } else {
+          out.values.push_back(value);
+        }
+        return true;
+      };
+      bool ok = true;
+      if (py::isinstance<py::tuple>(r) || py::isinstance<py::list>(r)) {
+        for (auto item : r.cast<py::sequence>()) {
+          ok = ok && take(item);
+        }
+      } else {
+        ok = take(r);
+      }
+      if (!ok) {
+        fail(wrongKindMessage());
+        return MimoResult{true, {}, {}};
+      }
+      return out;
+    } catch (const py::error_already_set& e) {
+      fail(e.what());
+      return MimoResult{true, {}, {}};
+    } catch (const std::exception& e) {
+      fail(e.what());
+      return MimoResult{true, {}, {}};
     }
   }
 
@@ -254,6 +310,7 @@ class PythonFilterInstance final : public FilterInstance {
   py::object instance_;
   std::shared_ptr<native::MemoryBudget> memory_;  // this instance's live bytes, across calls
   std::uint64_t call_millis_;
+  bool text_output_;  ///< the class declares output = "string"
   bool failed_ = false;
   std::string error_;
 };
@@ -297,7 +354,7 @@ class PythonEngine final : public ScriptEngine {
     }
     auto memory = std::make_shared<native::MemoryBudget>(limits_.mem_bytes);  // the instance's, for its whole life
     ScriptCallScope scope(memory, limits_.python_watchdog_millis, detail::Profile::kCompatible);
-    Expected<std::unique_ptr<FilterInstance>> out = create(*code, params_json, memory);
+    Expected<std::unique_ptr<FilterInstance>> out = create(*code, params_json, memory, klass.textOutput());
     const bool timed_out = scope.timedOut();
     if (scope.overBudget()) {
       return PJ::unexpected(memoryMessage(*memory));
@@ -340,7 +397,8 @@ class PythonEngine final : public ScriptEngine {
   }
 
   Expected<std::unique_ptr<FilterInstance>> create(
-      const py::object& code, const std::string& params_json, std::shared_ptr<native::MemoryBudget> memory) const {
+      const py::object& code, const std::string& params_json, std::shared_ptr<native::MemoryBudget> memory,
+      bool text_output) const {
     try {
       py::dict nsd = makeFilterNamespace();
       detail::ClearedOnExit cleared(nsd);
@@ -364,7 +422,7 @@ class PythonEngine final : public ScriptEngine {
       }
       cleared.release();
       return std::unique_ptr<FilterInstance>(std::make_unique<PythonFilterInstance>(
-          std::move(nsd), std::move(instance), std::move(memory), limits_.python_call_millis));
+          std::move(nsd), std::move(instance), std::move(memory), limits_.python_call_millis, text_output));
     } catch (const std::exception& e) {
       return PJ::unexpected(std::string("Python error: ") + detail::pythonErrorText(e));
     }

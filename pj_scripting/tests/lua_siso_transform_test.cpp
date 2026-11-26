@@ -8,9 +8,11 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
 #include <variant>
+#include <vector>
 
-#include "pj_datastore/processor_detail.hpp"  // proc::detail::toDouble
+#include "pj_scripting/lua_mimo_transform.h"
 #include "pj_scripting/script_engine.h"
 
 using namespace PJ::scripting;
@@ -62,7 +64,7 @@ FilterClass loadDerivative(const std::shared_ptr<ScriptEngine>& engine) {
 }
 
 double dbl(const Sample& s) {
-  return PJ::proc::detail::toDouble(s.value());
+  return std::get<double>(s.value());
 }
 
 }  // namespace
@@ -137,9 +139,8 @@ TEST(LuaSisoTransform, BadScriptStartsFailed) {
   EXPECT_FALSE(xf.calculateNextPoint(Sample::scalar(0, PJ::VarValue{1.0})).has_value());
 }
 
-// [d] output_kind="same" on a uint64 column must not clamp the upper half of the domain to
-// INT64_MAX. A pass-through filter on a uint64 value above 2^63 must stay above 2^63 (the old
-// code routed it through toInt64 and the signed clamp lost everything past INT64_MAX).
+// output_kind="same" on a uint64 column must not clamp the upper half of the domain to INT64_MAX: a pass-through
+// filter keeps a value above 2^63 above 2^63.
 TEST(LuaSisoTransform, MirrorUint64DoesNotClampUpperHalf) {
   auto engine = makeLuauEngine();
   auto classes = engine->inspectModule(kIdentitySame, "test");
@@ -152,4 +153,98 @@ TEST(LuaSisoTransform, MirrorUint64DoesNotClampUpperHalf) {
   ASSERT_TRUE(std::holds_alternative<std::uint64_t>(out->value()));
   EXPECT_GT(
       std::get<std::uint64_t>(out->value()), static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()));
+}
+
+// `output = "string"` makes a text column: the label is the sample value, nil still skips the sample.
+TEST(LuaSisoTransform, StringOutputEmitsTextSamples) {
+  constexpr const char* kState = R"LUAU(
+    return { id="state", name="State", output="string",
+      create = function(p) return { calculate = function(t, v)
+        if v == 0 then return nil end
+        return v > 0 and "walking" or "falling"
+      end } end }
+  )LUAU";
+  auto engine = makeLuauEngine();
+  auto classes = engine->inspectModule(kState, "test");
+  ASSERT_TRUE(classes.has_value()) << classes.error();
+  LuaSisoTransform xf(engine, classes->front(), "{}");
+  const PJ::StorageKind in = PJ::StorageKind::kFloat64;
+  EXPECT_EQ(
+      xf.outputKinds(PJ::Span<const PJ::StorageKind>(&in, 1)),
+      (std::vector<PJ::StorageKind>{PJ::StorageKind::kString}));
+
+  auto walking = xf.calculateNextPoint(Sample::scalar(0, PJ::VarValue{1.0}));
+  ASSERT_TRUE(walking.has_value());
+  ASSERT_TRUE(std::holds_alternative<std::string>(walking->value()));
+  EXPECT_EQ(std::get<std::string>(walking->value()), "walking");
+  auto falling = xf.calculateNextPoint(Sample::scalar(1'000'000'000LL, PJ::VarValue{-1.0}));
+  ASSERT_TRUE(falling.has_value());
+  EXPECT_EQ(std::get<std::string>(falling->value()), "falling");
+  EXPECT_FALSE(xf.calculateNextPoint(Sample::scalar(2'000'000'000LL, PJ::VarValue{0.0})).has_value());
+  EXPECT_FALSE(xf.failed());
+}
+
+// A text input reaches the script as a string, so a formula can compare it with a label.
+TEST(LuaSisoTransform, TextInputReachesTheScriptAsAString) {
+  constexpr const char* kIsWalking = R"LUAU(
+    return { id="is_walking", name="IsWalking",
+      create = function(p) return { calculate = function(t, v)
+        if type(v) ~= "string" then return -1 end
+        if v == "walking" then return 1 else return 0 end
+      end } end }
+  )LUAU";
+  auto engine = makeLuauEngine();
+  auto classes = engine->inspectModule(kIsWalking, "test");
+  ASSERT_TRUE(classes.has_value()) << classes.error();
+  LuaSisoTransform xf(engine, classes->front(), "{}");
+
+  auto walking = xf.calculateNextPoint(Sample::scalar(0, PJ::VarValue{std::string("walking")}));
+  ASSERT_TRUE(walking.has_value()) << xf.error();
+  EXPECT_DOUBLE_EQ(dbl(*walking), 1.0);
+  auto falling = xf.calculateNextPoint(Sample::scalar(1'000'000'000LL, PJ::VarValue{std::string("falling")}));
+  ASSERT_TRUE(falling.has_value()) << xf.error();
+  EXPECT_DOUBLE_EQ(dbl(*falling), 0.0);
+  EXPECT_FALSE(xf.failed());
+}
+
+// Arithmetic on a text input is a script error that names the string, never a silent 0.
+TEST(LuaSisoTransform, ArithmeticOnTextFailsNamingTheString) {
+  constexpr const char* kDouble = R"LUAU(
+    return { id="twice", name="Twice",
+      create = function(p) return { calculate = function(t, v) return v * 2 end } end }
+  )LUAU";
+  auto engine = makeLuauEngine();
+  auto classes = engine->inspectModule(kDouble, "test");
+  ASSERT_TRUE(classes.has_value()) << classes.error();
+  LuaSisoTransform xf(engine, classes->front(), "{}");
+
+  EXPECT_FALSE(xf.calculateNextPoint(Sample::scalar(0, PJ::VarValue{std::string("walking")})).has_value());
+  EXPECT_TRUE(xf.failed());
+  EXPECT_NE(xf.error().find("arithmetic"), std::string::npos) << xf.error();
+  EXPECT_NE(xf.error().find("string"), std::string::npos) << xf.error();
+}
+
+// A MIMO formula sees each input with its own kind: an integer widens to a number, text stays a string.
+TEST(LuaMimoTransform, MixedNumberAndTextInputsKeepTheirKinds) {
+  constexpr const char* kGate = R"LUAU(
+    return { id="gate", name="Gate",
+      create = function(p) return { calculate = function(t, speed, state)
+        if type(speed) ~= "number" or type(state) ~= "string" then return -1 end
+        if state == "walking" then return speed else return 0 end
+      end } end }
+  )LUAU";
+  auto engine = makeLuauEngine();
+  auto classes = engine->inspectModule(kGate, "test");
+  ASSERT_TRUE(classes.has_value()) << classes.error();
+  LuaMimoTransform xf(engine, classes->front(), "{}", 1);
+
+  std::vector<PJ::VarValue> output(1);
+  PJ::Timestamp out_time = 0;
+  const std::vector<PJ::VarValue> walking{PJ::VarValue{2.5}, PJ::VarValue{std::string("walking")}};
+  ASSERT_TRUE(xf.calculate(0, PJ::Span<const PJ::VarValue>(walking), out_time, output)) << xf.error();
+  EXPECT_DOUBLE_EQ(std::get<double>(output[0]), 2.5);
+  const std::vector<PJ::VarValue> falling{PJ::VarValue{std::int64_t{7}}, PJ::VarValue{std::string("falling")}};
+  ASSERT_TRUE(xf.calculate(1, PJ::Span<const PJ::VarValue>(falling), out_time, output)) << xf.error();
+  EXPECT_DOUBLE_EQ(std::get<double>(output[0]), 0.0);
+  EXPECT_FALSE(xf.failed());
 }

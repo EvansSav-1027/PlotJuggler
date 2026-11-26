@@ -37,6 +37,7 @@
 #include "passes/grid_rhi_pass.h"
 #include "passes/gridmap_rhi_pass.h"
 #include "passes/marker_rhi_pass.h"
+#include "passes/meshmap_rhi_pass.h"
 #include "passes/model_rhi_pass.h"
 #include "passes/occupancy_rhi_pass.h"
 #include "passes/overlay_rhi_pass.h"
@@ -50,6 +51,7 @@
 #include "pj_scene3d_core/tf/object_placement.h"
 #include "pj_scene3d_widgets/hud_overlay.h"
 #include "pj_scene3d_widgets/layers/grid_map_layer.h"
+#include "pj_scene3d_widgets/layers/mesh_map_layer.h"
 #include "pj_scene3d_widgets/layers/occupancy_grid_layer.h"
 #include "pj_scene3d_widgets/layers/poses_in_frame_layer.h"
 #include "pj_scene3d_widgets/layers/scene_entities_layer.h"
@@ -67,9 +69,8 @@
 #include "rhi_scene_pass.h"
 #include "scene_view_widget_rhi_quality_p.h"
 
-// The resource object lives in a static archive.  Explicit initialization both
-// retains it at link time and keeps Q_INIT_RESOURCE's generated symbol lookup in
-// the global namespace.
+// The resource object lives in a static archive: explicit initialization retains it at link time and keeps
+// Q_INIT_RESOURCE's symbol lookup in the global namespace.
 static void initializeScene3dRhiResources() {
   Q_INIT_RESOURCE(scene3d_rhi_shaders);
 }
@@ -214,8 +215,6 @@ struct Overloaded : Visitors... {
   using Visitors::operator()...;
 };
 
-// Submits one prepared draw through its family: the std::visit visitor over
-// PreparedFrame::DrawRef.
 struct SubmitDraw {
   QRhiCommandBuffer* command_buffer;
   ScenePass pass;
@@ -265,13 +264,16 @@ const GridMapLayer* familyKey(
     const GridMapRhiPass& /*family*/, const Scene3DLayer* /*layer*/, const SceneContributions& contributes) {
   return contributes.grid_map;
 }
+const MeshMapLayer* familyKey(
+    const MeshMapRhiPass& /*family*/, const Scene3DLayer* /*layer*/, const SceneContributions& contributes) {
+  return contributes.mesh_map;
+}
 
 }  // namespace
 
 SceneViewWidget::SceneViewWidget(QWidget* parent) : QRhiWidget(parent) {
-  // Each per-view budget fills one quint32-sized buffer (the point and pose
-  // budgets bound the sum of per-layer buffers). Prove both policies fit; the
-  // marker and model passes check their own budgets.
+  // A per-view budget must fit one quint32-sized buffer (the point and pose budgets bound the sum of per-layer
+  // buffers); the marker and model passes check their own.
   constexpr auto fits_buffers = [](const SceneLimits& limits) {
     constexpr std::uint64_t kMaxBytes = std::numeric_limits<quint32>::max();
     return limits.max_point_vertices_per_view * sizeof(PointVertex) <= kMaxBytes &&
@@ -295,6 +297,7 @@ SceneViewWidget::SceneViewWidget(QWidget* parent) : QRhiWidget(parent) {
   model_pass_ = std::make_unique<ModelRhiPass>();
   point_pass_ = std::make_unique<PointRhiPass>();
   gridmap_pass_ = std::make_unique<GridMapRhiPass>();
+  meshmap_pass_ = std::make_unique<MeshMapRhiPass>();
   trail_pass_ = std::make_unique<TrailRhiPass>();
   frame_ = std::make_unique<PreparedFrame>();
 
@@ -304,9 +307,8 @@ SceneViewWidget::SceneViewWidget(QWidget* parent) : QRhiWidget(parent) {
   }();
   (void)resources_initialized;
 
-  // QRhiWidget's API is immutable after platform resources exist.  Set it while
-  // the widget is still parentless; SceneDockWidget reparents only after this
-  // constructor returns.
+  // QRhiWidget's API is immutable once platform resources exist: set it while the widget is still parentless
+  // (SceneDockWidget reparents only after this constructor returns).
   setApi(PJ::preferredGraphicsApi());
   setSampleCount(1);  // initialize() picks the output target's sample count per QRhi
   setObjectName(QStringLiteral("scene3dRhiCanvas"));
@@ -331,6 +333,7 @@ void SceneViewWidget::setTransformBuffer(std::shared_ptr<TransformBuffer> tf) {
     return;
   }
   tf_ = std::move(tf);
+  reseedFollow();
   // A new buffer can reuse the old one's address and revision: rebuild the TF geometry.
   tf_triad_key_.reset();
   grid_pass_->invalidate();
@@ -348,6 +351,7 @@ void SceneViewWidget::setLayers(const std::vector<Scene3DLayer*>& ordered_layers
   std::vector<SceneEntitiesLayer*> markers;
   std::vector<ModelRenderable*> models;
   std::vector<GridMapLayer*> grid_maps;
+  std::vector<MeshMapLayer*> mesh_maps;
   const auto add = [](auto& family_layers, auto* layer) {
     if (layer != nullptr) {
       family_layers.push_back(layer);
@@ -368,6 +372,7 @@ void SceneViewWidget::setLayers(const std::vector<Scene3DLayer*>& ordered_layers
     add(markers, contributes.markers);
     add(models, contributes.models);
     add(grid_maps, contributes.grid_map);
+    add(mesh_maps, contributes.mesh_map);
   }
   point_pass_->setLayers(points);
   trail_pass_->setLayers(trails);
@@ -377,13 +382,15 @@ void SceneViewWidget::setLayers(const std::vector<Scene3DLayer*>& ordered_layers
   marker_pass_->setLayers(markers);
   model_pass_->setLayers(models);
   gridmap_pass_->setLayers(grid_maps);
+  meshmap_pass_->setLayers(mesh_maps);
   invalidateContent();
 }
 
 void SceneViewWidget::setTrackerTime(PJ::Timepoint time) {
-  if (render_time_ == time) {
+  if (has_tracker_time_ && render_time_ == time) {
     return;
   }
+  has_tracker_time_ = true;
   render_time_ = time;
   refreshAvailableFrames();
   applyFollow();
@@ -395,7 +402,7 @@ void SceneViewWidget::setFixedFrame(const std::string& frame) {
     return;
   }
   fixed_frame_ = frame;
-  follow_seeded_ = false;
+  reseedFollow();
   invalidateContent();  // the dock owns and persists the fixed frame, and reports its changes
 }
 
@@ -404,8 +411,7 @@ void SceneViewWidget::setFollowFrame(const std::string& frame) {
     return;
   }
   follow_frame_ = frame;
-  follow_seeded_ = false;
-  applyFollow();
+  reseedFollow();
   invalidateContent();
 }
 
@@ -414,16 +420,16 @@ std::optional<Transform> SceneViewWidget::followTransform(PJ::Timepoint time) co
   if (follow_frame_.empty() || tf_ == nullptr || fixed.empty()) {
     return std::nullopt;
   }
-  const auto transform = tf_->tryLookupTransform(fixed, follow_frame_, time, pj::tf::Clock::kEntry);
+  const auto transform = frameAtCursor(*tf_, fixed, follow_frame_, time);
   return transform ? std::optional<Transform>(*transform) : std::nullopt;
 }
 
 void SceneViewWidget::applyFollow() {
   const std::string fixed = effectiveFixedFrame();
-  if (follow_frame_.empty() || tf_ == nullptr || fixed.empty()) {
+  if (follow_frame_.empty() || tf_ == nullptr || fixed.empty() || !has_tracker_time_) {
     return;
   }
-  const auto transform = tf_->tryLookupTransform(fixed, follow_frame_, render_time_, pj::tf::Clock::kEntry);
+  const auto transform = frameAtCursor(*tf_, fixed, follow_frame_, render_time_);
   if (!transform) {
     follow_seeded_ = false;
     return;
@@ -438,6 +444,13 @@ void SceneViewWidget::applyFollow() {
   if (delta != glm::dvec3(0.0)) {
     camera_->followShift(glm::vec3(delta));
   }
+}
+
+// The reset comes first: applyFollow() returns without touching the seed when it cannot resolve (no follow frame, TF,
+// fixed frame or tracker time yet), so the reset is what drops a baseline taken in the old frame, buffer or target.
+void SceneViewWidget::reseedFollow() {
+  follow_seeded_ = false;
+  applyFollow();
 }
 
 void SceneViewWidget::recenterOnFollowFrame() {
@@ -595,7 +608,7 @@ void SceneViewWidget::setMeshShadingParams(const MeshShadingParams& params) {
 }
 
 void SceneViewWidget::grabPresentedFrame(std::function<void(const QImage&)> done) {
-  invalidateContent();  // the presented frame must be a real one (TECHNICAL_NOTES §3)
+  invalidateContent();  // the presented frame must be a real one (docs/TECHNICAL_NOTES.md "Qt workarounds")
   PJ::grabPresentedFrame(*this, std::move(done));
 }
 
@@ -627,9 +640,8 @@ void SceneViewWidget::refreshAvailableFrames() {
 // Places a layer's source frame in the fixed frame (placeObject(): at the object's
 // own stamp, else at render_time_, with the layer's hold); nullopt when either frame
 // is empty or TF cannot resolve the pair this frame — the caller skips the layer
-// without consuming its per-view budget. Even a frame equal to the fixed one goes
-// through placeObject(): a stamped object in a moving fixed frame stays where it was
-// captured, as the dock's scene bounds and the layer's render key place it.
+// without consuming its per-view budget. Every frame goes through placeObject(), the
+// one rule the dock's scene bounds and the layer's render key place it with too.
 std::optional<Transform> SceneViewWidget::resolveFixedFromSource(
     const std::string& source_frame, const std::string& fixed_frame, std::optional<PJ::Timepoint> object_stamp,
     PlacementHold* hold) const {
@@ -651,7 +663,7 @@ uint64_t SceneViewWidget::tfRenderKey(PJ::Timepoint time) const {
   uint64_t combined = 0;
   for (const std::string& frame : tf_render_key_frames_) {
     uint64_t hash = std::hash<std::string>{}(frame);
-    if (const auto transform = tf_->tryLookupTransform(fixed, frame, time, pj::tf::Clock::kEntry); transform) {
+    if (const auto transform = frameAtCursor(*tf_, fixed, frame, time); transform) {
       hash = foldTransformIntoKey(hash, transform->matrix());
     } else {
       hash ^= 0xD15C0FFEEULL;
@@ -686,6 +698,7 @@ void SceneViewWidget::buildTfTriads(const glm::dvec3& render_origin, const std::
   TfTriadKey key{
       .tf = tf_.get(),
       .tf_revision = tf_ != nullptr ? tf_->revision() : 0U,
+      .sampling = viewSampling(),
       .time = render_time_,
       .fixed_frame = fixed_frame,
       .render_origin = render_origin,
@@ -704,15 +717,14 @@ void SceneViewWidget::buildTfTriads(const glm::dvec3& render_origin, const std::
   if (tf_ == nullptr || fixed_frame.empty() || !axes_visible_) {
     return;
   }
-  // Solid arrow triads. The frame's
-  // fixed-from-frame transform (camera-relative) is baked into each arm's model,
-  // so the draw uses an identity fixed_from_source uniform.
+  // The frame's fixed-from-frame transform (camera-relative) is baked into each arm's model, so the draw uses an
+  // identity fixed_from_source uniform.
   const PoseTriadStyle triad_style{
       .axis_length = gizmo_size_m_, .opacity = gizmo_opacity_, .x_arrow_only = false, .override_color = false};
   std::pair<std::size_t, std::size_t> hovered_arms{0, 0};
   tf_->getAllFrames(tf_triad_frames_);
   for (const std::string& frame : tf_triad_frames_) {
-    const auto transform = tf_->tryLookupTransform(fixed_frame, frame, render_time_, pj::tf::Clock::kEntry);
+    const auto transform = frameAtCursor(*tf_, fixed_frame, frame, render_time_);
     if (!transform) {
       continue;
     }
@@ -748,6 +760,7 @@ void SceneViewWidget::forEachFamily(Visitor&& visitor) const {
   visitor(*marker_pass_);
   visitor(*model_pass_);
   visitor(*gridmap_pass_);
+  visitor(*meshmap_pass_);
 }
 
 void SceneViewWidget::initialize(QRhiCommandBuffer* command_buffer) {
@@ -765,13 +778,14 @@ void SceneViewWidget::initialize(QRhiCommandBuffer* command_buffer) {
     resource_rhi_ = current_rhi;
     rhi_backend_name_ = QString::fromLatin1(current_rhi->backendName());
     max_3d_texture_size_ = max3dTextureSize(*current_rhi);
-    // The output multisamples only where the GPU cannot run the HDR chain (the
-    // direct pass draws the whole scene on it); over the chain's (already
-    // multisampled) present it is single-sample, and the corner gizmo brings
-    // its own 4x target. Decided per QRhi, not per frame: a change rebuilds
-    // every resource, so a runtime HDR refusal (size, budget, a missing
-    // pipeline variant) draws its direct pass without MSAA.
-    if (const int samples = hdrUnsupportedReason(*current_rhi).isEmpty() ? 1 : kDirectSampleCount;
+    // The output multisamples only where a GPU cannot run the HDR chain (the direct pass draws the whole scene on
+    // it); over the chain's present it is single-sample, and the corner gizmo brings its own 4x target. A software
+    // rasterizer stays single-sample, MSAA being a large part of its frame (TECHNICAL_NOTES "Software rasterizers draw
+    // the direct pass"). Decided per QRhi, not per frame: a change rebuilds every resource, so a runtime HDR refusal
+    // (size, budget, a missing pipeline variant) draws its direct pass without MSAA.
+    software_notice_ = softwareRenderingNotice(*current_rhi);
+    if (const int samples =
+            software_notice_.isEmpty() && !hdrUnsupportedReason(*current_rhi).isEmpty() ? kDirectSampleCount : 1;
         sampleCount() != samples) {
       // QRhiWidget rebuilds its target and calls initialize() again: nothing is
       // built for this one (render() clears it).
@@ -812,6 +826,7 @@ RhiPassSetup SceneViewWidget::passSetup(QRhi* rhi) const {
       .view_uniforms = uniform_buffer_,
       .geometry = shared_geometry_.get(),
       .pipelines = pipelines_.get(),
+      .line_segments = !PJ::softwareRasterizerName(*rhi).isEmpty(),
   };
 }
 
@@ -856,6 +871,9 @@ void SceneViewWidget::forEachLazyFamily(QRhi& rhi, Visitor&& visitor) const {
   });
   visit(*gridmap_pass_, "grid-map pipelines", [this](const RhiPassSetup& setup) {
     return gridmap_pass_->initialize(setup);
+  });
+  visit(*meshmap_pass_, "mesh-map pipelines", [this](const RhiPassSetup& setup) {
+    return meshmap_pass_->initialize(setup);
   });
 }
 
@@ -977,9 +995,8 @@ struct SceneViewWidget::FrameView {
   bool inverse_projection_valid = false;  // SSAO and EDL rebuild view positions with it
 };
 
-// The prepared draws of one frame and the quality stages it runs. Every pass
-// replays the draws (the HDR colour pass, the depth replay or the direct pass,
-// the EDL mesh mask, the shadow map).
+// The prepared draws of one frame and the quality stages it runs; every pass (HDR colour, depth replay or direct, EDL
+// mesh mask, shadow map) replays the draws.
 struct SceneViewWidget::PreparedFrame {
   template <typename Family>
   struct DrawOf {
@@ -990,7 +1007,8 @@ struct SceneViewWidget::PreparedFrame {
   // visitor's call for alternative 0 (SubmitDraw), so that slot holds no draw.
   using DrawRef = std::variant<
       std::monostate, DrawOf<PointRhiPass>, DrawOf<TrailRhiPass>, DrawOf<PoseRhiPass>, DrawOf<OccupancyRhiPass>,
-      DrawOf<VoxelRhiPass>, DrawOf<MarkerRhiPass>, DrawOf<ModelRhiPass>, DrawOf<GridMapRhiPass>>;
+      DrawOf<VoxelRhiPass>, DrawOf<MarkerRhiPass>, DrawOf<ModelRhiPass>, DrawOf<GridMapRhiPass>,
+      DrawOf<MeshMapRhiPass>>;
   // One prepared draw in submission terms: its logical slot (index into
   // layers_), blending class and family record.
   struct SceneDraw {
@@ -1083,8 +1101,7 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
   hdr_->state.last_active = frame.hdr_active;
   const QSize render_size = frame.hdr_active ? scaled_size : output_size;
 
-  // The frame contract (rhi_scene_pass.h): admit once, prepare once;
-  // every pass below replays `frame`.
+  // The frame contract (rhi_scene_pass.h): admit once, prepare once; every pass below replays `frame`.
   FrameAdmission admission;
 #ifdef PJ_RHI_TEST_HOOKS
   stage_times_.targets_ready_ns = steadyNowNs();
@@ -1141,12 +1158,10 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
     }
   }
 
-  // Scene backdrop tracks the active theme (the same token, read per frame). A
-  // PaletteChange invalidates the content, so a theme switch re-applies here.
-  // The HDR target is linear-light — the present pass re-encodes to sRGB — so
-  // linearize the display-referred token on write.
+  // The backdrop tracks the active theme, read per frame (a PaletteChange invalidates the content). The HDR target is
+  // linear-light and the present pass re-encodes to sRGB, so linearize the display-referred token on write.
   const QColor scene_bg = sceneThemeColors().backdrop;
-  const auto linear_channel = [](float channel) { return std::pow(channel, 2.2F); };
+  const auto linear_channel = [](float channel) { return static_cast<float>(look::srgbToLinear(channel)); };
   const QColor hdr_scene_clear = QColor::fromRgbF(
       linear_channel(static_cast<float>(scene_bg.redF())), linear_channel(static_cast<float>(scene_bg.greenF())),
       linear_channel(static_cast<float>(scene_bg.blueF())), 1.0F);
@@ -1256,14 +1271,12 @@ void SceneViewWidget::paintEvent(QPaintEvent* event) {
 }
 
 bool SceneViewWidget::retainsLastFrame() const {
-  // last_frame_request_ is reset by every release (a new top-level or a destroyed
-  // QRhi) and every initialize() (a recreated target), so a set one means the
-  // target holds our last full frame, as that request built it. Comparing it
-  // with the current request catches a resize or a format change QRhiWidget has
-  // not applied yet: setColorBufferFormat(), setFixedColorBufferSize() and a
-  // resize only request a new target, which QRhiWidget builds in the paint this
-  // would skip. A resize or DPR change under a fixed colour-buffer size keeps the
-  // target but moves the overlays, which the logical size and DPR catch.
+  // last_frame_request_ is reset by every release (a new top-level or a destroyed QRhi) and every initialize() (a
+  // recreated target), so a set one means the target holds our last full frame, as that request built it. Comparing
+  // it with the current request catches a resize or format change QRhiWidget has not applied yet:
+  // setColorBufferFormat(), setFixedColorBufferSize() and a resize only request a new target, which QRhiWidget builds
+  // in the paint this would skip. A resize or DPR change under a fixed colour-buffer size keeps the target but moves
+  // the overlays, which the logical size and DPR catch.
   return last_frame_request_.has_value() && *last_frame_request_ == requestedTarget() && rhi() != nullptr &&
          rhi() == resource_rhi_;
 }
@@ -1275,9 +1288,8 @@ SceneViewWidget::TargetRequest SceneViewWidget::requestedTarget() const {
   return {colorBufferFormat(), fixed.isEmpty() ? size() * dpr : fixed, sampleCount(), size(), dpr};
 }
 
-// Frame contract step 1: runs every visible layer's prepareForRender() against
-// the per-view budgets and places it in the fixed frame. The only place a
-// budget is consumed.
+// Frame contract, admission: runs every visible layer's prepareForRender() against the per-view budgets and places it
+// in the fixed frame. The only place a budget is consumed.
 void SceneViewWidget::admitFrame(QRhi* rhi, FrameAdmission& admission) {
   admission.fixed_frame = effectiveFixedFrame();
   const std::string& fixed_frame = admission.fixed_frame;
@@ -1290,13 +1302,14 @@ void SceneViewWidget::admitFrame(QRhi* rhi, FrameAdmission& admission) {
   pose_pass_->admit(place);
   occupancy_pass_->admit(place);
   gridmap_pass_->admit(place);
+  meshmap_pass_->admit(place);
   voxel_pass_->admit(rhi, place);
   marker_pass_->admit(place);
   model_pass_->admit(place, shading_params_, shading_params_.shadows_enabled && tf_ != nullptr);
 }
 
-// Frame contract step 2: the camera matrices. The aspect is the logical
-// widget's, whatever the DPR and render scale round the framebuffer to.
+// Frame contract, camera: the matrices. The aspect is the logical widget's, whatever the DPR and render scale round
+// the framebuffer to.
 SceneViewWidget::FrameView SceneViewWidget::frameView(QRhi* rhi) const {
   FrameView view;
   view.render_origin = glm::dvec3(camera_->state().focal);
@@ -1312,9 +1325,8 @@ SceneViewWidget::FrameView SceneViewWidget::frameView(QRhi* rhi) const {
   return view;
 }
 
-// Frame contract step 3: builds this frame's GPU data (streams, instances,
-// uploads, uniforms) from the admission and orders every draw for submission.
-// Returns the update batch the first pass must consume.
+// Frame contract, preparation: builds this frame's GPU data (streams, instances, uploads, uniforms) from the
+// admission and orders every draw for submission. Returns the update batch the first pass must consume.
 QRhiResourceUpdateBatch* SceneViewWidget::prepareFrame(
     QRhi* rhi, const QSize& render_size, const FrameView& view, const FrameAdmission& admission, PreparedFrame& frame) {
   const glm::dvec3& render_origin = view.render_origin;
@@ -1451,6 +1463,7 @@ QRhiResourceUpdateBatch* SceneViewWidget::prepareFrame(
   occupancy_pass_->prepare(context);
   voxel_pass_->prepare(context);
   gridmap_pass_->prepare(context, shading_params_);
+  meshmap_pass_->prepare(context, shading_params_);
   trail_pass_->prepare(context, admission.fixed_frame, render_time_, render_size, pixel_scale);
 
   frame.viewport =
@@ -1699,7 +1712,7 @@ std::optional<std::string> SceneViewWidget::frameAt(const QPointF& logical_pos) 
   pick_points_.clear();
   for (const std::string& frame : pick_frames_) {
     std::optional<glm::vec2> projected;
-    if (const auto transform = tf_->tryLookupTransform(fixed, frame, render_time_, pj::tf::Clock::kEntry); transform) {
+    if (const auto transform = frameAtCursor(*tf_, fixed, frame, render_time_); transform) {
       projected = projectToWidget(transform->t);
     }
     pick_points_.push_back(projected.value_or(glm::vec2(-1.0e6F)));
@@ -1764,9 +1777,7 @@ void SceneViewWidget::prepareOverlays(
   if (hovered_frame_.has_value() && axes_visible_ && tf_ != nullptr && !fixed_frame.empty()) {
     // Re-project the live origin so the label follows streaming TF and the camera.
     std::optional<glm::vec2> anchor;
-    if (const auto transform =
-            tf_->tryLookupTransform(fixed_frame, *hovered_frame_, render_time_, pj::tf::Clock::kEntry);
-        transform) {
+    if (const auto transform = frameAtCursor(*tf_, fixed_frame, *hovered_frame_, render_time_); transform) {
       anchor = projectToWidget(transform->t);
     }
     if (anchor.has_value()) {
@@ -1779,7 +1790,6 @@ void SceneViewWidget::prepareOverlays(
         hover_label_frame_ = *hovered_frame_;
       }
       if (hover_ring_image_.isNull()) {
-        // A 1.5 px ring of radius 3 on the frame origin ties the label to its gizmo.
         constexpr qreal kRingBox = 10.0;
         hover_ring_image_ =
             QImage(QSize(qCeil(kRingBox * dpr), qCeil(kRingBox * dpr)), QImage::Format_ARGB32_Premultiplied);
@@ -1793,7 +1803,6 @@ void SceneViewWidget::prepareOverlays(
         painter.end();
         hover_ring_image_ = toOverlayFormat(hover_ring_image_);
       }
-      // Above-right of the origin, clamped inside the view.
       const QSizeF box = hover_label_image_.deviceIndependentSize();
       const int box_w = static_cast<int>(std::lround(box.width()));
       const int box_h = static_cast<int>(std::lround(box.height()));

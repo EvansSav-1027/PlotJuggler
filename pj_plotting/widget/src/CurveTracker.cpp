@@ -9,22 +9,51 @@
 #include <qwt_symbol.h>
 #include <qwt_text.h>
 
-#include <QFontDatabase>
+#include <QApplication>
+#include <QEvent>
 #include <QPalette>
 #include <QPen>
-#include <QSettings>
 #include <QSize>
 #include <QString>
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <map>
 using namespace Qt::StringLiterals;
 
+#include "TrackerTextEngine.h"
+#include "pj_plotting/PlotScaleDraw.h"
+#include "pj_widgets/AppSettings.h"
+#include "pj_widgets/ColorContrast.h"
 #include "pj_widgets/FrameworkTokens.h"
 
 namespace PJ {
 
 namespace {
+
+// Curve palettes are tuned to draw on the plot, not to be read as text: on the dark backdrop the default red and blue
+// fall under this ratio.
+constexpr double kMinTextContrast = 4.5;
+
+// Top vertical speed of the value box, and the glide tick that finishes the move once positions stop arriving.
+constexpr double kLabelSpeedPxPerSec = 200.0;
+constexpr int kLabelTickMs = 16;
+// The glide timer waits this long after a position before ticking: longer than PlaybackEngine's tick (~33 ms), or it
+// would repaint between playback positions and multiply the plot's repaint rate.
+constexpr int kLabelIdleMs = 50;
+// A time line moving farther than this in one position is a seek (a click on the timeline), not playback: the box
+// follows it vertically at once.
+constexpr double kLabelSnapJumpPx = 20.0;
+
+// The time line reads like the X axis under it: plain seconds, or the clock format the date-time toggle installed there
+// (an XY plot keeps plain seconds).
+[[nodiscard]] QString trackerTimeText(const QwtPlot* plot, double seconds, int precision) {
+  const auto* draw = dynamic_cast<const PlotTimeScaleDraw*>(plot->axisScaleDraw(QwtPlot::xBottom));
+  if (draw != nullptr && isWallClock(draw->format())) {
+    return formatTimeLabel(seconds, draw->format(), precision);
+  }
+  return QString::number(seconds, 'f', precision);
+}
 
 [[nodiscard]] std::optional<QPointF> referencePointAt(const QwtPlotCurve* curve, std::optional<QPointF> reference) {
   return reference.has_value() ? curvePointAt(curve, reference->x()) : std::nullopt;
@@ -34,12 +63,9 @@ namespace {
 // tracker readout's content/visibility/colour whenever it changes, so we can
 // tell whether a vanished "time: ..." box is empty/hidden (logic) or fully
 // populated yet unpainted (a canvas text-rendering failure shared with the legend).
-void logTrackerText(const void* plot, bool visible, const QString& html, const QColor& text_color) {
-  if (!qEnvironmentVariableIsSet("PJ_PLOT_TEXT_DEBUG")) {
-    return;
-  }
+void logTrackerText(const void* plot, bool visible, const QString& text, const QColor& text_color) {
   const QString sig =
-      u"visible=%1 empty=%2 len=%3 text=%4"_s.arg(visible).arg(html.isEmpty()).arg(html.size()).arg(text_color.name());
+      u"visible=%1 empty=%2 len=%3 text=%4"_s.arg(visible).arg(text.isEmpty()).arg(text.size()).arg(text_color.name());
   static std::map<const void*, QString> last_sig;
   auto it = last_sig.find(plot);
   if (it != last_sig.end() && it->second == sig) {
@@ -60,6 +86,12 @@ CurveTracker::CurveTracker(QwtPlot* plot, QColor color) : QObject(plot), plot_(p
 
   text_marker_ = new QwtPlotMarker();
   text_marker_->attach(plot_);
+
+  connect(&label_timer_, &QTimer::timeout, this, [this]() {
+    label_timer_.setInterval(kLabelTickMs);
+    stepValueBox();
+    emit valueBoxMoved();
+  });
 }
 
 CurveTracker::~CurveTracker() {
@@ -88,6 +120,9 @@ void CurveTracker::setParameter(Parameter parameter) {
 
 void CurveTracker::setEnabled(bool enable) {
   visible_ = enable;
+  if (!enable) {
+    label_shown_ = false;
+  }
   line_marker_->setVisible(enable);
   // Gate the box on the parameter here rather than force it visible — that is
   // what stopped a re-enabled line-only tracker (when a curve is added, or on
@@ -104,6 +139,10 @@ void CurveTracker::setEnabled(bool enable) {
 void CurveTracker::setPosition(const QPointF& tracker_position) {
   if (plot_ == nullptr) {
     return;
+  }
+  if (watched_canvas_ != plot_->canvas() && plot_->canvas() != nullptr) {
+    watched_canvas_ = plot_->canvas();
+    watched_canvas_->installEventFilter(this);
   }
   const auto fw_theme = theme::appTheme();
 
@@ -127,17 +166,18 @@ void CurveTracker::setPosition(const QPointF& tracker_position) {
     point_markers_.push_back(marker);
   }
 
+  // The value box is the canvas colour at partial alpha, so its text reads against the canvas colour itself.
+  const QColor canvas_color = plot_->canvasBackground().color();
+
   struct LineParts {
-    QColor color;
+    QColor color;  // text ink: the curve colour, lightened on the dark theme until it reads on the box
     QString value;
     QString delta;
     QString name;
   };
 
   std::multimap<double, LineParts> text_lines;
-  const int precision = QSettings().value(u"Preferences::precision"_s, 3).toInt();
-  int values_char_count = 0;
-  int delta_char_count = 0;
+  const int precision = valuePrecision();
   double min_y = std::numeric_limits<double>::max();
   double max_y = std::numeric_limits<double>::lowest();
   int visible_points = 0;
@@ -172,30 +212,18 @@ void CurveTracker::setPosition(const QPointF& tracker_position) {
 
     const auto maybe_reference = referencePointAt(curve, reference_pos_);
     LineParts parts;
-    parts.color = color;
+    parts.color = fw_theme == theme::Theme::Dark ? inkWithContrast(color, canvas_color, kMinTextContrast) : color;
     parts.value = QString::number(point.y(), 'f', precision);
     parts.name = curve->title().text();
     if (maybe_reference.has_value()) {
       parts.delta = u" (Δ %1)"_s.arg(QString::number(point.y() - maybe_reference->y(), 'f', precision));
     }
     text_lines.insert({point.y(), parts});
-    values_char_count = std::max(values_char_count, static_cast<int>(parts.value.length()));
-    delta_char_count = std::max(delta_char_count, static_cast<int>(parts.delta.length()));
 
     min_y = std::min(min_y, point.y());
     max_y = std::max(max_y, point.y());
     ++visible_points;
     point_marker->setVisible(true);
-  }
-
-  for (auto& [unused, parts] : text_lines) {
-    (void)unused;
-    while (parts.value.length() < values_char_count) {
-      parts.value.prepend(u"&nbsp;"_s);
-    }
-    while (parts.delta.length() < delta_char_count) {
-      parts.delta.prepend(u"&nbsp;"_s);
-    }
   }
 
   QwtText marker_text;
@@ -204,54 +232,136 @@ void CurveTracker::setPosition(const QPointF& tracker_position) {
   if (reference_pos_.has_value()) {
     time_delta = u" (Δ %1)"_s.arg(QString::number(tracker_position.x() - reference_pos_->x(), 'f', precision));
   }
-  QString marker_html = u"<font color=%1>time : %2%3</font><br>"_s.arg(
-      text_color.name(), QString::number(tracker_position.x(), 'f', precision), time_delta);
+  value_box_rows_.clear();
+  value_box_rows_.push_back(
+      {.ink = text_color,
+       .text = u"time : %1%2"_s.arg(trackerTimeText(plot_, tracker_position.x(), precision), time_delta)});
 
   if (valueBoxAllowed()) {
-    int line_index = 0;
+    // The label's rows carry cells: the values, and the deltas when a reference is set, are right-aligned columns.
+    std::vector<ValueBoxRow> label_rows = value_box_rows_;
     for (auto it = text_lines.rbegin(); it != text_lines.rend(); ++it) {
       const LineParts& parts = it->second;
-      if (parameter_ == kValue) {
-        marker_html += u"<font color=%1>%2%3</font>"_s.arg(parts.color.name(), parts.value, parts.delta);
-      } else {
-        marker_html +=
-            u"<font color=%1>%2%3 : %4</font>"_s.arg(parts.color.name(), parts.value, parts.delta, parts.name);
+      const QString tail = parameter_ == kValue ? QString() : u" : "_s + parts.name;
+      value_box_rows_.push_back({.ink = parts.color, .text = parts.value + parts.delta + tail});
+      QString cells = parts.value + kValueBoxCellSeparator;
+      if (reference_pos_.has_value()) {
+        cells += parts.delta + kValueBoxCellSeparator;
       }
-      if (++line_index < static_cast<int>(text_lines.size())) {
-        marker_html += u"<br>"_s;
-      }
+      // A separator inside a curve's name would open another column.
+      label_rows.push_back({.ink = parts.color, .text = cells + QString(tail).replace(kValueBoxCellSeparator, u' ')});
     }
+    marker_text = valueBoxLabel(label_rows);
 
-    // Canvas colour with alpha: a white veil on the light theme, a dark one on dark,
-    // so the WindowText/curve-colour ink above always reads against it.
-    QColor background_color = plot_->canvasBackground().color();
+    // Canvas colour with alpha: a white veil on the light theme, a dark one on dark, so the WindowText ink above reads
+    // against it (and the curve-colour ink on the dark theme, lifted to kMinTextContrast).
+    QColor background_color = canvas_color;
     background_color.setAlpha(200);
     marker_text.setBackgroundBrush(background_color);
     marker_text.setBorderPen(QPen(Qt::NoPen));
-    marker_text.setText(marker_html);
-    QFont font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    QFont font = QApplication::font();
     font.setPointSize(9);
     marker_text.setFont(font);
     marker_text.setRenderFlags(parameter_ == kValue ? Qt::AlignCenter : Qt::AlignLeft);
+    (void)marker_text.textSize();  // measured before the copy, so the marker's label inherits the cached size
     text_marker_->setLabel(marker_text);
     text_marker_->setLabelAlignment(Qt::AlignRight);
     text_marker_->setXValue(tracker_position.x() + view_rect.width() * 0.02);
   }
 
   if (visible_points > 0) {
-    text_marker_->setYValue(0.5 * (max_y + min_y));
+    label_value_y_ = 0.5 * (max_y + min_y);
+    label_target_y_ = boxAnchorY(marker_text.textSize().height());
   }
 
-  const double canvas_ratio = view_rect.width() / static_cast<double>(std::max(1, plot_->width()));
-  const double text_width = marker_text.textSize().width() * canvas_ratio;
+  // The box's width in plot units, through the map the canvas draws with: the plot widget is wider than the canvas
+  // by its axes, and a width taken over it places the box past the canvas edge or over the line. A right-aligned
+  // label starts `spacing` pixels after its position (QwtPlotMarker::drawLabel), so the gap is part of the width.
+  const QwtScaleMap x_map = plot_->canvasMap(QwtPlot::xBottom);
+  const double units_per_pixel = x_map.pDist() != 0.0 ? std::abs(x_map.sDist() / x_map.pDist()) : 0.0;
+  const double text_width = (marker_text.textSize().width() + text_marker_->spacing() + 1.0) * units_per_pixel;
   if ((text_marker_->boundingRect().right() + text_width) > view_rect.right()) {
-    text_marker_->setXValue(tracker_position.x() - view_rect.width() * 0.02 - text_width);
+    // Left of the line. A box wider than the room there starts at the canvas's left edge, so it keeps its first
+    // column and loses the end of its rows.
+    text_marker_->setXValue(std::max(view_rect.left(), tracker_position.x() - view_rect.width() * 0.02 - text_width));
   }
 
   const bool marker_visible = visible_points > 0 && visible_ && valueBoxAllowed();
+  const bool seek =
+      std::abs(x_map.transform(tracker_position.x()) - x_map.transform(previous_tracker_point_.x())) > kLabelSnapJumpPx;
+  if (!marker_visible || !label_shown_ || seek) {
+    label_timer_.stop();
+    text_marker_->setYValue(label_target_y_);
+  } else {
+    if (label_timer_.isActive()) {
+      stepValueBox();
+    } else {
+      label_clock_.start();
+    }
+    // Restarted on every position, so during playback the owner's own repaint shows each step and the timer only
+    // fires once positions stop.
+    if (text_marker_->yValue() != label_target_y_) {
+      label_timer_.start(kLabelIdleMs);
+    }
+  }
+  label_shown_ = marker_visible;
   text_marker_->setVisible(marker_visible);
-  logTrackerText(plot_, marker_visible, marker_html, text_color);
+  if (qEnvironmentVariableIsSet("PJ_PLOT_TEXT_DEBUG")) {
+    logTrackerText(plot_, marker_visible, valueBoxText(), text_color);
+  }
   previous_tracker_point_ = tracker_position;
+}
+
+QString CurveTracker::valueBoxText() const {
+  QStringList lines;
+  for (const ValueBoxRow& row : value_box_rows_) {
+    lines.push_back(row.text);
+  }
+  return lines.join(u'\n');
+}
+
+double CurveTracker::valueBoxY() const {
+  return text_marker_->yValue();
+}
+
+double CurveTracker::boxAnchorY(double box_height_px) const {
+  // QwtPlotMarker centres the box on its value: near the top or bottom of the view, half of it would leave the canvas.
+  const QwtScaleMap y_map = plot_->canvasMap(QwtPlot::yLeft);
+  const double half_height_px = 0.5 * box_height_px;
+  const double low_px = std::min(y_map.p1(), y_map.p2()) + half_height_px;
+  const double high_px = std::max(y_map.p1(), y_map.p2()) - half_height_px;
+  // Not on a canvas shorter than the box, which includes one not laid out yet, where invTransform() divides by zero.
+  if (const double value_px = y_map.transform(label_value_y_);
+      low_px < high_px && (value_px < low_px || value_px > high_px)) {
+    return y_map.invTransform(std::clamp(value_px, low_px, high_px));
+  }
+  return label_value_y_;
+}
+
+bool CurveTracker::eventFilter(QObject* watched, QEvent* event) {
+  // The resize arrives after QwtPlot::updateLayout placed the scales, so canvasMap() is already the new one. Not a
+  // glide: the box was not moving, the canvas was.
+  if (event->type() == QEvent::Resize && watched == watched_canvas_ && label_shown_) {
+    label_timer_.stop();
+    label_target_y_ = boxAnchorY(text_marker_->label().textSize().height());
+    text_marker_->setYValue(label_target_y_);
+  }
+  return QObject::eventFilter(watched, event);
+}
+
+void CurveTracker::stepValueBox() {
+  const double dt_sec = static_cast<double>(label_clock_.restart()) * 1e-3;
+  const QwtScaleMap map = plot_->canvasMap(QwtPlot::yLeft);
+  const double current_px = map.transform(text_marker_->yValue());
+  const double target_px = map.transform(label_target_y_);
+  const double max_step_px = kLabelSpeedPxPerSec * dt_sec;
+  // A canvas not laid out yet has a zero pixel span, where invTransform() divides by zero.
+  if (std::abs(map.pDist()) < 1.0 || std::abs(target_px - current_px) <= max_step_px) {
+    text_marker_->setYValue(label_target_y_);
+    label_timer_.stop();
+    return;
+  }
+  text_marker_->setYValue(map.invTransform(current_px + std::copysign(max_step_px, target_px - current_px)));
 }
 
 void CurveTracker::setReferencePosition(std::optional<QPointF> reference_pos) {

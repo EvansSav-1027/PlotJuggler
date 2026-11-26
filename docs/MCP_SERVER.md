@@ -1,0 +1,789 @@
+# AI agents: the MCP server
+
+PlotJuggler lets AI agents read and drive a running instance over the
+[Model Context Protocol](https://modelcontextprotocol.io). Three kinds of client use the same in-app server:
+
+- **External agents** (Claude Code, Codex, any MCP client) reach it through a stdio bridge. This is on by default,
+  and the user can turn it off.
+- **Toolbox plugins** (the Assistant) lease a private endpoint through the SDK service `pj.mcp_endpoint.v1`. The
+  plugin then points its own agent CLI at that endpoint. There is no opt-in and no discovery file.
+- **Agents of a browser page** (the WebAssembly build) reach it through a relay the page connects out to (see
+  [Browser relay](#browser-relay)): a page can neither listen on a socket nor be spawned. The browser build has
+  no stdio bridge and no plugin endpoint.
+
+Code-level detail lives in the header doc-comments this document names; the measurements behind it are in
+"Evidence" at the end.
+
+## Picture
+
+```
+external agent ──stdio──> plotjuggler4 --mcp-bridge ──HTTP 127.0.0.1:<port>, Bearer <public token>──┐
+                          (one per agent session)       reads <AppLocalData>/mcp-instances/<pid>.json │
+                                                                                                     ▼
+                                                                                     McpServer (GUI thread)
+                                                                                                     ▲
+Assistant plugin ──spawns──> claude / codex CLI ──HTTP 127.0.0.1:<port>, Bearer <plugin token>───────┘
+      │
+      └── pj.mcp_endpoint.v1 acquire() ──> {url, bearer_token}   (McpEndpointHost, one per toolbox session)
+
+browser page:
+external agent ──stdio──> pj_mcp_relay.py (127.0.0.1:<port>) <──long-poll HTTP── McpBrowserLink ──> McpServer
+                          (plotjuggler-agent plugin)            (the page connects out)            (handleRelayed)
+```
+
+## Components
+
+| Piece | Where | What it does |
+|---|---|---|
+| `McpProtocol` | `pj_app/src/mcp/` (QtCore only) | Vocabulary both ends share: JSON-RPC envelope checks (`parseRpcMessage`), lifecycle replies, the tool lists (`ToolSet`), the HTTP/1.1 subset, the discovery folder, `ownerFor`, `checkAccess` |
+| `McpBridge.cpp` | `pj_app/src/mcp/` | `plotjuggler4 --mcp-bridge`, handled in `main()` before any `QApplication`: stdio ↔ HTTP, instance discovery, `list_instances` / `select_instance`, forwarding a cancellation of the call in flight |
+| `McpServer` | `pj_app/src/mcp/` | The loopback endpoint on the GUI thread, the token table, the job table, revocation. The HTTP is hand-written ("Evidence"). Its transport-free half (`dispatch`) also answers what a relay link brings in (`handleRelayed`); in the browser only that half is built |
+| `McpBrowserLink` | `pj_app/src/mcp/` | The page side of the browser relay: long-polls the relay and feeds each message to `handleRelayed`. Plain `QNetworkAccessManager`, so the desktop runs it too (`--mcp-relay`, tests) |
+| `pj_mcp_relay.py` | `plotjuggler-agent/relay/` | The agent side of the browser relay: MCP over stdio, the page protocol over loopback HTTP, standard-library Python |
+| `McpServerTools.cpp` | `pj_app/src/mcp/` | The app tools: calls into existing services and the public "agent control" block of `MainWindow.h`, plus `export_series`' file writer, which runs on a worker |
+| `McpEndpointHost` | `pj_app/src/mcp/McpServer.h` | The host side of `pj.mcp_endpoint.v1`, one per toolbox session |
+| `pj_agent_tools` | `pj_runtime/{include,src}/agent_tools/` (static lib, MIT) | The agent tools (`ToolRegistry`) over a `ToolContext` of SDK host views; no Qt Widgets, no app types |
+| `pj.mcp_endpoint.v1` | `plotjuggler_sdk` `pj_base/include/pj_base/plugin_data_api.h`, C++ view in `sdk/plugin_data_api.hpp` | The C-ABI service a toolbox plugin acquires an endpoint from (since SDK 0.40.0) |
+| The Assistant | `pj-official-plugins/toolbox_assistant_agent` | The first plugin consumer: chat panel, Claude and Codex backends, catalog digest |
+
+## Tool sets
+
+The tool set depends on which token a request carries (`mcp::ToolSet`):
+
+- **Agent tools** (`pj_agent_tools`, served to every token): `list_topics`, `describe_topic`, `read_series`, `wait_for`,
+  `evaluate`, `create_derived_series`, `create_derived_object`, `create_markers`, `remove_markers`, `list_created`,
+  `remove_derived_series`, `playback`, `plot_tab`, `scene_view`, `report_status`. `report_status` is listed to plugin
+  tokens only: on the full set `get_status` names the datasets and the instructions count their topics.
+- **App tools** (`McpServerTools.cpp`, public token only): `get_status`, `about`, `open_file`, `unload_file`,
+  `reload_file`, `start_stream`, `stop_stream`, `export_series`, `add_script_series`, `remove_script_series`,
+  `add_filter`, `screenshot`, `widget_state` and `set_widget_state` (`McpWidgetState.cpp`, see
+  [Widget state](#widget-state)), `save_layout` and `load_layout` (see [Layouts](#layouts)).
+- **Job tools** (`McpServer`, served to every token): `jobs_list`, `job_wait`, `job_kill` (see [Jobs](#jobs)).
+- **Bridge tools** (answered by the bridge itself): `list_instances`, `select_instance`, `launch`.
+- **UI tools** (`McpUiTools.cpp`, public token only, and only in a run started with `--mcp-ui-tools`): `ui_tree`,
+  `ui_click`, `ui_drag`, `ui_wheel`, `ui_key`, `ui_type`, `ui_plot`. See [UI tools](#ui-tools-qa).
+
+Derived series hold numbers unless asked for text: `create_derived_series` takes `output_type: "string"`, and an
+`add_script_series` script declares `output = "string"` on its class. The tools that read numbers (`read_series`,
+`export_series`) refuse a string series with the reason (`agent_tools::textSeriesError`); the user sees one in a State
+Transitions panel. A formula, script series or filter takes one as an input: the script receives each value as a
+string, and the join check reads only its timestamps.
+
+`ToolSet::kFull` serves the agent, app and job tools. `ToolSet::kAgentOnly` is used for plugin tokens: `tools/list`
+and the `initialize` instructions leave the app tools out, and calling one gets the unknown-tool error.
+Every tool's title and MCP hints (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) come from one
+table, `mcp::toolHints`, which also covers the bridge's and the UI tools; `toolEntry` writes them into each
+`tools/list` entry and `isReadOnlyTool` reads the same table, so the two cannot drift. A tool is destructive when a
+call can remove or overwrite state that existed before it, the user's or the agent's own (a same-name replace
+included); only `start_stream` reaches outside the machine. `isReadOnlyTool` names the tools that may run while a
+modal dialog is open; `job_kill` runs there too, though it is not read-only (it stops only the agent's own work).
+Reads and changes are separate tools (`widget_state` / `set_widget_state`; `screenshot` only reads, and `plot_tab` or
+`scene_view` `focus` brings an agent's tab forward), so a client can approve each by its name alone. Tool names stay
+within `mcp::kMaxToolNameChars`: Claude prefixes a plugin's tools with `mcp__plugin_plotjuggler_plotjuggler__` and
+refuses names over 64 characters. `McpServer::toolList` fills `add_filter`'s `filter` enum from the session's
+`FilterCatalogue` (`DataProcessorService::availableFilters`); the bridge's own list, served when no instance answers,
+has none.
+
+The instructions (`initialize` and `server/discover` both carry them) end with what the caller's token finds loaded
+(`McpServer::loadedSummary`), read from one catalog snapshot: each dataset by its name (the tools' `dataset:`
+qualifier) with its display time range and its counts of topics and numeric fields (`isSignalField`, as `read_series`
+counts them), then each topic with its numeric fields. The static text and the summary together stay within
+`mcp::kMaxInstructionsChars`, a contract: the summary's budget is what the static text leaves of it. The topics are
+listed all or not at all, since a list cut short reads as everything that is loaded: when they do not all fit, or a
+topic or field name is longer than the per-name cap, the summary says "Topics are not listed here: use list_topics."
+and lists the datasets alone (and when even those do not fit, only how many there are, naming `get_status`, or
+`report_status` for a plugin token). The note and the path example come before any list. Names come from files and
+from live streams (anyone publishing on a subscribed broker picks them), so each is quoted as a JSON string, kept on
+one line (control characters become spaces; U+2028, U+2029 and U+0085, which a JSON dump leaves raw, are escaped), and
+a line says they are data, not instructions. Claude Code puts the instructions in its system prompt, so an agent goes straight to the tool that
+answers instead of spending a turn on each discovery call ("Evidence"). It is a picture of when the session
+connected; `list_topics` and `get_status` show later loads. The bridge asks the current instance for its
+instructions on both calls, and keeps its own when no instance answers: Claude Code 2.1 sends only
+`server/discover`.
+
+The agent tools run against a `ToolContext` built from a service registry. That is the same set of SDK host views a
+toolbox plugin gets (`ToolboxHostView`, `PlotTabsHostView`, `DataProcessorHostView`, `PlaybackHostView`, ...). The
+registry decides whose tabs and derived series the tools see and create. Series names follow `read_series` everywhere
+(`resolveSeriesPath`: unique suffixes, `dataset:topic/field`, near-miss candidates); a transform input whose bare path
+several datasets share reaches the host dataset-qualified. A dataset's name is its label (`DataEngine::datasetLabel`), one
+string that the Datasets tree, `get_status`, the catalog snapshot the tools read (`PJ_data_source_info_t.name`) and
+every `label:` qualifier the host resolves all share. It is the source name (`/` read as `_`, `Dataset` when empty) or a
+display name a plugin or a merge sets, with the lowest free ` (N)` added when another dataset holds it: two files
+named `data.csv`, or two streams of one plugin, are `data.csv` and `data.csv (2)`. A label is assigned once and held
+until its dataset is removed, so closing the older copy leaves `data.csv (2)` as it is (a reload of it too), and the
+freed `data.csv` names the next copy loaded, never a survivor. A dataset merged away is listed nowhere, neither in the
+tree nor in the snapshot, but keeps its label, which now addresses the anchor holding its data; opening its file again
+loads a new dataset (`b.csv (2)`). Labels are session names: layouts and saved recipes keep the dataset id and the raw
+source name. A tool entry prints its `dataset` only when several datasets are loaded (a lone dataset's paths need no
+qualifier), but `list_topics`' `dataset` filter matches the label either way: a whole label selects that dataset
+alone, any other text every label containing it. An agent's removal (`remove_derived_series`,
+`remove_script_series`) goes through `DataProcessorService::removeOwnTransform`: when the cascade would also delete a
+series another owner built on it (the user's included), it is refused, naming each one and its owner. The user's own
+deletes ask first and keep cascading. `plot_tab`'s zoom frames only the tab it names: `pj.viewport.v1` frames all of a
+caller's tabs at once, so the server sets the context's `zoom_tab` hook (`PluginPlotTabsController` with the caller's
+owner, which a plugin token records at `addPluginToken`). Windowed reads never build the whole series' Arrow array: the
+server sets the context's `read_window` and `scan_values` hooks over the session's `DataEngine`
+(`readSeriesArrowWindow`, `scanSeriesValues`, `pj_datastore/plugin_data_host.hpp`). `export_series` then decodes the
+window only; `read_series` also scans the whole series' values once, for its whole-series flat facts, which is still
+linear in the series but several times cheaper than the full read. `export_series` keeps time as integer display
+nanoseconds, so its CSV time column is exact; `format: "npy"` writes a numpy structured array (`time` and one float64
+field per series path, NaN before a series starts) that `numpy.load` reads much faster than `numpy.loadtxt` reads the
+CSV ("Evidence"), with no package beyond numpy. `add_filter` takes its class from `pj_scripting`'s
+`FilterCatalogue::standaloneClassScript`. `screenshot` composites each visible QRhi view's next presented frame
+(`grabPresentedFrame`) into the window grab, and replies when the frames arrive.
+
+## Tokens and identity
+
+`McpServer` holds at most one public token and a table of plugin tokens (`plugin_tokens_`, token → that session's
+service registry). Every request's bearer is compared against each token in constant time (`mcp::checkAccess`). The
+token that matches decides the tool set, the owner and where the `ToolContext` comes from.
+
+| | Public token | Plugin token |
+|---|---|---|
+| Minted by | `openPublicAccess` (Preferences toggle or `--mcp`) | `McpEndpointHost::acquire` → `addPluginToken` |
+| Advertised | In the discovery file | Never; only the acquiring plugin gets it |
+| Tool set | `kFull` | `kAgentOnly` |
+| Acts as | `agent-<client>` per request (`mcp::ownerFor`) | The plugin id its session was built for, whatever the client claims |
+| Services | One assembly per owner (`MainWindow::buildAgentSession`, in `agent_sessions_`) | The plugin's own `ToolboxPanelSession` registry, so its existing tabs and series stay reachable |
+| Status bar | Names the calling agent, and counts its running jobs | Its running jobs are counted and listed; its name is not shown (the plugin has its own UI) |
+
+**Public owners.** `mcp::ownerFor` builds the owner from the bridge's `X-PJ-Client` header or the request's `_meta`
+client name: `agent-` plus that name reduced to `[a-z0-9-]`, at most 32 characters. A request can never name a
+plugin's id, and a plugin can never take an agent's: the plugin catalog refuses ids starting with `agent-`
+(`PJ::kAgentIdPrefix`). Two sessions of one client share a namespace. On first use the server registers the owner
+with `ExtensionCatalogService::registerAdHocOwner`, so its tabs' watermark and its rows read "AI agent (<owner>)".
+Agents draw only in their own tabs (`plot_tab`, `scene_view`); the one tool that changes the user's docks is
+`set_widget_state`, public token only. Their derived series are history-exempt plugin transforms under Custom Topics,
+with an injective transform id (bytes other than `[A-Za-z0-9]` escaped); their derived objects
+(`create_derived_object`) are history-exempt on-demand recipes owned by the agent, in the same panel. The user can
+open either kind in the Transform Editor read-only (the pencil's view, see "Custom Topics panel" in
+`pj_app/docs/ARCHITECTURE.md`), but not edit or delete it. Marker rules have no such view.
+
+## Jobs
+
+A call that can take long does not hold its client until it ends. The job-capable tools (`mcp::isJobCapableTool`:
+`evaluate`, `create_derived_object`, `wait_for`, `open_file`, `reload_file`, `unload_file`, `start_stream`,
+`export_series`, `load_layout`)
+take `wait_s` (`mcp::waitSeconds`: default `kDefaultWaitS`, at most `kMaxWaitS`), added to their schemas by
+`mcp::toolList`.
+
+```
+call ──► running ──(ends within wait_s)──► the ordinary reply                  (foreground; no job id surfaces)
+            │
+            └──(still running at wait_s)──► {job_id, state, progress, ...}      (background)
+
+states: running · waiting_for_user · completed · failed · killed
+```
+
+- **One table.** `McpServer::jobs_` holds every such call from before its work starts (`openJob`): an agent tool's
+  continuation (`ToolResult::resume`, resumed on the 50 ms tick) or an app tool's work (a load, which reports through
+  its reply and stops through the job's `kill` hook). A job the call still waits on is *foreground*. Past `wait_s`
+  the call gets the job id and the job is *background*. A job whose id nobody knows is forgotten when it ends; once
+  its id is known (`Job::retained`: the call got it, the call hung up on an import, or `jobs_list` showed it) its
+  result is kept for `job_wait`, repeatably, until it expires (`kJobExpiry` after it ended, the `kMaxEndedJobs` latest
+  to end per client). An agent tool outside `isJobCapableTool` that defers is answered with an
+  error: only a job is resumed.
+- **Waiters.** The original call, a `job_wait` (`timeout_s` up to `kMaxJobWaitS`) and a `job_kill` are waiters on a
+  job, each with a deadline and its own connection. A waiter is taken out of the job before its reply runs, so a
+  call that got its job id is never answered again. A waiter whose client left is dropped.
+- **Ownership.** A job belongs to the client that started it (`McpServer::sameClient`: the same token and, on the
+  public token, the same `agent-<client>` owner), so a reconnecting client of the same name finds its jobs again and
+  a plugin sees only its own. A foreign or unknown id reads "no such job". A client runs at most `kMaxRunningJobs`;
+  the next job-capable call is refused before its work starts, naming `jobs_list` and `job_kill`.
+- **Kill stops real work**, and `job_kill` answers once the stop took effect (the final state, with the tool's last
+  result), or after `kKillWaitS` with `stopping: true` when the work is still winding down. What happened decides the
+  final state, not what was asked: a load that had completed when its stop arrived ends `completed`.
+  - an evaluation: its continuation is destroyed, which releases the evaluation handle
+    (`OnDemandRuntimeHost::onRelease` cancels the `EnginePool` job). The pool worker may still be winding down; it
+    publishes nothing. A `create_derived_object` killed during its first read-back stays installed
+    (`remove_derived_series` removes it);
+  - a load: `FileLoader::cancelLoad(ticket, keep_partial)`. A queued one leaves the queue; an active one stops at
+    the producer's next progress callback, keeping the rows loaded so far (`keep_partial`, the default) or removing
+    them. The job ends when `loadFinished` arrives; a failed load's reply carries the reason its `kFailed` terminal
+    carries (a load that yielded no data is one). The first kill decides `keep_partial`. A `reload_file` replaces
+    data the user already has, so every stop of it discards (`McpServer::awaitLoad`): the dataset goes back to what
+    it held, whatever `keep_partial` said. `McpServer::stillAuthorized` is false once the caller's job was asked to
+    stop, so a load killed while it waited never starts;
+  - in the browser, `open_file`'s download from the relay: `cancelBrowserFetch`, until the load is queued;
+  - a stream: `StreamingSourceManager::requestStopDataset`, which only asks (a kill hook must not block on the
+    worker's join); the job ends when `streamStopped` arrives, and the data stays loaded;
+  - an export: its `EnginePool` token is cancelled; nothing is written (see below);
+  - a dialog the job's work has open for the user: it is closed as their Cancel would (see below).
+- **A stream is a job that outlives its call.** `start_stream` answers as soon as the stream runs, with `dataset_id`
+  and the `job_id` of a job that lives as long as the stream (`McpServer::answerCall` answers the call and leaves
+  the job running; `followStream` ties the two). The job ends `completed` when the stream ends on its own or anyone
+  stops it (`stop_stream`, the user removing the dataset), `failed` when it fails, `killed` on `job_kill`. Streams
+  count toward `kMaxRunningJobs`, and revoking a token stops the streams its agents started.
+- **Dialogs an agent caused.** `open_file` and `start_stream` with `ask_user`, and the confirmations of
+  `unload_file` and `load_layout`, put a dialog in front of the user. Each hands the job the closer of exactly that
+  dialog while it is up (`McpServer::dialogWatch`, a `dialog_presenter::DialogWatch` that the file loader, the
+  stream manager and the confirmations (`dialog_presenter::questionAsync`) each pass to what opens their dialog): the
+  job then reads
+  `waiting_for_user`, and a kill closes that dialog from the event loop, as the user's click would arrive. The
+  rejection is the tool's ordinary "cancelled" outcome, so nothing is applied, and it is the whole stop: a load at
+  its dialog is not also cancelled through `FileLoader::cancelLoad`. Revoking a token closes the dialogs its jobs
+  have open. No dialog is ever found by looking at
+  what is on screen: one the user opened is never touched.
+- **`export_series` writes off the GUI thread.** The handler stages the series on the GUI thread (the datastore's
+  readers belong to it) and hands the copy to `SessionManager::enginePool()`; grid building and writing run on a
+  worker, which polls its cancel token. A new temporary file is removed unless the export completes; a named
+  destination is written through `QSaveFile`, so a stopped or failed export never truncates a file that was there.
+  Only the staging read still runs on the GUI thread.
+- **Hang-up.** Whether a foreground job dies with its call's connection is per tool (`diesWithItsCall`). An agent
+  tool's does: it ends as killed, which also answers another session of the same client waiting on it. So does
+  `unload_file`'s, whose prompt is withdrawn: a client that left must not have data deleted later
+  (`stillAuthorized` already refuses from the moment the call hung up, before the tick notices). An import, a
+  stream and an export carry on as background jobs their client finds with `jobs_list`. So does `load_layout`'s
+  while it asks or downloads: a client that left must not have the user's workspace replaced later. A background job
+  ignores the connection of the call that started it.
+- **`notifications/cancelled`** kills the one foreground call of the same token and owner whose JSON-RPC id matches
+  `requestId` (`McpServer::cancelRequest`); none or several matches stop nothing, since ids are per client session.
+  A cancel that names no client (some name themselves on requests only) is matched on the token alone. The bridge
+  sends ids unique across bridges.
+- **Progress** is what the work reports, never a nested event loop: a load gives `{done, total}` in the producer's
+  own units (`FileLoader::loadProgress`, total 0 when unknown) or `{queued}` before its first tick; an evaluation
+  has none.
+- **Under the user's modal dialog** the three job tools run; a mutating job's continuation waits (state
+  `waiting_for_user`) rather than fail.
+- **The user's view.** `McpServer::unfinishedJobs` lists every client's running jobs (unlike `jobs_list`, which is
+  per client), `stopJob` stops one as its own client's `job_kill` would, and `jobsChanged` says the set changed.
+  `MainWindow` shows them in its status-bar indicator, which names the active client, counts the running jobs and
+  stays visible while anything runs; clicking it opens `McpJobsDialog` (not modal, so agents are not held up), one
+  row and one Stop button per job.
+
+- **Watching a stream.** `wait_for` (an agent tool, so the Assistant has it too) is a job that ends with the first
+  sample of one series, newer than the latest at the call, that satisfies a comparison, or fails at its timeout:
+  with `start_stream` and `job_kill` it covers "start a stream, watch it, stop it". It polls through the context's
+  `scan_values` hook from its cursor (`scanSeriesValues`, where a null is a NaN), not through an Arrow read.
+
+### MCP Tasks
+
+The server offers the MCP Tasks extension of protocol 2026-07-28 (`mcp::kTasksExtension`,
+`io.modelcontextprotocol/tasks`; not the 2025-11-25 core Tasks utility) as a second way to reach the same job
+table:
+
+- **Negotiation.** `server/discover` advertises it under `capabilities.extensions`; a client declares it per request
+  in `_meta["io.modelcontextprotocol/clientCapabilities"].extensions` (`mcp::declaresTasks`, kept in `Caller::tasks`).
+  Nothing here remembers an `initialize`, so a client of that era cannot opt in.
+- **Handle.** A job-capable call still answers directly when it ends within `wait_s`. At the handoff a declaring
+  client gets a `CreateTaskResult` (`resultType: "task"`) instead of the job-id text; a client that did not declare
+  the extension on that call never gets one. The task id is random (64 hex digits), minted at the handoff beside the
+  small job id, which the job tools keep using. `start_stream` is the exception (`answersBeforeItEnds`): its job
+  outlives the answer its call is owed, so it is never a task, only a job.
+- **Methods.** `tasks/get` returns the task (`McpServer::taskOf`) and, once it ended, the stored tool result;
+  `tasks/cancel` is `killJob` and acknowledges at once (cooperative: `tasks/get` says when it took effect);
+  `tasks/update` acknowledges, since a job never asks its client for input. A task of another client, an unknown or an
+  expired one is JSON-RPC `-32602`; a client that did not declare the extension gets `-32021`
+  (`mcp::kMissingClientCapability`) naming it. The bridge passes the three methods through whole.
+- **Status mapping.** Running and waiting for the user are `working` (with a `statusMessage`: the job's progress, or
+  that the user is being asked in PlotJuggler); completed *and failed* are `completed`, the tool result carrying
+  `isError`, because the extension keeps `failed` for protocol errors; killed is `cancelled`. `ttlMs` is null while
+  the job runs, then the time from its creation to its result's expiry; a task that advertised it is not evicted by
+  the `kMaxEndedJobs` count (its own bound is `kMaxEndedTasks`).
+- **Not built:** `notifications/tasks` and its subscription (optional for a server), and `input_required`.
+- No client is known to implement the extension; only this repository's tests exercise it.
+
+### Adding a job-capable tool
+
+The tool joins `mcp::isJobCapableTool`, gets its job id in `Caller::job`, and gives the job its stop and progress hooks
+as `McpServer::awaitLoad` does (through `liveJob`: the job may have been stopped meanwhile). Neither hook may block or
+spin a nested event loop. A tool that answers before its work ends uses `McpServer::answerCall`, as `start_stream`
+does; one that asks the user passes `McpServer::dialogWatch` to whatever opens the dialog. Whether the job dies with
+its call is decided in `diesWithItsCall`, and whether it can be an MCP task in `answersBeforeItEnds`. A test must not
+wait synchronously for a `job_kill` answer from inside the dialog's own modal loop: the loop cannot unwind until that
+wait returns.
+
+## Lifetimes and revocation
+
+- **Server.** `MainWindow` keeps one server from its first need until `~MainWindow` (`MainWindow::ensureMcpServer`,
+  random free port). The first need is either public access opening or a plugin's `acquire`. With no token left the
+  server keeps listening and refuses everything (401). `~MainWindow` destroys it right after `teardownAllToolboxes`:
+  each toolbox session revoked its token as it died, and no plugin is left to start the server again. This happens
+  before the services the agent sessions point into are destroyed.
+- **Endpoint.** `acquire` returns the endpoint already held until `release`; after a `release`, the next `acquire`
+  mints a new token. `McpEndpointHost` holds the server by `QPointer`, so a `release` after the server is gone is a
+  no-op, and a later `acquire` either opens an endpoint on a new server or fails with `PJ_ERROR_CODE_INTERNAL`. A
+  run of failed starts is reported to the diagnostics once, not once per `acquire`. `acquire` builds everything that
+  can throw before it mints the token, so a failed call holds none.
+- **Revocation is synchronous.** It runs on `release`, on the plugin's session dying (`McpServer::revoke`), and on
+  `closePublicAccess` for the public token. When it returns:
+  - the token is forgotten;
+  - its jobs are killed: each continuation is destroyed (releasing into services that are still alive) and its
+    record forgotten; a load is cancelled, keeping its partial rows, and its record goes when the load winds down;
+  - its open sockets are aborted, so a held reply then writes nothing.
+
+  `~ToolboxPanelSession` resets `mcp_endpoint` right after `handle` (the plugin may call `release` from its
+  destructor) and before every service the token reaches. Closing public access drops `agent_sessions_` after
+  revoking.
+- **Revocation from inside a result.** A reply or continuation can itself revoke a token, for example by tearing down
+  another plugin's session. `resumeDeferred` therefore takes one continuation out of its job at a time, so the
+  revocation still finds and drops the other jobs before their services die. Each job carries the round that last
+  resumed it, so a round never resumes its own follow-ups. The token is checked before a continuation runs and before
+  its follow-up is kept, and each continuation is destroyed right after it ran. The services of the result that is
+  running stay alive because agent tools never spin a nested event loop (`agent_tools::ToolResult::resume`). Should a
+  reply spin one anyway, the nested `resumeDeferred` returns at once (`draining_`), leaving the queue to the outer loop:
+  a nested call would move the round on under it, and the outer loop would then resume the follow-ups it queued again
+  and again.
+- **App work left for later** asks `McpServer::stillAuthorized(caller)` before it runs and again once the user has
+  answered its dialog. Once the token is gone, or the job the call runs as was killed, it applies nothing. This
+  covers:
+  - `start_stream`'s queued dialog (`StreamingSourceManager::startSession`'s `still_allowed`; a stream abandoned
+    after its dialog leaves no dataset behind);
+  - `open_file` and `reload_file` loads waiting in the queue or at their dialog (`LoadHints::still_allowed`, checked
+    in `FileLoader::beginLoad`);
+  - `unload_file`'s prompt (`confirmAndRemoveDependentTransforms`'s `still_allowed`);
+  - `load_layout`'s confirmation.
+- **A tool runs from the event loop**, never from inside its connection's own signal (`McpServer::dispatch` queues
+  the call): a tool may run a modal loop (the unload prompt, a stream's dialog), during which that connection can
+  close and be deleted.
+- **Held replies.** A tool that is not job-capable may still hold its reply: a dialog the user answers, a screenshot
+  frame. A job-capable one becomes a job ([Jobs](#jobs)), whose continuation is resumed every 50 ms, as the
+  Assistant's GUI tick does. Every request gets exactly one response; a call that went to the background got it
+  (the job id) and its result waits for `job_wait`.
+
+## Public access (external agents)
+
+- **On by default.** An attended run opens public access at startup unless the user turned off the Preferences →
+  Appearance switch "Let AI agents control PlotJuggler (MCP server)" (`MainWindow::kMcpServerKey`). An unattended
+  run (`--exit-after-layout`, `--screenshot`, `--dump-diagnostics`, the offscreen and minimal platforms, so every
+  test) opens it only with `--mcp`, so it never shows up as an instance an agent could pick. The switch shows whether
+  public access is open now; a plugin's endpoint does not count. OK applies the switch when it differs from the current state: it writes
+  the setting and either opens public access with a random token (discovery file written) or closes it (file
+  removed; plugin tokens keep working). `--mcp` opens it for one run without touching the setting.
+- **Indicator.** A status-bar button names the public client that called last (for two minutes after its last
+  request, or until public access closes), counts the jobs agents have running and stays while any runs; clicking it
+  lists them, each with a Stop button ([Jobs](#jobs), "The user's view").
+- **Discovery.** `<AppLocalData>/mcp-instances/<pid>.json` holds pid, port, token and start time, owner-only like its
+  folder. On Windows `setPermissions` only toggles read-only, so privacy there rests on `%LOCALAPPDATA%`'s per-user
+  ACL. `AppLocalDataLocation` needs only HOME, because agents start the bridge with a stripped environment. A starting
+  server deletes the files of dead pids (`ActiveWidgetsMarker::isProcessAlive`). The bridge deletes a file only when
+  its pid is gone or its port refuses; a slow or odd reply leaves it. Attended starts record the executable path
+  (`mcp-instances/executable`) for agent plugins that launch PlotJuggler.
+- **Bridge.** Its waits are bounded: 2 s connect, 5 s probes, 300 s per tool call (a job-capable call answers
+  within its `wait_s`; what can still take long is a dialog the user answers). It forwards one call at a time, but
+  reads stdin on its own thread: a `notifications/cancelled` naming the call in flight is forwarded to the instance
+  under the id the bridge gave that call; the bridge then drops that call's connection without waiting (the instance
+  may be unable to stop it) and the cancelled request gets no response. One naming a call still waiting behind it
+  drops that call unsent. A connection that closes with no
+  reply tells the agent PlotJuggler quit or turned MCP off, and to call `list_instances`. `tools/list` is the live
+  instance's list when exactly one instance answers (or one is selected), and the bridge binary's own list otherwise.
+
+## Browser relay
+
+The browser build's server does not listen; the page links to a relay instead. The plotjuggler-agent plugin starts
+`relay/pj_mcp_relay.py` when no desktop PlotJuggler is installed: the agent speaks MCP to it over stdio, and it listens
+on `127.0.0.1` (first free port of 7381-7390). Its `launch` tool opens the hosted app with
+`?mcp=http://127.0.0.1:<port>/?key=<secret>`; `main.cpp` hands that to `MainWindow::connectMcpRelay`, which opens public
+access and starts an `McpBrowserLink` (only a plain http, loopback relay with a port:
+`McpBrowserLink::acceptableRelay`). The desktop does the same with `--mcp-relay <url>`, the key copied from the relay's
+cache (`~/.cache/plotjuggler-agent/relay-key`).
+
+- **Protocol** (relay base `R`, JSON bodies, every request with `X-PJ-Link: <the url's key>`):
+  - `POST R/link/hello {"title", "protocol": 1, "browser"}` → `{"id"}`: the page is one relay instance
+    (`list_instances`, `select_instance`; ids are strings, unlike the bridge's pids). `browser` says whether its tool
+    list is the browser build's, which the relay keeps for its next sessions.
+  - `GET R/link/next?id=` → `{"seq", "client", "message"}` or, after 20 s, 204; 404 when the relay forgot the id
+    (it restarted), and the page says hello again.
+  - `POST R/link/reply?id= {"seq", "response"}`, whenever the server answers (held replies included).
+  - `GET R/file/<token>/<name>`: a file `open_file` named. The relay keeps `path` and adds `url` and `name`; the
+    browser's `open_file` streams the url into a `BrowserFileStore` file (at most `kMaxPresetDataBytes`) and loads it
+    like a picked file, the desktop's uses the path.
+- **Who gets in.** Each relayed message is answered as the public client the relay names (its MCP client's name, so
+  `agent-<client>`). The relay answers `/link/*` only with its secret, random and kept in the user's cache (mode 0600,
+  so a tab survives a relay restart: the new run answers 404 and the page says hello again), which `launch` hands out in
+  the URL it opens; pages and processes without it cannot join as PlotJuggler and take the agent's calls. The secret is
+  as private as that URL: browser history, the browser's command line, the app server's request log (it is a query
+  item), and it is only good against the loopback relay. A browser sends the custom `X-PJ-Link` header only after a CORS
+  preflight, which the relay answers only for its allowed origins (the hosted app, plus `PJ_RELAY_ORIGINS`, e.g. a local
+  `serve_wasm.mjs`), with `Access-Control-Allow-Private-Network` for Chrome's local network access. The page in turn
+  trusts whatever relay its `?mcp=` names, so it accepts loopback relays only: a link to `?mcp=` is a request to be
+  driven by that relay, as `--mcp-relay` is on the desktop.
+- **Tools.** The browser has no `about` (no feature catalog) and no `export_series` (the file would stay in the
+  page); `toolList` and the instructions leave them out there. `save_layout` writes no file and `load_layout` takes
+  no `path` there (the relay serves files only to `open_file`). MCP clients read `tools/list` once at startup, before
+  any page connects, and do not reliably refresh on `list_changed`, so the relay serves its bundled
+  `browser-tools.json` (regenerated from a build, see its README) until a page has connected, then that page's list,
+  cached for the next sessions.
+- **Files.** The page cannot read the agent's disk: the relay serves the file `open_file` names and passes its url,
+  which the page downloads into a staged file (`McpServer::fetchAndLoad`). The server remembers what each dataset
+  was downloaded from, so `reload_file` asks the relay for the file again, as it is now, and loads it over the
+  dataset in place (`LoadHints::replace_dataset_id` with `require_replacement`). A dataset the user picked by hand
+  has no such url and is refused, as the Reload button treats it; so is one the user has since replaced with a file
+  of their own (the url is kept only while the dataset has the source identity it was loaded with). Not covered: a
+  file that loaded as several datasets (a strict replacement refuses a fan-out), and an import stopped with its
+  partial rows kept (it never recorded its url).
+- **Lifetime.** The link is a child of the server, deleted with it (in `~QObject`, after the server's members); its
+  in-flight replies are deleted without emitting `finished`, so no callback reaches the server then, and replies the
+  server still holds check the link through a `QPointer`. A relay that is down is retried, backing off to 10 s, while
+  the page lives; the relay forgets a page that has not polled for 120 s. One relay serves one agent session, so a relay
+  that forgot the page (404) or failed two polls in a row is a session that ended: the link deletes the object it gave
+  that session's calls as their connection, which the server treats as a desktop client hanging up (a job that dies with
+  its call is killed, the others carry on for their client to find), and no answer of the old session is posted into the
+  next one, whose message numbering starts over. In the browser a `QNetworkReply` never frees its body
+  (`pj_runtime/docs/TECHNICAL_NOTES.md`): relay messages are small, so a session leaks kilobytes.
+
+## The plugin endpoint (`pj.mcp_endpoint.v1`)
+
+The SDK contract, with the authoritative wording in `plugin_data_api.h`:
+
+```c
+typedef struct { PJ_string_view_t url; PJ_string_view_t bearer_token; } PJ_mcp_endpoint_t;
+typedef struct PJ_mcp_endpoint_host_vtable_t {
+  uint32_t protocol_version; uint32_t struct_size;
+  bool (*acquire_endpoint)(void* ctx, PJ_mcp_endpoint_t* out_endpoint, PJ_error_t* out_error);
+  void (*release_endpoint)(void* ctx);
+} PJ_mcp_endpoint_host_vtable_t;
+```
+
+- **Main thread only.** Both strings are host-owned and stay valid until `release_endpoint` or the end of the
+  service's lifetime; a plugin copies them. The service itself stays valid until the plugin instance is destroyed,
+  so the plugin may release from its destructor.
+- **Credentials.** The url and token do not expire, and the host does not revoke them unasked while the plugin
+  instance and the server live. If the client is refused, the plugin recovers by calling `release_endpoint` and then
+  `acquire_endpoint`, which mints a new token. The token is the endpoint's only credential. It goes to the client the
+  plugin launches and nowhere else: no logs, no persisted config.
+- **Optional.** The host registers the service in every `buildToolboxPanelSession` (desktop only). A registration
+  failure warns and does not fail the session. A plugin asks for it with `McpEndpointHostView` (`valid()` false when
+  the host lacks it) and tests against `PJ::sdk::testing::FakeMcpEndpointHost`.
+- **Versioning.** The service is additive in SDK 0.40.0 (feature floor group in `pj_base/feature_floors.json`). A
+  plugin that needs it declares `min_sdk_required: "0.40.0"`. That field is what the marketplace gates on;
+  `min_plotjuggler_version` is display-only.
+
+## The Assistant as a consumer
+
+- **Per-turn acquire.** On every turn, on the GUI thread, `AssistantDialog::sendCurrentInput` acquires the endpoint
+  (the same one while held) and hands it to the backend in `TurnTools::mcp`. A failure ends the turn with a chat note,
+  "This PlotJuggler cannot serve the Assistant's tools: …", which for a host without the service reads "it offers no
+  MCP endpoint to plugins." A PlotJuggler older than SDK 0.40.0 never gets that far: it refuses to install or load the
+  plugin (`min_sdk_required`). The plugin never releases; its session teardown revokes the token.
+- **Claude backend.** The CLI runs with `--tools ""` (no built-in tool: no shell, no filesystem), `--restricted`
+  (none of the user's settings or CLAUDE.md), and `--mcp-config <0600 temp file>` with `--strict-mcp-config` and
+  `--allowedTools mcp__pj`. The config file holds the url and the token. It is written through `writePrivateTempFile`
+  and reused per endpoint.
+- **Codex backend.** The url goes on argv (`mcp_servers.pj.url`). The token goes only through the environment
+  (`bearer_token_env_var`, `PJ_ASSISTANT_MCP_TOKEN`), never on the command line.
+- **Context.** The catalog digest (`catalog_digest.cpp`) summarises the loaded topics into the system prompt. It is
+  rebuilt every turn and re-sent only when its hash changes. The tools themselves all come from the host.
+
+## UI tools (QA)
+
+They let an agent use PlotJuggler as a user does, to find what unit tests and the data-level tools cannot reach:
+menu and dialog wiring, focus, undo across widgets, odd click orders. They exist for automated exploratory QA, so a
+run turns them on with `--mcp-ui-tools` (which implies `--mcp`), never a setting, and they are not listed otherwise.
+Desktop only: the browser build has no command line to ask for them, so it does not compile them.
+
+- `ui_tree` prints the visible windows as one indented line per widget, `[ref] Class#objectName "text" (flags) WxH`
+  (flags such as `disabled`, `checked`, `read-only`, `focus`, `modal`; button text without mnemonic markers, which some
+  platform themes add, so a script reads the same offscreen and on X11), the open popup and the modal dialog first; a
+  window a modal dialog blocks (as Qt decides it) gets one line, and a target in it is refused, since the window system
+  would drop its input. Unnamed, textless Qt containers are left out and their children listed in their place. Menu
+  actions, tabs and the rows visible in item views are items with refs of their own. Refs are the latest `ui_tree`'s:
+  each call starts a new table and the numbering goes on, so an older ref reads as stale rather than naming another
+  widget. A row ref holds a `QPersistentModelIndex` until the next `ui_tree`; a tab ref holds its index and text, and
+  reads as stale once another tab sits there. The other tools also take a widget's `objectName`, which is stable (root
+  `CLAUDE.md`) and so suits a repro script; a name several visible widgets share (outside the windows a modal dialog
+  blocks) is refused rather than resolved to whichever a search finds first. A popup or child dialog is a window and
+  also a child of its owner: the name search counts it once, so a name in an open popup is not ambiguous.
+- `ui_plot` reads what the canvas paints and `ui_tree` cannot show: per visible plot its dock title, X and Y ranges,
+  curves, and the tracker's value box as the user reads it (rows, empty when hidden). Ranges are fixed at three
+  decimals so a script can `expect` their exact text; the value rows follow the precision preference (3 by default,
+  as in a fresh `pjqa` home). Read-only, no settle time.
+- Input goes through `QWindowSystemInterface`, the path a real mouse and keyboard take, so popups, implicit grabs,
+  focus on click, shortcuts and double-click synthesis behave as for a user. Points are scaled to native pixels, as a
+  platform plugin reports them. It is queued (`AsynchronousDelivery`), and what has no queued form (the wheel,
+  focusing and activating before keys) is deferred to the event loop: a click that opens a modal dialog, or a
+  focus change whose handler opens one, does not block its call inside the dialog's `exec()`. The server answers
+  after `wait_ms` (`mcp::uiSettleMs`, read before the input is queued so a bad value cannot fail a call that already
+  acted), from a timer, which also fires inside such a dialog's loop. Each call's mouse input is stamped at least a
+  double-click interval after the previous call's, so two calls on one spot never make a double-click.
+- They act as the user, so they run under the user's modal dialogs (closing one is often the point):
+  `mcp::runsUnderUsersDialog` says so, and `ui_tree` and `ui_plot` are among `mcp::isReadOnlyTool`'s. Their list entries and
+  that classification live in `McpProtocol`, with the others; `McpUiTools` holds only the driver.
+- Limits: drag-and-drop (`QDrag`: the curve list onto a plot, dock moves) never completes. Offscreen's drag is a
+  stub that ignores every drop, and X11's drag loop follows the server's real pointer, which this input never
+  moves; gestures inside one widget (zoom box, pan, splitters, sliders) work. A QA session builds plots from a
+  layout or through menus instead. Keys go
+  to the target's window after activating it, since window shortcuts need the active window: run QA sessions in a
+  virtual display (`xvfb-run`, or `QT_QPA_PLATFORM=offscreen`), not on the user's desktop. On macOS the platform
+  plugin, not `QWindowSystemInterface::handleKeyEvent`, delivers shortcuts, so `ui_key` shortcuts are not expected to
+  fire there although the reply says the keys were pressed (not tried on a Mac). `ui_type` presses its keys into the
+  window chosen when the call came in: text after a `\n` that closes that window goes nowhere, so split it into two
+  calls.
+- Running a session: `scripts/qa/pjqa.py` starts an isolated offscreen instance (private HOME, `--mcp-ui-tools`),
+  sends it tool calls over HTTP with its discovery token, saves screenshots, and replays scripts of named-widget
+  steps. `pjqa.py regress` replays every script in `scripts/qa/regressions/`, each in a fresh instance started as its
+  `# app:` header says: the bugs QA found, kept as UI-level regressions next to their unit tests. How an agent explores with it, and what it reports: the `qa-session` skill
+  (`.claude/skills/qa-session/`) and the `qa-engineer` agent (`.claude/agents/`).
+
+## Widget state
+
+`widget_state` reads and `set_widget_state` replaces a dock's settings as the XML element a layout saves for it
+(`DockWidget`'s `IDataWidget` state calls, forwarded to the plot or object widget it hosts), on any tab, the user's included. Docks are addressed by their
+layout state id (`DockWidget::stateId`), which `list` gives with tab, title and kind (the element's tag; `empty` for a
+dock with no state).
+
+- **Options come from the parsers.** Each widget's `xmlValidateState` is a parse-only check that reads every attribute
+  `xmlLoadState` reads through reporting readers (`pj_runtime/XmlStateOptions.h`: `readXmlEnum`, `readXmlBool`,
+  `readXmlInt`, `readXmlFloat`, `readXmlDouble`, `readXmlText`; a family's own raw read, such as a colour, reports with
+  `XmlOptionsRecorder::noteOption` and words its rejection with `xmlValueProblem`, so every reason reads alike). `get`
+  validates the dock's own saved state under an `XmlOptionsRecorder` and returns what it recorded: per element tag,
+  each attribute's type, tokens or bounds, and default. The list is the parser, so it cannot claim a value the parser
+  refuses. Each family's test asserts `xmlSelfDescriptionProblems` is empty for its saved states (every saved
+  attribute reported, every reported token accepted), so an attribute added to `xmlSaveState` without a reporting
+  reader fails there.
+- **Readers are strict for agents, tolerant for layouts.** A reader given `XmlBadValue::kTolerate` keeps what a
+  layout load always did with a bad value (the default) but still notes it as a rejection; `set_widget_state`
+  refuses any element with a rejection. Without a recorder (`XmlOptionsRecorder::active()` false) the work done only to report is skipped,
+  so a layout load does not pay for it.
+- **`set_widget_state` changes nothing unless the element is accepted.** The root tag must match the dock's. A plot keeps its own
+  `id` (it names the plot in pending bindings and saved layouts, so an element copied from another plot must not bring
+  that one's), and its curves are rebound from their series paths as a layout load does
+  (`layout_xml::normalizePlotRangeBasis`, `rebindCurveKeys`): an unresolved path refuses the call. `xmlValidateState`
+  runs under a recorder, whose first rejection is the error (`<pointcloud> size_pixels="50": expected a number in [1,
+  32]`); an attribute the recorder never saw (`unreportedXmlAttributes`) is refused as unknown, unless the widget
+  reports nothing at all (its state is opaque). Only then the load, `DockWidget::applyState` (as a paste:
+  `finishRestore()`, first-topic seeding of an empty object widget). If the load refuses, or leaves a topic waiting
+  that was not waiting before (`IDataWidget::unresolvedRestores`: a layer or Log topic that is not loaded would show
+  nothing), or drops an element (`IDataWidget::takeRefusalReason`: a scene refuses a layer of another dataset than the
+  one it shows), the saved previous state is loaded back and the reply names the reason.
+- **The element is the whole state, view included.** A scene's camera and a plot's axis range travel with it, so an
+  element from an older `get` puts them back where they were then (a followed frame moves the camera meanwhile); the
+  tool's description tells agents to `get` right before `set_widget_state`.
+- **The user's history and panels.** `MainWindow::beginAgentDockChange` refuses a change while a layout load or an
+  undo restore is applying, and first records a user edit still waiting in the scene undo debounce as its own step;
+  `endAgentDockChange` records the change as one undo step, re-reads the settings panel when the dock is the focused
+  one (the 3D panel pushes every value it shows on its next edit, so a stale panel would undo the change) and shares
+  a time plot's new X range with the linked plots as a user zoom does. `widget_state` runs while the user has a
+  dialog open (`runsUnderUsersDialog`); `set_widget_state` waits. `widget_state` with action `set` is a tool error
+  naming `set_widget_state`.
+
+## Layouts
+
+`save_layout` and `load_layout` read and replace the whole workspace as layout XML, through the menu's own code:
+
+- **Save.** `MainWindow::layoutFileBytes` is what File → Save Layout writes (`saveLayoutToPath` is it plus
+  `writeLayoutFile`). With a `path` (desktop) the tool writes the menu's file and answers `path` and `bytes`, not the
+  text: bound to its sources unless `bind_sources` is false (`layout_xml::kBindSourcesByDefault`, the save dialog's
+  default), credentials kept, data paths relative to its folder, a recent layout. `outputPathError`, shared with
+  `export_series`, refuses a relative path, one not ending in `.xml` (`.pj4.xml` is added to a path with no
+  extension, as the menu adds it), a folder, and an existing file unless `overwrite`. Without `path` the tool returns
+  `xml`, which reaches the agent: generic unless `bind_sources` is true, and then with absolute data paths (text has
+  no folder). Every configuration in it (a file's or a stream's `<plugin>`, a `<materialize>` descriptor, a pinned
+  `<toolbox>`, a Custom Widget's `<config>`, a filter's `<processor>`, a derived series' `<params>`) goes through
+  `configForAgent`; only one whose redaction changed something is rewritten, so the others keep their text byte for
+  byte (a stream's configuration text is how a load finds it running). In the browser `path` is refused: the page
+  cannot write the agent's disk.
+- **Load.** One of `xml`, `path` or `url`, each parsed and checked to be a layout (a `<root>` holding a
+  `<tabbed_widget>`) with no redacted secret before anyone is asked: no configuration (the tags save's text redacts)
+  holds `mcp::kRedacted` where redaction puts it, a string under a key naming a secret (`mcp::holdsRedactedSecret`). A
+  redacted secret would be applied as the sentinel itself (a stream would not match the running one, and a second
+  session would start with `<redacted>` as its password), so the refusal says to round-trip through
+  `save_layout {path}` and `load_layout {path}`, whose file keeps the secrets, or (in the browser, which has neither)
+  to put the real values in. The sentinel under any other key is a value like any other, and text that is not JSON is
+  not checked. Text is parsed as a QString, so an encoding declaration in it is ignored; a file through
+  `MainWindow::readLayoutFile`; a `url` once `PresetController` has downloaded it (only the layout: data files beside it
+  are not fetched). The parsed document goes to `MainWindow::loadLayoutForAgent`, the body of
+  `loadLayoutFromPath` past its read (`loadLayoutDocument`) as `--layout` runs it
+  (`LayoutLoadInteractivity::kAutomated`): the layout's data files and streams load when not loaded already, missing
+  curves are kept and reported, and no dialog opens. Its `LayoutOrigin` names it in messages (`xml`, the URL, the path)
+  and, for a file only, gives the folder relative paths and Scene3D resources resolve against and the recent-layout
+  entry (the cleaned absolute path). Text and a URL have no folder: a relative data path in them is reported
+  (`relative-path-unresolved`) and binds nothing. A URL anchors the layout's relative Scene3D resources (robot models
+  and their package roots) where the download ended, after any redirect, while
+  messages name the URL asked for; in text a relative one fails the load. In the browser `path` is refused (pass the file's text).
+- **One load at a time.** The diagnostics a reply quotes do not say which load reported them, so `load_layout` is
+  refused as busy while an agent's load runs (from its checks to its reply) or `MainWindow::layoutLoadInFlight` (a
+  progressive restore waiting for its data, a browser pick or URL load). The check is repeated when a download ends,
+  before the user is asked, and once they have answered. A download that ends while the user has a modal dialog open
+  is refused as a call under it is.
+- **Whose end.** `layoutRestoreSettled` carries the id of the load that ended (`MainWindow::nextLayoutLoad`, read
+  just before `loadLayoutForAgent`), and the reply takes only its own. A load keeps the id it took on entry through
+  its questions, so a load started from one of their nested event loops never takes it. The user's own load
+  supersedes an agent's progressive restore (as it would their own) at its commit point: on the desktop before a
+  reload enqueues or the sync apply; in the browser before a source-bound layout's imports start or the apply. The
+  superseded restore settles false with a "Layout" diagnostic (`layout-superseded`), so the agent hears its layout was
+  not loaded, and the user's load settles on its own. A superseded restore is not rolled back: if the user's load
+  then fails, the workspace keeps what the agent's restore had applied.
+- **The user's consent.** Unlike every other tool, a load replaces the user's tabs and derived series. When
+  `MainWindow::layoutLoadWouldDiscardWork` says the workspace holds anything (a dock holding a plot or a widget, a
+  derived series, object or marker rule, an open toolbox, undo history), the user is asked first ("Replace" /
+  "Cancel"), as a job: past `wait_s` the agent gets its job id, `job_kill` withdraws the question, and a call that
+  hangs up withdraws it too. Cancel loads nothing. A workspace with nothing in it is replaced without asking.
+- **Stopping.** `job_kill` withdraws the question or cancels the download, and the job ends `killed`; a stop that
+  reaches the job just before the user's answer is handled wins too, since the answer asks `stillAuthorized`, which
+  refuses a job being stopped. Once the layout applies it cannot be stopped halfway (a restore waiting for its files
+  would leave their data behind a workspace that no longer shows it): the stop is declined at once, its answer (the
+  job's status, whose progress says the load completes) comes without waiting, and the job ends with the load's own
+  outcome.
+- **The answer** is `loaded` and the warnings reported meanwhile (every "Layout" diagnostic at warning level or
+  above, such as a newer `pj4_version`, a data file that is gone, a relative path, curves the data lacks or a dataset
+  chosen for the layout, and a layout data file's "File Loader" load failure), each once; the apply failure's
+  summary, which quotes issues already reported, only when it is the sole reason. Or an error with the app's
+  reasons. Diagnostics reach `QtDiagnosticBridge` queued: those posted before the load are delivered before the
+  capture starts, those posted before its settle are delivered at the settle, where the capture ends, and the reply
+  is sent one event-loop turn later.
+- **Ownership.** Agents' tabs persist with their owner (`owner_plugin`) and their derived series with their owner's
+  transform keys, and a load restores both as they were saved: the same `agent-<client>` gets them back (`get_status`
+  `agent_tabs`, `list_created`, `plot_tab`), any other client sees them as someone else's.
+
+## The user comes first
+
+- While a modal dialog is open, only read-only tools run (`screenshot` and `widget_state` among them); the rest are
+  told to wait. `screenshot` takes no `tab`: a call that passes one is a tool error naming `plot_tab` / `scene_view`
+  `focus`.
+  The UI tools are the exception: they are the user, in a run that asked for them.
+- `unload_file` with dependent derived series waits for the user's answer to the prompt (the `cancelled` hook of
+  `confirmAndRemoveDependentTransforms`), as a job: past `wait_s` the agent gets its job id. `load_layout` asks the
+  same way before it replaces a workspace that holds anything ([Layouts](#layouts)).
+- A dialog opened because an agent passed `ask_user` is titled "An AI agent asked you to choose: ...". The prefix
+  travels `LoadHints::dialog_title_prefix` → `DataSourceRequest::title_prefix` → `DialogEngineConfig::title_prefix`
+  (for streams, `StreamingSourceManager::startSession`).
+- `start_stream` with `ask_user` opens the named source (checked against `streamSources()`) once its request has
+  returned, and only if no modal dialog came up meanwhile. The start does not wait for its dialog
+  (`StreamingSourceManager::startSession` reports through its `done`): a browser cannot block on one.
+- The user sees what agents are running and stops any of it ([Jobs](#jobs), "The user's view").
+
+## Protocol and security
+
+- **Both protocol eras** on one endpoint and over stdio: `initialize` (2025-06-18 and kin) and the stateless
+  2026-07-28 `server/discover`. Every response is plain JSON: no session id, no SSE.
+- **Every token kind:**
+  - Requests need the bearer token (401 otherwise, compared in constant time), and any `Origin` is refused (403).
+  - `mcp::parseRpcMessage` validates the envelope on both ends. Malformed input, or JSON nested deeper than 64 levels,
+    gets a JSON-RPC error.
+  - Size caps: 16 KiB of headers and a 1 MiB body (also the bridge's stdin line cap).
+  - At most 16 sockets; an incomplete request is closed after 10 s.
+- **`export_series`** by default writes a new owner-only, randomly named file (`QTemporaryFile`). A named `path`
+  must end in its format's extension (`.csv`, `.npy`, any case), and a file already there is refused unless the call
+  passes `overwrite: true`, at the call and again just before the new file is put in place (one may appear while the
+  export runs); it is replaced only once the new one is complete (`QSaveFile`). It refuses more than 10
+  million rows and reports a failed write, flush or close.
+- **Plugin configurations** reach an agent only through `mcp::redactSecrets` (`get_status`, the `open_file` and
+  `start_stream` results, `save_layout`'s text, and the job summaries `jobs_list` and the Jobs dialog show): every
+  non-empty string under a key that names a secret (password, passwd, secret, token, apikey, privatekey, credential,
+  anywhere in the key, ignoring case, `_` and `-`), and everything under such a key, reads as `mcp::kRedacted`. An MQTT
+  source saves its `password` and a WebRTC source its `bearer_token` and ICE `credential`s in the configuration. Passed
+  back, the sentinel keeps the saved value at the same key path (`mcp::restoreSecrets`) only when the configuration, its
+  secret keys aside, is the saved one unchanged: a changed broker address, server URL or ICE entry would carry the saved
+  secret where the user never sent it, so such a call is refused, naming the key paths that differ (pass the secret
+  itself, or `ask_user`). The rule is generic: it compares the whole document and knows no plugin's keys. The saved
+  configuration is, for a stream, the one the user last confirmed in the source's dialog (what `start_stream` uses
+  without `config`); for a file, the one the same file was loaded with (in the browser a page's file never matches, so a
+  sentinel there is refused). With no saved value at a sentinel's path the call is refused, naming it. `ui_tree` reads a
+  password field as its mask.
+- **Names from files are data.** The instructions quote every dataset, topic and field name as a JSON string and say
+  they are data, not instructions (see [Tool sets](#tool-sets)).
+- **Logging.** No token is ever logged, and server logging goes to the `pj.mcp` category.
+- **Trust boundary.** It is the same user. The bridge is a convenience, not a security layer. With public access on
+  by default, any process of that user can read the discovery file and drive the window; the Preferences switch
+  closes it. A plugin token is capability-scoped (agent tools only, the plugin's own identity), but any local process
+  of that user that learns it can use it until it is revoked.
+
+## Tests
+
+- `pj_app/tests/mcp_server_test.cpp`:
+  - `McpServerTest`: protocol, security, owners, deferred results, public access.
+  - `McpJobTest`: the job table through synthetic continuations: the handoff at `wait_s`, `job_wait` and `job_kill`,
+    ownership, limits and expiry, hang-up, revocation, `notifications/cancelled`, the modal gate, the user's view,
+    and the MCP Tasks methods.
+  - `McpQueuedLoadTest`, `McpActiveLoadTest`: killing and revoking a load in the queue and one held active by an
+    in-test source, with and without `keep_partial`.
+  - `McpStreamAndDialogJobTest`: a stream as a job (kill, someone else's stop, revocation) and `job_kill` closing
+    each of the three dialogs an agent's call opens; a hung-up `unload_file` withdrawing its prompt.
+  - `tests/wasm/mcp_relay.spec.js`: the browser page driven through an in-test relay
+    (`tests/wasm/support/mcp_relay.js`, the page protocol of `pj_mcp_relay.py`): `reload_file` of a file the relay
+    served, and a stream dialog an agent asked for, opened and withdrawn.
+  - `McpEndpointTest`: plugin tokens. Covers the forced owner, refused app tools, the `tools/list` profile, no
+    discovery file, release and teardown revocation, disconnects, distinct tokens per plugin, and the same endpoint
+    on a repeated acquire. Also a session torn down from inside another's resume, and a revoked token's follow-up.
+  - Revocation of public access before or under an agent's queued dialog: nothing is applied.
+  - `UiToolsClick…`: the UI tools are hidden and refused unless the run asked for them; once on, `ui_tree` lists the
+    user's modal dialog first and `ui_click` closes it through the window system. `UiToolsAnswer…`: a click that opens
+    a modal dialog is answered while it is open, and `ui_key` Escape closes it. Both run again at
+    `QT_SCALE_FACTOR=2` (`pj_app_gui_tests.dpr2.*`), where unscaled input would miss its widget.
+  - `ARelayedCall…`, `ALinkForgotten…`, `OnlyALoopbackHttpRelay…`: the browser link against a fake relay.
+  - `WidgetStateReadsDescribesAndReplacesAUsersDock`: `widget_state` on a user's plot: listed, the options its parser
+    reports, a `set_widget_state` that is one undo step, the plot's own id kept from a copied element, refusals (bad
+    value, other root, missing series, unknown attribute) that change nothing, and the old `set` action refused.
+    `WidgetStateRefusesATopicThatIsNotLoaded`: a Log panel's `set_widget_state` naming a topic that is not loaded is
+    refused and the panel keeps its topic. `WidgetStateRefusesALayerOfAnotherDataset`: a 3D view's `set_widget_state` adding another dataset's layer is refused with the
+    view's reason and the view keeps its layers.
+    Each widget family tests its own `xmlValidateState` and option coverage.
+  - `McpLayoutTest`: `save_layout` writes what the menu's save writes and answers its path, overwrites only a layout
+    file, returns generic text unless asked and redacts a stream's secret in bound text; `load_layout` from text, a
+    file and a URL restores the agent's tab and series as its own, records only a file as a recent layout, asks when
+    something would be lost (a toolbox, undo history), refuses XML that is no layout before asking, ignores the
+    text's encoding declaration, reports a relative path in text, is refused while another load runs, and returns
+    the app's warnings and errors without opening a dialog; a URL download is killed by `job_kill`.
+  - `TheInstructionsListEveryTopicOrNoneAndStayUnderTheCap`, `InitializeSaysWhatIsLoaded`: the summary's
+    all-or-nothing rule, quoting and cap. `ConfigSecretsReadAsTheSentinel…`, `AStreamConfigsSecretsAreRedacted…`:
+    redaction and the sentinel (refused for a changed configuration), for a file and a stream.
+    `ANamedExportNeedsItsExtension…`, `ANamedExportKeepsAFileThatAppearedWhileItRan`: the export guard.
+- `pj_app/tests/mcp_protocol_test.cpp` (runner `pj_app_unit_tests`): the HTTP and JSON-RPC gates, `redactSecrets` and
+  `restoreSecrets`, and `McpAnnotations`: every listed tool has a title, the four hints and described parameters.
+- `pj_app/tests/mcp_bridge_test.cpp`: the bridge over stdio against the built app, and against a fake instance the
+  test answers by hand (a cancellation forwarded while its call is in flight).
+- `plotjuggler-agent/tests/test_relay.py`: the relay against a fake page (routing, `open_file` serving, origins).
+- `pj_runtime/tests/agent_tools_*` (runner `pj_agent_tools_tests`) for the agent tools, against the `PJ::testing`
+  fakes.
+- SDK: `pj_base/tests/mcp_endpoint_host_test.cpp` plus the ABI sentinels.
+- Assistant: its own suite in `toolbox_assistant_agent/tests` (`tests/support/test_endpoint.hpp`). Live tests against
+  a running instance are opt-in.
+
+## Known gaps
+
+- Plugin tokens get the agent tools only, so the Assistant cannot open files or start streams.
+- A plugin token is not bound to the process the plugin spawned (see the trust boundary above).
+- The bridge forwards one call at a time, so two calls of one session overlap only as a background job plus a
+  foreground call, and a `tasks/get` or `tasks/cancel` waits behind a call still in its `wait_s`.
+- The browser relay (`pj_mcp_relay.py`, in the `plotjuggler-agent` repository) does not forward notifications or the
+  `tasks/*` methods, nor pass on the page's extensions, so `notifications/cancelled` and MCP Tasks do not reach a page;
+  only the job tools do.
+- The Assistant's Stop ends its agent CLI but not the jobs that turn left running: the plugin
+  (`pj-official-plugins/toolbox_assistant_agent`) does not release its endpoint on Stop, which would revoke its token.
+- Protocol 2026-07-28 is spoken only as far as agents have needed: ordinary results carry no
+  `resultType: "complete"`, and `server/discover` keeps the `serverInfo` field of the earlier era.
+- The server is stateless, so it cannot tell two sessions of one client apart: a cancellation that arrives after its
+  call ended can stop another session's foreground call that reuses the same JSON-RPC id. Bridge traffic is immune
+  (unique ids); it concerns clients that speak HTTP to the server directly.
+- Killing an evaluation is acknowledged when its handle is released, not when its pool worker has exited.
+- Held calls and waits share the 16-socket cap: many clients each holding calls for their full `wait_s` can keep a
+  `job_kill` from connecting until one returns.
+- A plugin's message box raised while an import runs (`FileLoader`'s plugin message-box gate) is not a dialog a job
+  can close: the import's kill stops the load at the producer's next progress callback instead.
+- `export_series` still stages its series on the GUI thread, and the row cap is per export: several wide exports at
+  once hold several copies. Its write runs on `EnginePool`'s shared lane, which a machine with two or three cores
+  sizes at one thread: derived evaluations wait there until the file is written.
+- A named export is written beside its destination and replaces it only once complete, so it needs a folder it can
+  write to: exporting over a writable file in a folder that is not fails ("cannot create"). Writing in place instead
+  would let a stopped export truncate the file.
+- A `create_derived_object` stopped during its first read-back answers `killed` although the object is installed,
+  and the read-back's removal of an object whose script fails is skipped: `list_created` shows it and
+  `remove_derived_series` removes it.
+- A `load_layout` from a `url` loads the layout's data files and streams as text does, so a layout on the web can
+  name a file on this machine or start a stream; an agent's own `xml` can carry the same.
+- A layout's `owner_plugin` and transform owners are taken as written: text an agent passes can name another
+  client's tabs and series as theirs.
+- `save_layout`'s text drops a `<config>`, `<processor>` or `<params>` whose text is not JSON: redaction cannot see
+  into it, so keeping it could hand the agent a secret. The file at `path` keeps it.
+- `widget_state` lists only what a parser checks. A value set from data (a point cloud's colour field, a frame name)
+  is reported as `text`: the agent learns the field names from `describe_topic`, not from `get`. A Custom Widget
+  plugin's state is opaque to the host and reports no options; its `set_widget_state` is not validated before the plugin's own
+  `xmlLoadState`.
+
+## Evidence
+
+- **The loaded summary in the instructions:** with it, Claude Code agents used half the turns and 26-32% less time on
+  lookup tasks than with discovery calls alone (Claude Code, which puts the instructions in its system prompt; task
+  set and dates not recorded). That was measured with the earlier summary (up to 60 topics, 40 fields each, about
+  6 kB, unquoted names, cut where the caps fell); the all-or-nothing summary under `mcp::kMaxInstructionsChars` was
+  not measured again. Re-test with a catalog that fits and one that does not.
+- **Claude Code's instructions cap:** Claude Code cuts MCP server instructions at 4,096 characters by default (its
+  changelog: raised from 2,048; `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH` changes it), and text past the cap never
+  reaches the model. It is a client limit, not an MCP constant: `mcp::kMaxInstructionsChars` keeps a margin under
+  it. Re-check when Claude Code changes its default.
+- **`npy` export:** `numpy.load` reads it about 30-100x faster than `numpy.loadtxt` reads the CSV (sizes not
+  recorded).
+- **Hand-written HTTP:** QtHttpServer is GPL-3-only, which the MPL-2.0 desktop app does not link.
+- **Claude Code 2.1 sends only `server/discover`,** never `initialize`, so the bridge asks the instance for its
+  instructions on both calls.

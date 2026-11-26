@@ -40,9 +40,6 @@
 
 namespace pj::scene3d::test {
 
-// Runs before main(); see pjPreferRealDisplayQpa().
-inline const bool kRealDisplayPlatform = pjPreferRealDisplayQpa();
-
 // Arms the shader-named fault injection (PJ::kRhiTestFailShaderEnv) for `shader`,
 // a shader path suffix, until clear() or destruction.
 class PipelineFault {
@@ -109,7 +106,7 @@ inline std::vector<uint8_t> serializeTfEdges(
   PJ::sdk::FrameTransforms transforms;
   for (const auto& [child, offset] : children) {
     PJ::sdk::FrameTransform edge;
-    edge.timestamp = t_ns;
+    edge.timestamp_ns = t_ns;
     edge.parent_frame_id = parent;
     edge.child_frame_id = child;
     edge.translation = {offset.x, offset.y, offset.z};
@@ -156,7 +153,6 @@ class Scene3DRenderFixture {
     return *id;
   }
 
-  // Pushes one more object at `t_ns` for a registered topic.
   void push(PJ::ObjectTopicId id, PJ::Timestamp t_ns, std::vector<uint8_t> bytes) {
     EXPECT_TRUE(session_.objectStore().pushOwned(id, t_ns, std::move(bytes)).has_value());
   }
@@ -168,7 +164,6 @@ class Scene3DRenderFixture {
   PJ::Scene3DDockWidget* dock() {
     return dock_;
   }
-  // The dataset every add()ed topic belongs to.
   [[nodiscard]] PJ::DatasetId dataset() const {
     return dataset_;
   }
@@ -205,7 +200,6 @@ inline QImage grabStable(pj::scene3d::SceneViewWidget& view) {
   return previous;
 }
 
-// |dR| + |dG| + |dB|: how visibly a pixel changed between two frames.
 inline int channelDeltaSum(QRgb a, QRgb b) {
   return std::abs(qRed(a) - qRed(b)) + std::abs(qGreen(a) - qGreen(b)) + std::abs(qBlue(a) - qBlue(b));
 }
@@ -225,12 +219,10 @@ inline int differingPixels(const QImage& a, const QImage& b, int threshold = 0) 
   return count;
 }
 
-// max(|dR|, |dG|, |dB|): the per-channel tolerance a golden comparison applies.
 inline int maxChannelDelta(QRgb a, QRgb b) {
   return std::max({std::abs(qRed(a) - qRed(b)), std::abs(qGreen(a) - qGreen(b)), std::abs(qBlue(a) - qBlue(b))});
 }
 
-// Pixels of `image` in `area` (the whole image when empty) whose colour satisfies `match`.
 inline int countPixels(const QImage& image, const std::function<bool(QRgb)>& match, QRect area = {}) {
   area = area.isEmpty() ? image.rect() : area.intersected(image.rect());
   int count = 0;

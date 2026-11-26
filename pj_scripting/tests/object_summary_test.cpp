@@ -1,7 +1,7 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 
-// EVAL-05: the summary of an object output that an evaluation report carries instead of its bytes.
+// The summary of an object output that an evaluation report carries instead of its bytes.
 
 #include "pj_scripting/object_summary.h"
 
@@ -139,7 +139,7 @@ TEST(ObjectSummaryTest, UnrecognizedTypeSummarizesAsTypeOnly) {
   sdk::Log log;
   log.level = sdk::Log::Level::kInfo;
   log.message = "hello";
-  log.name = "node";
+  log.source = "node";
 
   const nlohmann::json doc = summarizeObject(sdk::BuiltinObject(log));
   EXPECT_EQ(doc.at("type").get<std::string>(), "kLog");

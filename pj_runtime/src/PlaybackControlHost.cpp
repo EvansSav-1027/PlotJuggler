@@ -3,7 +3,6 @@
 
 #include "pj_runtime/PlaybackControlHost.h"
 
-#include <algorithm>
 #include <cmath>
 #include <string>
 #include <string_view>
@@ -49,6 +48,7 @@ Status PlaybackControlHost::registerServices(ServiceRegistryBuilder& registry) {
 
 bool PlaybackControlHost::onPlay(void* ctx, PJ_error_t* out_error) noexcept {
   return guarded<PlaybackControlHost>(ctx, out_error, kDomain, [](PlaybackControlHost& self) {
+    const CallScope scope;
     self.engine_.play();
     return true;
   });
@@ -56,6 +56,7 @@ bool PlaybackControlHost::onPlay(void* ctx, PJ_error_t* out_error) noexcept {
 
 bool PlaybackControlHost::onPause(void* ctx, PJ_error_t* out_error) noexcept {
   return guarded<PlaybackControlHost>(ctx, out_error, kDomain, [](PlaybackControlHost& self) {
+    const CallScope scope;
     self.engine_.pause();
     return true;
   });
@@ -68,6 +69,7 @@ bool PlaybackControlHost::onSeek(void* ctx, double time_s, PJ_error_t* out_error
     }
     // The engine clamps into [rangeMin, rangeMax]; callers read the clamped
     // cursor back via get_state.
+    const CallScope scope;
     self.engine_.setCurrentTime(displaySeconds(time_s));
     return true;
   });
@@ -78,10 +80,10 @@ bool PlaybackControlHost::onSetRate(void* ctx, double rate, PJ_error_t* out_erro
     if (!std::isfinite(rate) || rate <= 0.0) {
       return reject(out_error, kDomain, "playback rate must be a finite value > 0");
     }
-    // Host policy bound (the ABI says "the host may clamp"): keep any consumer
-    // from driving the engine at absurd multipliers. Consumers see the applied
-    // value via get_state.
-    self.engine_.setPlaybackRate(std::clamp(rate, 0.001, 1000.0));
+    // The engine clamps to the speed scrubber's range (the ABI says "the host may clamp"); consumers see the
+    // applied value via get_state.
+    const CallScope scope;
+    self.engine_.setPlaybackRate(rate);
     return true;
   });
 }

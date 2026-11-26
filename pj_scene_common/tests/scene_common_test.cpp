@@ -26,13 +26,15 @@
 #include "on_demand_test_utils.h"
 #include "pj_base/builtin/builtin_object_codec.hpp"
 #include "pj_base/sdk/platform.hpp"
-#include "pj_base/time.hpp"  // PJ::Timepoint, PJ::Range, fromRaw/toRaw
+#include "pj_base/time.hpp"
 #include "pj_datastore/engine.hpp"
 #include "pj_runtime/IDataWidget.h"
 #include "pj_runtime/OnDemandService.h"
 #include "pj_runtime/SessionManager.h"
+#include "pj_runtime/XmlStateOptions.h"
 #include "pj_scene_common/layer_factory.h"
 #include "pj_scene_common/layer_params.h"
+#include "pj_scene_common/saved_layer_header.h"
 #include "pj_scene_common/scene_dock_widget.h"
 #include "pj_scene_common/scene_layer.h"
 using namespace Qt::StringLiterals;
@@ -45,8 +47,7 @@ struct FakeLayerConfig {
 
 std::unordered_map<uint32_t, FakeLayerConfig> g_fake_layer_configs;
 std::vector<uint32_t> g_detached_topics;
-// Ordered lifecycle log ("sync:<n>" / "detach:<id>" / "destroy:<id>") for
-// order-of-operations assertions (e.g. view re-pointed before layers die).
+// Lifecycle log ("sync:<n>" / "detach:<id>" / "destroy:<id>") for order assertions.
 std::vector<std::string> g_layer_events;
 
 PJ::ObjectTopicId topic(uint32_t id) {
@@ -107,10 +108,8 @@ class FakeLayer : public PJ::ISceneLayer {
     emit visibilityChanged(visible);
   }
 
-  // For the repaint-gate test: when set, renderKey() returns this fixed value
-  // (simulating "rendered content unchanged across ticks"); when nullopt it falls
-  // back to the base default (time-derived, "always changed") so every other test
-  // keeps its existing repaint-on-each-tick behavior.
+  // When set, renderKey() returns this value ("content unchanged across ticks"); otherwise the base default
+  // ("always changed") applies.
   void setFixedRenderKey(std::optional<uint64_t> key) {
     fixed_render_key_ = key;
   }
@@ -198,14 +197,12 @@ class FakeSceneDock : public PJ::SceneDockWidget {
     return refresh_count_;
   }
 
-  /// Makes the dock consume topics of this object type as scene-wide config
-  /// (no layer created), exercising the ConsumedAsConfig path.
+  /// Makes the dock consume topics of this object type as scene-wide config (no layer).
   void setConfigConsumeType(PJ::sdk::BuiltinObjectType type) {
     config_consume_type_ = type;
   }
 
-  /// Drives the viewRenderKey() hook for the repaint-gate test (stands in for a 3D
-  /// dock's TF-overlay fingerprint, which no layer owns).
+  /// Drives viewRenderKey() (stands in for a 3D dock's TF-overlay fingerprint).
   void setViewRenderKey(uint64_t key) {
     view_render_key_ = key;
   }
@@ -296,6 +293,154 @@ TEST(LayerFactoryTest, RegisterSupportsCreateAndUnsupportedReturnsNull) {
   EXPECT_EQ(factory.create(topic(8), PJ::sdk::BuiltinObjectType::kImage, u"image"_s), nullptr);
 }
 
+TEST(LayerFactoryTest, ValidatePayloadRunsTheRegisteredValidatorAndTypesAreListed) {
+  using BT = PJ::sdk::BuiltinObjectType;
+  const auto creator = [](PJ::ObjectTopicId topic_id, BT object_type, const QString& display_name) {
+    return std::make_unique<FakeLayer>(topic_id, object_type, display_name);
+  };
+  PJ::LayerFactory factory;
+  int calls = 0;
+  factory.registerType(BT::kPointCloud, creator, [&calls](const QDomElement& payload) {
+    ++calls;
+    return payload.attribute(u"ok"_s) == u"yes"_s;
+  });
+  factory.registerType(BT::kImage, creator, &PJ::LayerFactory::acceptPayloadWithoutOptions);
+  factory.registerType(BT::kOccupancyGrid, creator);
+  std::vector<BT> registered{BT::kPointCloud, BT::kImage, BT::kOccupancyGrid};
+  std::sort(registered.begin(), registered.end());
+  EXPECT_EQ(factory.types(), registered);
+
+  QDomDocument doc;
+  QDomElement payload = doc.createElement(u"payload"_s);
+  payload.setAttribute(u"ok"_s, u"yes"_s);
+  EXPECT_TRUE(factory.validatePayload(BT::kPointCloud, payload));
+  payload.setAttribute(u"ok"_s, u"no"_s);
+  EXPECT_FALSE(factory.validatePayload(BT::kPointCloud, payload));
+  EXPECT_EQ(calls, 2);
+  EXPECT_TRUE(factory.validatePayload(BT::kImage, payload));
+
+  for (const BT refused : {BT::kOccupancyGrid, BT::kVoxelGrid}) {  // registered without a validator; unregistered
+    PJ::XmlOptionsRecorder recorder;
+    EXPECT_FALSE(factory.validatePayload(refused, payload));
+    EXPECT_EQ(recorder.firstRejection(), u"<payload>: no layer reads this payload"_s);
+  }
+}
+
+TEST(SavedLayerHeaderTest, ReportsEveryAttributeAndParsesThem) {
+  using BT = PJ::sdk::BuiltinObjectType;
+  PJ::LayerFactory factory;
+  factory.registerType(BT::kPointCloud, {}, &PJ::LayerFactory::acceptPayloadWithoutOptions);
+  factory.registerType(BT::kImage, {}, &PJ::LayerFactory::acceptPayloadWithoutOptions);
+  QDomDocument doc;
+  QDomElement layer = doc.createElement(u"layer"_s);
+  layer.setAttribute(u"dataset_id"_s, u"3"_s);
+  layer.setAttribute(u"dataset_source"_s, u"a.mcap"_s);
+  layer.setAttribute(u"dataset_path"_s, u"/data/a.mcap"_s);
+  layer.setAttribute(u"topic_name"_s, u"/cloud"_s);
+  layer.setAttribute(u"object_type"_s, u"kPointCloud"_s);
+  layer.setAttribute(u"display_name"_s, u"Cloud"_s);
+  layer.setAttribute(u"visible"_s, u"false"_s);
+  layer.setAttribute(u"order"_s, u"2"_s);
+  layer.setAttribute(u"pending_intent"_s, u"true"_s);
+
+  PJ::XmlOptionsRecorder recorder;
+  const std::optional<PJ::SavedLayerHeader> header =
+      PJ::parseSavedLayerHeader(layer, PJ::SavedTopicRef::kOptional, factory);
+  ASSERT_TRUE(header.has_value()) << qPrintable(recorder.firstRejection());
+  EXPECT_EQ(recorder.firstRejection(), QString());
+  EXPECT_EQ(PJ::unreportedXmlAttributes(layer, recorder.options()), QStringList());
+  EXPECT_EQ(header->dataset_id, 3U);
+  EXPECT_EQ(header->dataset_source, u"a.mcap"_s);
+  EXPECT_EQ(header->dataset_path, u"/data/a.mcap"_s);
+  EXPECT_TRUE(header->qualified);
+  EXPECT_TRUE(header->pending_intent);
+  EXPECT_EQ(header->topic_name, u"/cloud"_s);
+  EXPECT_EQ(header->object_type, BT::kPointCloud);
+  EXPECT_EQ(header->display_name, u"Cloud"_s);
+  EXPECT_FALSE(header->visible);
+  EXPECT_EQ(header->order, std::optional<int>(2));
+
+  const auto object_type = std::find_if(recorder.options().begin(), recorder.options().end(), [](const auto& option) {
+    return option.attribute == u"object_type"_s;
+  });
+  ASSERT_NE(object_type, recorder.options().end());
+  QStringList tokens;
+  for (const BT type : factory.types()) {
+    const auto name = PJ::sdk::name(type);
+    tokens.append(QString::fromLatin1(name.data(), static_cast<qsizetype>(name.size())));
+  }
+  EXPECT_EQ(object_type->values, tokens);
+  EXPECT_EQ(tokens.size(), 2);
+
+  const QDomElement bare = doc.createElement(u"layer"_s);
+  const auto defaults = PJ::parseSavedLayerHeader(bare, PJ::SavedTopicRef::kOptional, factory);
+  ASSERT_TRUE(defaults.has_value());
+  EXPECT_FALSE(defaults->qualified);
+  EXPECT_TRUE(defaults->visible);
+  EXPECT_FALSE(defaults->order.has_value());
+  EXPECT_FALSE(defaults->object_type.has_value()) << "the type is the caller's rule, never refused here";
+}
+
+TEST(SavedLayerHeaderTest, StrictAttributesRefuseAndToleratedOnesAreNoted) {
+  PJ::LayerFactory factory;
+  struct Case {
+    const char* attribute;
+    const char* value;
+    PJ::SavedTopicRef ref;
+    bool accepted;
+  };
+  for (const Case& c : {
+           Case{"visible", "maybe", PJ::SavedTopicRef::kOptional, false},
+           Case{"order", "-1", PJ::SavedTopicRef::kOptional, false},
+           Case{"order", "x", PJ::SavedTopicRef::kOptional, false},
+           Case{"dataset_id", "abc", PJ::SavedTopicRef::kOptional, false},
+           Case{"dataset_id", "4294967296", PJ::SavedTopicRef::kOptional, false},
+           Case{"dataset_id", "abc", PJ::SavedTopicRef::kUnused, true},
+           Case{"pending_intent", "yes", PJ::SavedTopicRef::kOptional, true},
+       }) {
+    QDomDocument doc;
+    QDomElement layer = doc.createElement(u"layer"_s);
+    layer.setAttribute(u"topic_name"_s, u"/t"_s);
+    layer.setAttribute(QString::fromLatin1(c.attribute), QString::fromLatin1(c.value));
+    PJ::XmlOptionsRecorder recorder;
+    const auto header = PJ::parseSavedLayerHeader(layer, c.ref, factory);
+    EXPECT_EQ(header.has_value(), c.accepted) << c.attribute << '=' << c.value;
+    EXPECT_TRUE(recorder.firstRejection().contains(QString::fromLatin1(c.attribute) + u"=\""_s))
+        << c.attribute << ": " << qPrintable(recorder.firstRejection());
+    if (header.has_value()) {
+      EXPECT_FALSE(header->pending_intent);
+      EXPECT_EQ(header->dataset_id, 0U);
+    }
+  }
+}
+
+TEST(SavedLayerHeaderTest, RequiredRefNeedsATopicAndAPositiveDatasetId) {
+  QDomDocument doc;
+  QDomElement ref = doc.createElement(u"config_topic"_s);
+  ref.setAttribute(u"topic_name"_s, u"/tf"_s);
+  ref.setAttribute(u"dataset_id"_s, u"0"_s);
+  {
+    PJ::XmlOptionsRecorder recorder;
+    EXPECT_FALSE(PJ::parseSavedTopicHeader(ref, PJ::SavedTopicRef::kRequired).has_value());
+    EXPECT_EQ(recorder.firstRejection(), u"<config_topic> dataset_id=\"0\": expected an integer in [1, 4294967295]"_s);
+    const auto dataset_id = std::find_if(recorder.options().begin(), recorder.options().end(), [](const auto& option) {
+      return option.attribute == u"dataset_id"_s;
+    });
+    ASSERT_NE(dataset_id, recorder.options().end());
+    EXPECT_EQ(dataset_id->min, std::optional<double>(1.0));
+  }
+  EXPECT_TRUE(PJ::parseSavedTopicHeader(ref, PJ::SavedTopicRef::kOptional).has_value()) << "0 names no dataset";
+
+  ref.removeAttribute(u"dataset_id"_s);
+  EXPECT_TRUE(PJ::parseSavedTopicHeader(ref, PJ::SavedTopicRef::kRequired).has_value()) << "bound by topic alone";
+
+  ref.setAttribute(u"topic_name"_s, QString());
+  PJ::XmlOptionsRecorder recorder;
+  EXPECT_FALSE(PJ::parseSavedTopicHeader(ref, PJ::SavedTopicRef::kRequired).has_value());
+  EXPECT_EQ(recorder.firstRejection(), u"<config_topic> topic_name=\"\": required"_s);
+  EXPECT_TRUE(PJ::parseSavedTopicHeader(ref, PJ::SavedTopicRef::kOptional).has_value());
+}
+
 TEST(SceneDockWidgetTest, AddTopicEmitsLayerAddedAndReportsDrawOrder) {
   g_fake_layer_configs.clear();
   FakeSceneDock dock;
@@ -321,9 +466,7 @@ TEST(SceneDockWidgetTest, AddingTheSameTopicTwiceIsRejected) {
   QObject::connect(&dock, &PJ::SceneDockWidget::layerAdded, &dock, [&](PJ::ObjectTopicId) { ++added_count; });
 
   EXPECT_TRUE(dock.addTopic(topic(1), PJ::sdk::BuiltinObjectType::kPointCloud, u"cloud_a"_s));
-  // Re-adding the same topic must be rejected: no duplicate layer, no second
-  // layerAdded signal. Drag-drop and XML restore both route through addTopic, so
-  // this guards against the same topic appearing twice in one scene dock.
+  // Re-adding a topic is rejected: no duplicate layer, no second layerAdded.
   EXPECT_FALSE(dock.addTopic(topic(1), PJ::sdk::BuiltinObjectType::kPointCloud, u"cloud_a"_s));
 
   EXPECT_EQ(added_count, 1);
@@ -385,23 +528,20 @@ TEST(SceneDockWidgetTest, TrackerTimeClampsToLayerUnionAndForwardsToVisibleLayer
   layer_b->clearTrackerTimes();
   dock.setLayerVisible(topic(1), false);
   dock.setLayerVisible(topic(2), true);
-  // Un-hiding topic(2) re-delivers the last tracker time (100ns) clamped to its
-  // own range [300,400] -> 300, the M.25 catch-up. The subsequent tick clamps
-  // 500ns to the union's upper bound (400) and reaches only the visible layer.
+  // Un-hiding topic(2) re-delivers the last tracker time (100ns) clamped to its own range [300,400] -> 300. The
+  // next tick clamps 500ns to the union's upper bound (400) and reaches only the visible layer.
   dock.onTrackerTime(500.0 / 1000000000.0);
 
   EXPECT_TRUE(layer_a->trackerTimesNs().empty());
   EXPECT_EQ(layer_b->trackerTimesNs(), (std::vector<int64_t>{300, 400}));
 }
 
-// M.25: a hidden layer receives no tracker ticks (onTrackerTime skips it), so
-// it would otherwise repaint the geometry it held at the moment of hiding. On
-// un-hide the dock must re-deliver the current playhead, clamped to that layer's
-// own range exactly as registerLayer seeds it, so the layer catches up.
+// A hidden layer gets no tracker ticks; on un-hide the dock re-delivers the playhead clamped to that layer's own
+// range (as registerLayer seeds it), so the layer does not show its hide-time geometry.
 TEST(SceneDockWidgetTest, UnhideRedeliversLastTrackerTimeClampedToLayerRange) {
   g_fake_layer_configs.clear();
-  // layer_a spans the whole window; layer_b's range is a strict subset. This lets
-  // the un-hide clamp (per-LAYER) differ from onTrackerTime's clamp (per-UNION).
+  // layer_a spans the whole window, layer_b a subset: the un-hide clamp (per layer) differs from onTrackerTime's
+  // (per union).
   g_fake_layer_configs[1] = FakeLayerConfig{std::pair<int64_t, int64_t>{100, 500}};
   g_fake_layer_configs[2] = FakeLayerConfig{std::pair<int64_t, int64_t>{300, 400}};
   FakeSceneDock dock;
@@ -412,35 +552,28 @@ TEST(SceneDockWidgetTest, UnhideRedeliversLastTrackerTimeClampedToLayerRange) {
   ASSERT_NE(layer_a, nullptr);
   ASSERT_NE(layer_b, nullptr);
 
-  // Hide topic(2), then scrub past its range while it is hidden: it must NOT
-  // receive that tick (it is the stale-geometry condition the redelivery fixes).
+  // Scrub past topic(2)'s range while it is hidden: it receives no tick.
   dock.setLayerVisible(topic(2), false);
   layer_a->clearTrackerTimes();
   layer_b->clearTrackerTimes();
-  // Scrub above the union max; onTrackerTime clamps to the UNION ([100,500]) ->
-  // 500 reaches the still-visible layer_a, and the hidden layer_b gets nothing.
-  // (Clamping to a round bound also sidesteps the seconds<->ns double rounding.)
+  // onTrackerTime clamps to the union [100,500] -> 500 reaches layer_a only. (A round bound sidesteps the
+  // seconds<->ns double rounding.)
   dock.onTrackerTime(900.0 / 1'000'000'000.0);
   EXPECT_EQ(layer_a->trackerTimesNs(), (std::vector<int64_t>{500}));
   EXPECT_TRUE(layer_b->trackerTimesNs().empty());
 
-  // Un-hiding catches up: the playhead (last_tracker_ == 500) is clamped to
-  // layer_b's OWN range [300,400] -> 400 and re-delivered so it leaves hide-time
-  // geometry. The 400 (not 500) proves the redelivery uses the per-layer clamp.
+  // The playhead (500) is clamped to layer_b's own range [300,400] -> 400: 400, not 500, shows the per-layer clamp.
   layer_b->clearTrackerTimes();
   dock.setLayerVisible(topic(2), true);
   EXPECT_EQ(layer_b->trackerTimesNs(), (std::vector<int64_t>{400}));
 
-  // Idempotent: re-hiding then un-hiding with no intervening tick re-delivers the
-  // same time once (no double-deliver), and a no-op setVisible(true) does nothing.
+  // A setVisible(true) on a visible layer delivers nothing.
   layer_b->clearTrackerTimes();
   dock.setLayerVisible(topic(2), true);  // already visible: no redelivery
   EXPECT_TRUE(layer_b->trackerTimesNs().empty());
 }
 
-// M.25 edge: a layer hidden before the first tracker tick still catches up on
-// un-hide by being seeded with its own first frame (last_tracker_ is nullopt, so
-// the redelivery falls back to the layer's range minimum, like registerLayer).
+// A layer hidden before the first tracker tick is seeded with its range minimum on un-hide, as registerLayer does.
 TEST(SceneDockWidgetTest, UnhideBeforeAnyTrackerTickSeedsLayerFirstFrame) {
   g_fake_layer_configs.clear();
   g_fake_layer_configs[1] = FakeLayerConfig{std::pair<int64_t, int64_t>{700, 900}};
@@ -544,6 +677,33 @@ TEST(SceneDockWidgetTest, AmbiguousObjectDatasetIdentityNeverUsesFirstSourceMatc
       << "an ambiguous portable identity must stay unresolved instead of binding the first dataset";
 }
 
+TEST(SceneDockWidgetTest, UniqueObjectTopicBindsTheOnlyMatchElseThePreferredDatasetElseNothing) {
+  PJ::SessionManager session;
+  const auto register_cloud = [&session](PJ::DatasetId dataset, const std::string& topic, const char* type) {
+    return *session.objectStore().registerTopic(
+        PJ::ObjectTopicDescriptor{
+            .dataset_id = dataset,
+            .topic_name = topic,
+            .metadata_json = std::string(R"({"builtin_object_type":")") + type + R"("})",
+        });
+  };
+  const PJ::DatasetId left = *session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "left.mcap"});
+  const PJ::DatasetId right = *session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "right.mcap"});
+  const PJ::ObjectTopicId unique = register_cloud(left, "/unique", "kPointCloud");
+  register_cloud(right, "/unique", "kImage");  // another type is no candidate
+  const PJ::ObjectTopicId left_shared = register_cloud(left, "/shared", "kPointCloud");
+  const PJ::ObjectTopicId right_shared = register_cloud(right, "/shared", "kPointCloud");
+  const PJ::ObjectStore& store = session.objectStore();
+  constexpr auto kCloud = PJ::sdk::BuiltinObjectType::kPointCloud;
+
+  EXPECT_EQ(PJ::uniqueObjectTopic(store, "/unique", kCloud), unique);
+  EXPECT_EQ(PJ::uniqueObjectTopic(store, "/unique", kCloud, right), unique) << "a unique match ignores the preference";
+  EXPECT_EQ(PJ::uniqueObjectTopic(store, "/shared", kCloud, left), left_shared);
+  EXPECT_EQ(PJ::uniqueObjectTopic(store, "/shared", kCloud, right), right_shared);
+  EXPECT_FALSE(PJ::uniqueObjectTopic(store, "/shared", kCloud).has_value());
+  EXPECT_FALSE(PJ::uniqueObjectTopic(store, "/missing", kCloud, left).has_value());
+}
+
 TEST(SceneDockWidgetTest, DeferredLayerReturnsToItsSavedDrawOrder) {
   PJ::SessionManager session;
   const auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "drive.mcap"});
@@ -617,9 +777,8 @@ TEST(SceneDockWidgetTest, RejectsCrossDatasetLayersUntilPerLayerTimeDomainsExist
   EXPECT_FALSE(dock.addTopic(*topic_b, PJ::sdk::BuiltinObjectType::kPointCloud, u"B"_s));
 }
 
-// A saved layout that mixed datasets still loads: the first dataset's element
-// restores, the foreign one is dropped with a visible reason, and the restore is
-// not marked as failed.
+// A saved layout that mixed datasets loads: the first dataset's element restores, the foreign one is dropped with
+// a visible reason, and the restore is not a failure.
 TEST(SceneDockWidgetTest, RestoreDropsForeignDatasetLayerWithAVisibleReasonAndNoFailure) {
   PJ::SessionManager session;
   const auto dataset_a = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "a.mcap"});
@@ -663,8 +822,7 @@ TEST(SceneDockWidgetTest, RestoreDropsForeignDatasetLayerWithAVisibleReasonAndNo
   EXPECT_TRUE(reasons.front().contains(u"b.mcap"_s)) << reasons.front().toStdString();
 }
 
-// Several refusals in one burst (a multi-select drop, a mixed layout) produce one
-// report; once the event loop has turned, the next refusal reports again.
+// Several refusals in one burst produce one report; after the event loop turns, the next reports again.
 TEST(SceneDockWidgetTest, RefusalsInOneBurstEmitTopicRefusedOnce) {
   PJ::SessionManager session;
   const auto dataset_a = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "a.mcap"});
@@ -703,9 +861,8 @@ TEST(SceneDockWidgetTest, RefusalsInOneBurstEmitTopicRefusedOnce) {
 
 namespace {
 
-// Two datasets, each with one point-cloud topic, that "arrive" only when the test
-// says so: the injected resolver stands in for the shell's progressive load, so a
-// saved mixed-dataset layout can be replayed in either load order.
+// Two datasets, each with one point-cloud topic, that arrive when the test says so (the injected resolver stands
+// in for the shell's progressive load), so a mixed layout replays in either load order.
 class LateDatasetsFixture {
  public:
   LateDatasetsFixture() {
@@ -725,7 +882,7 @@ class LateDatasetsFixture {
         &dock_, &PJ::SceneDockWidget::topicRefused, [this](const QString& reason) { reasons_.push_back(reason); });
   }
 
-  /// Saved layout whose FIRST element is dataset A's cloud, then dataset B's.
+  /// Saved layout whose first element is dataset A's cloud, then dataset B's.
   [[nodiscard]] QDomElement mixedLayout() {
     QDomElement state = document_.createElement(u"scene"_s);
     appendLayer(state, dataset_a_, u"a.mcap"_s, u"/cloud_a"_s);
@@ -810,8 +967,7 @@ class LateDatasetsFixture {
 
 }  // namespace
 
-// GAP-48: a mixed-dataset layout restores the same way whatever the load order,
-// because the dataset of the first saved element wins.
+// A mixed-dataset layout restores the same way whatever the load order: the first saved element's dataset wins.
 TEST(SceneDockWidgetTest, MixedLayoutKeepsTheFirstSavedDatasetRegardlessOfLoadOrder) {
   const auto replay = [](bool a_loads_first) {
     LateDatasetsFixture fixture;
@@ -839,9 +995,8 @@ TEST(SceneDockWidgetTest, MixedLayoutKeepsTheFirstSavedDatasetRegardlessOfLoadOr
   EXPECT_EQ(replay(/*a_loads_first=*/true), replay(/*a_loads_first=*/false));
 }
 
-// The first saved dataset never arrives: when the restore settles, the next saved
-// dataset that is loaded wins, and the elements of the other dataset are dropped
-// with a reason built from their saved source label, not counted as a failure.
+// The first saved dataset never arrives: at settle the next loaded saved dataset wins, and the other dataset's
+// elements are dropped with a reason built from their saved source label, not counted as a failure.
 TEST(SceneDockWidgetTest, MixedLayoutFallsBackToTheNextLoadedSavedDataset) {
   LateDatasetsFixture fixture;
   const QDomElement state = fixture.mixedLayout();
@@ -863,9 +1018,8 @@ TEST(SceneDockWidgetTest, MixedLayoutFallsBackToTheNextLoadedSavedDataset) {
   EXPECT_TRUE(fixture.reasons().front().contains(u"b.mcap"_s)) << fixture.reasons().front().toStdString();
 }
 
-// A paste (or family switch) replays a saved scene through the IDataWidget contract with
-// no shell settlement: finishRestore() must close the dataset choice and retry, so the
-// loaded dataset's elements bind and the missing first dataset is refused with a reason.
+// A paste or family switch replays a saved scene with no shell settlement: finishRestore() settles the dataset
+// choice and retries, so the loaded dataset's elements bind and the missing first dataset is refused with a reason.
 TEST(SceneDockWidgetTest, FinishRestoreSettlesAPastedMixedLayoutWhoseFirstDatasetIsNotLoaded) {
   LateDatasetsFixture fixture;
   const QDomElement state = fixture.mixedLayout();
@@ -887,9 +1041,7 @@ TEST(SceneDockWidgetTest, FinishRestoreSettlesAPastedMixedLayoutWhoseFirstDatase
   EXPECT_TRUE(fixture.reasons().front().contains(u"b.mcap"_s)) << fixture.reasons().front().toStdString();
 }
 
-// The second saved dataset never arrives either: the first one is the dock's dataset
-// from the start, so settle only has to drop the other dataset's still-pending element,
-// naming it by the label it was saved with.
+// The second saved dataset never arrives either: settle drops its pending element, naming it by its saved label.
 TEST(SceneDockWidgetTest, MixedLayoutDropsTheOtherSavedDatasetAtSettleWhenItNeverLoads) {
   LateDatasetsFixture fixture;
   const QDomElement state = fixture.mixedLayout();
@@ -911,8 +1063,7 @@ TEST(SceneDockWidgetTest, MixedLayoutDropsTheOtherSavedDatasetAtSettleWhenItNeve
   EXPECT_TRUE(fixture.reasons().front().contains(u"b.mcap"_s)) << fixture.reasons().front().toStdString();
 }
 
-// Documented limit: when nothing is loaded at settle there is no winner to pick,
-// so the first saved dataset to resolve afterwards wins.
+// With nothing loaded at settle there is no winner: the first saved dataset to resolve afterwards wins.
 TEST(SceneDockWidgetTest, MixedLayoutWithNothingLoadedAtSettleLetsTheFirstResolvedDatasetWin) {
   LateDatasetsFixture fixture;
   const QDomElement state = fixture.mixedLayout();
@@ -937,9 +1088,9 @@ TEST(SceneDockWidgetTest, MixedLayoutWithNothingLoadedAtSettleLetsTheFirstResolv
 
 namespace {
 
-// Two fan-out siblings of one file resolved by the session's own identity ladder (no injected
-// resolver): the saved source and path name both, so only the topic-name tiebreak tells which
-// sibling a saved element belongs to, and a topic that is not registered yet resolves to nothing.
+// Two fan-out siblings of one file resolved by the session's own identity ladder (no injected resolver): source
+// and path name both, so only the topic name tells which sibling an element belongs to, and a topic not registered
+// yet resolves to nothing.
 class SharedFileDatasetsFixture {
  public:
   SharedFileDatasetsFixture() {
@@ -1033,9 +1184,8 @@ class SharedFileDatasetsFixture {
 
 }  // namespace
 
-// Settle re-resolves a pending element by its own topic. Where the session can only tell the
-// two datasets apart by topic name, a winner's element whose topic has not arrived resolves to
-// nothing; that is "not yet", not "another dataset", so it stays pending and binds on arrival.
+// Where the session tells the two datasets apart only by topic name, a winner's element whose topic has not
+// arrived resolves to nothing: "not yet", not "another dataset", so it stays pending and binds on arrival.
 TEST(SceneDockWidgetTest, SettleKeepsTheWinnersTopicThatArrivesAfterTheSettleUnderTheRealResolver) {
   SharedFileDatasetsFixture fixture;
   const QDomElement state = fixture.layout();
@@ -1059,8 +1209,7 @@ TEST(SceneDockWidgetTest, SettleKeepsTheWinnersTopicThatArrivesAfterTheSettleUnd
   EXPECT_EQ(fixture.reasons().size(), 1);
 }
 
-// A dock a user already bound to a dataset keeps it: the settle's choice is the dataset the dock
-// shows, the reason names it, and that dataset's own saved elements stay.
+// A dock a user already bound to a dataset keeps it: the reason names it and its own saved elements stay.
 TEST(SceneDockWidgetTest, SettleTakesTheDatasetTheDockAlreadyShows) {
   LateDatasetsFixture fixture;
   const QDomElement state = fixture.mixedLayout();
@@ -1084,9 +1233,9 @@ TEST(SceneDockWidgetTest, SettleTakesTheDatasetTheDockAlreadyShows) {
       "This view shows dataset b.mcap; a topic from dataset a.mcap cannot be added to it.");
 }
 
-// A rejected paste rolls a dock back through xmlLoadState(previous state), which records the
-// datasets of that state again. A dock that had already settled has no settle to follow, so the
-// rollback must hand back its settled (empty) dataset choice together with its pending queue.
+// A rejected paste rolls a dock back through xmlLoadState(previous state), which records that state's datasets
+// again; a settled dock has no settle to follow, so the rollback hands back its empty dataset choice with its
+// pending queue.
 TEST(SceneDockWidgetTest, RolledBackLoadDoesNotRearmTheDatasetChoiceOfASettledDock) {
   LateDatasetsFixture fixture;
   const QDomElement state = fixture.mixedLayout();
@@ -1336,8 +1485,7 @@ TEST(SceneDockWidgetTest, LayerAddedIsEmittedAfterViewIsReconciled) {
   FakeSceneDock dock;
   std::vector<int64_t> synced_at_emit;
   bool fired = false;
-  // Mutate -> reconcile view -> notify: the view must already include the new
-  // layer when observers (which may trigger a paint) react to layerAdded.
+  // The view already includes the new layer when a layerAdded slot runs.
   QObject::connect(&dock, &PJ::SceneDockWidget::layerAdded, &dock, [&](PJ::ObjectTopicId) {
     synced_at_emit = dock.lastSyncedIds();
     fired = true;
@@ -1357,8 +1505,7 @@ TEST(SceneDockWidgetTest, LayerRemovedIsEmittedAfterViewIsReconciled) {
 
   std::vector<int64_t> synced_at_emit;
   bool fired = false;
-  // The view must already exclude the removed layer when observers react, so a
-  // paint-triggering slot never renders a composite bound to the detached layer.
+  // The view already excludes the removed layer when a layerRemoved slot runs.
   QObject::connect(&dock, &PJ::SceneDockWidget::layerRemoved, &dock, [&](PJ::ObjectTopicId) {
     synced_at_emit = dock.lastSyncedIds();
     fired = true;
@@ -1370,9 +1517,7 @@ TEST(SceneDockWidgetTest, LayerRemovedIsEmittedAfterViewIsReconciled) {
   EXPECT_EQ(synced_at_emit, (std::vector<int64_t>{2}));
 }
 
-// Catalog-removal cleanup (IObjectViewer): revalidateObjects() drops layers
-// whose ObjectStore topic was evicted and reports whether any live layer
-// remains, so the shell can reset an emptied dock to its placeholder.
+// revalidateObjects() drops layers whose ObjectStore topic was evicted and reports whether any live layer remains.
 TEST(SceneDockWidgetTest, RevalidateObjectsPrunesEvictedTopicsAndReportsEmpty) {
   g_fake_layer_configs.clear();
   PJ::SessionManager session;
@@ -1406,24 +1551,21 @@ TEST(SceneDockWidgetTest, RevalidateObjectsPrunesEvictedTopicsAndReportsEmpty) {
   EXPECT_TRUE(dock.revalidateObjects());
   EXPECT_EQ(dock.layers().size(), 2U);
 
-  // Evict one topic: its layer is pruned (with the usual removal notification),
-  // the other survives, dock still reports non-empty.
+  // Evict one topic: its layer is pruned with the usual notification.
   session.objectStore().removeTopic(*topic_a);
   EXPECT_TRUE(dock.revalidateObjects());
   ASSERT_EQ(dock.layers().size(), 1U);
   EXPECT_EQ(dock.layers().front().topic_id.id, topic_b->id);
   EXPECT_EQ(removed_topics, (std::vector<uint32_t>{topic_a->id}));
 
-  // Evict the last topic: dock empties and reports false (shell resets it).
+  // Evict the last topic: the dock reports false.
   session.objectStore().removeTopic(*topic_b);
   EXPECT_FALSE(dock.revalidateObjects());
   EXPECT_TRUE(dock.layers().empty());
 }
 
-// A latched / one-shot layer (first == last, e.g. a map pinned to the recording
-// start) is valid from its stamp ONWARD: it lowers the clamp's minimum but must
-// NOT cap the maximum, or its lone early stamp would drag the live playhead
-// backwards (the old "TF doesn't render unless another topic is present" bug).
+// A latched layer (first == last, a map pinned to the recording start) lowers the clamp's minimum but does not cap
+// the maximum, or its lone early stamp would drag the live playhead backwards.
 TEST(SceneDockWidgetTest, LatchedLayerDoesNotDragTrackerTimeBack) {
   g_fake_layer_configs.clear();
   g_fake_layer_configs[1] = FakeLayerConfig{std::pair<int64_t, int64_t>{1'000, 1'000}};  // latched
@@ -1450,13 +1592,11 @@ TEST(SceneDockWidgetTest, LatchedLayerDoesNotDragTrackerTimeBack) {
   EXPECT_EQ(latched->trackerTimesNs(), (std::vector<int64_t>{3'000}));
 }
 
-// A static layer (inverted/empty timeRange, e.g. a future URDF RobotModelLayer)
-// must NOT contribute to the dock's clamp union: clampToLayerRange skips
-// `range.max < range.min`, so a co-resident spanning layer alone bounds the
-// playhead, and the static layer still receives every tracker tick.
+// A static layer (inverted timeRange) does not contribute to the clamp: a co-resident spanning layer alone bounds
+// the playhead, and the static layer still receives every tick.
 TEST(SceneDockWidgetTest, StaticLayerWithInvertedRangeIsSkippedByClamp) {
   g_fake_layer_configs.clear();
-  // Inverted range == "static / no data": max() as min field, min() as max field.
+  // Inverted range: no data.
   g_fake_layer_configs[1] = FakeLayerConfig{
       std::pair<int64_t, int64_t>{std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::lowest()}};
   g_fake_layer_configs[2] = FakeLayerConfig{std::pair<int64_t, int64_t>{2'000, 3'000}};  // spanning
@@ -1478,10 +1618,8 @@ TEST(SceneDockWidgetTest, StaticLayerWithInvertedRangeIsSkippedByClamp) {
   EXPECT_EQ(static_layer->trackerTimesNs(), (std::vector<int64_t>{2'500}));
 }
 
-// Repaint coalescing: when every visible layer's renderKey() is unchanged across
-// consecutive tracker ticks (same active sample, same transform), the dock advances
-// the layers and repaints ONCE, then skips — so a 60 Hz playhead over <10 Hz data
-// does not drive a 60 Hz repaint. A render-key change reopens the gate immediately.
+// While every visible layer's renderKey() is unchanged across ticks the dock advances the layers and repaints
+// once, then skips; a key change reopens the gate immediately.
 TEST(SceneDockWidgetTest, TrackerRepaintCoalescesWhenRenderKeyUnchanged) {
   g_fake_layer_configs.clear();
   g_fake_layer_configs[1] = FakeLayerConfig{std::pair<int64_t, int64_t>{0, 1'000'000}};  // wide: no clamp distortion
@@ -1490,31 +1628,29 @@ TEST(SceneDockWidgetTest, TrackerRepaintCoalescesWhenRenderKeyUnchanged) {
   auto* layer = dynamic_cast<FakeLayer*>(dock.layerFor(topic(1)));
   ASSERT_NE(layer, nullptr);
 
-  // Pin a constant key => "rendered content identical across ticks".
+  // A constant key: content identical across ticks.
   layer->setFixedRenderKey(uint64_t{42});
   layer->clearTrackerTimes();
   const int base_refresh = dock.refreshCount();
 
-  // Three DISTINCT tracker times, all carrying the SAME render key.
+  // Three distinct tracker times, one render key.
   dock.onTrackerTime(100.0 / 1'000'000'000.0);
   dock.onTrackerTime(200.0 / 1'000'000'000.0);
   dock.onTrackerTime(300.0 / 1'000'000'000.0);
 
-  // Painted once; the next two coalesced away (and the layer advanced exactly once).
+  // Painted once; the next two are coalesced and the layer advanced once.
   EXPECT_EQ(dock.refreshCount() - base_refresh, 1);
   EXPECT_EQ(layer->trackerTimesNs().size(), 1U);
 
-  // Content changes -> the gate reopens and painting resumes on the next tick.
+  // A content change reopens the gate.
   layer->setFixedRenderKey(uint64_t{43});
   dock.onTrackerTime(400.0 / 1'000'000'000.0);
   EXPECT_EQ(dock.refreshCount() - base_refresh, 2);
   EXPECT_EQ(layer->trackerTimesNs().size(), 2U);
 }
 
-// View-owned content (a 3D dock's TF axis triads / connection lines pose the whole
-// frame forest at the tracker time and belong to NO layer) is folded into the gate
-// via viewRenderKey(). A change there must repaint even when every visible layer's
-// key is unchanged — otherwise a moving TF tree freezes behind a static cloud.
+// A change in viewRenderKey() (content no layer owns, such as a 3D dock's TF triads) repaints even when every
+// layer key is unchanged; otherwise a moving TF tree freezes behind a static cloud.
 TEST(SceneDockWidgetTest, ViewRenderKeyChangeRepaintsDespiteStableLayers) {
   g_fake_layer_configs.clear();
   g_fake_layer_configs[1] = FakeLayerConfig{std::pair<int64_t, int64_t>{0, 1'000'000}};
@@ -1537,11 +1673,8 @@ TEST(SceneDockWidgetTest, ViewRenderKeyChangeRepaintsDespiteStableLayers) {
   EXPECT_EQ(dock.refreshCount() - base_refresh, 2) << "a view-key change must repaint despite a stable layer";
 }
 
-// Clearing all layers (the xmlLoadState restore path) must re-point the
-// concrete view off the old layers (a sync with an empty order) BEFORE any of
-// them is destroyed: a view holding raw layer pointers (e.g. the 3D
-// SceneViewWidget's layer list) otherwise dereferences freed layers when it
-// reconciles, and never releases the GPU state it holds for them.
+// Clearing all layers (the xmlLoadState path) re-points the view off them (a sync with an empty order) before any
+// is destroyed: a view holding raw layer pointers would dereference freed layers and keep their GPU state.
 TEST(SceneDockWidgetTest, ClearLayersRepointsViewBeforeDestroyingLayers) {
   FakeSceneDock dock;
   ASSERT_TRUE(dock.addTopic(topic(1), PJ::sdk::BuiltinObjectType::kPointCloud, u"a"_s));
@@ -1573,8 +1706,7 @@ TEST(SceneDockWidgetTest, TrackerTimeIgnoresNonFiniteValues) {
   ASSERT_NE(layer, nullptr);
   layer->clearTrackerTimes();
 
-  // NaN/inf carry no position; the dock must drop them rather than cast a
-  // non-finite double to int64 (undefined behavior) and forward garbage.
+  // NaN and inf are dropped: casting a non-finite double to int64 is undefined.
   dock.onTrackerTime(std::numeric_limits<double>::quiet_NaN());
   dock.onTrackerTime(std::numeric_limits<double>::infinity());
 
@@ -1588,8 +1720,7 @@ TEST(SceneDockWidgetTest, ConfigTopicIsConsumedWithoutCreatingLayer) {
   int added_count = 0;
   QObject::connect(&dock, &PJ::SceneDockWidget::layerAdded, &dock, [&](PJ::ObjectTopicId) { ++added_count; });
 
-  // A scene-wide config topic is accepted (addTopic == true) but spawns no layer
-  // and no layerAdded signal: the two meanings the typed AddOutcome separates.
+  // A config topic is accepted (addTopic true) but spawns no layer and no layerAdded.
   EXPECT_TRUE(dock.addTopic(topic(5), PJ::sdk::BuiltinObjectType::kImage, u"config"_s));
 
   EXPECT_EQ(added_count, 0);
@@ -1597,12 +1728,8 @@ TEST(SceneDockWidgetTest, ConfigTopicIsConsumedWithoutCreatingLayer) {
   EXPECT_TRUE(dock.layers().empty());
 }
 
-// serializeLayerParams + applyLayerParams are the copy/paste backbone for the
-// 3D config panel: copy serializes one layer's xmlSaveState blob, paste applies
-// it to another. FakeLayer's "payload" attribute stands in for real per-layer
-// params (shape, size, colormap, …).
-// SCN-15: each writer owns a part of the row warning; the joined text lists the non-empty parts in order, and a
-// set reports a change only when the joined text changed.
+// Each writer owns a part of the row warning; the joined text lists the non-empty parts in order, and a set
+// reports a change only when the joined text changed.
 TEST(SceneWarningPartsTest, JoinsNonEmptyPartsInOrderAndReportsOnlyRealChanges) {
   using Part = PJ::SceneWarningParts::Part;
   PJ::SceneWarningParts parts;
@@ -1666,9 +1793,8 @@ struct DerivedDockFixture {
 
 }  // namespace
 
-// D30, GAP-05: while its derived layers compute, each row says how far its shown result is behind the one the
-// newest request produces (the scheduler's lag), and the dock's status strip shows the largest; both clear once
-// the results land.
+// While its derived layers compute, each row says how far its shown result is behind the one the newest request
+// produces (the scheduler's lag), and the dock's status strip shows the largest; both clear once the results land.
 TEST(SceneDockWidgetTest, LagIndicatorShowsTheMaxLagOfItsDerivedLayers) {
   DerivedDockFixture fx;
   const PJ::ObjectTopicId a = fx.install("a");
@@ -1815,8 +1941,7 @@ TEST(LayerParamsTest, RoundTripCopiesParamsBetweenLayers) {
   EXPECT_EQ(target.payload(), u"alpha"_s);
 }
 
-// Empty / malformed input must be rejected and leave the target untouched, so a
-// paste from an empty clipboard or a corrupted blob never silently wipes params.
+// Empty or malformed input is rejected and leaves the target untouched.
 TEST(LayerParamsTest, ApplyRejectsEmptyAndMalformedXmlLeavingTargetUntouched) {
   FakeLayer target(topic(1), PJ::sdk::BuiltinObjectType::kPointCloud, u"dst"_s);
   target.setPayload(u"keep"_s);

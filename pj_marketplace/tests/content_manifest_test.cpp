@@ -12,6 +12,7 @@
 #include <string>
 
 #include "pj_marketplace/sha256.hpp"
+#include "pj_marketplace/utf8_path.hpp"
 
 namespace {
 
@@ -41,10 +42,9 @@ class TempTree {
   }
 
  private:
-  // ctest runs every case in its own process, so a per-process counter alone would
-  // hand the same name to concurrent cases and one's cleanup would delete another's
-  // tree. A per-process random tag keeps them apart; the counter separates the trees
-  // within one case.
+  // ctest runs every case in its own process, so a per-process counter alone would give concurrent cases the same name
+  // and one's cleanup would delete another's tree: a per-process random tag keeps them apart, the counter separates
+  // trees within one case.
   static std::string uniqueName() {
     static const unsigned process_tag = std::random_device{}();
     static int counter = 0;
@@ -62,10 +62,6 @@ std::string digestOf(const std::filesystem::path& root, PJ::ContentManifestOptio
   }
   return PJ::aggregateContentManifestDigest(*files);
 }
-
-// ---------------------------------------------------------------------------
-// Identity
-// ---------------------------------------------------------------------------
 
 TEST(ContentManifestTest, SameBytesInTwoTreesYieldTheSameDigest) {
   // The whole point of the identity: two independently produced copies of the
@@ -119,11 +115,9 @@ TEST(ContentManifestTest, DigestIsIndependentOfCreationOrder) {
 }
 
 TEST(ContentManifestTest, TheFileListComesBackSorted) {
-  // The digest can only be stable if the list is ordered before it is aggregated,
-  // and the order a filesystem reports its entries in is not guaranteed. Asserted
-  // on the postcondition rather than by creating files in a different order: on
-  // any given filesystem both orders may well be walked the same way, which makes
-  // such a test agree with a build that does not sort at all.
+  // The digest is stable only if the list is ordered before aggregation, and a filesystem's entry order is not
+  // guaranteed. Asserted on the postcondition, not by creating files in another order: both orders may be walked the
+  // same way, which would pass a build that never sorts.
   TempTree tree;
   for (const char* name : {"z.txt", "a.txt", "m/nested.txt", "b.txt", "m/aaa.txt"}) {
     writeFile(tree.path(), name, "payload");
@@ -133,10 +127,6 @@ TEST(ContentManifestTest, TheFileListComesBackSorted) {
   ASSERT_TRUE(files.has_value());
   EXPECT_TRUE(std::ranges::is_sorted(*files, {}, &PJ::StoredFile::relative_path));
 }
-
-// ---------------------------------------------------------------------------
-// Self-exclusion
-// ---------------------------------------------------------------------------
 
 TEST(ContentManifestTest, TheSkippedPathIsLeftOutOfTheIdentity) {
   // The file that records the digest lives inside the tree it describes, so it
@@ -157,10 +147,6 @@ TEST(ContentManifestTest, TheSkippedPathIsLeftOutOfTheIdentity) {
   EXPECT_NE(before_recording, digestOf(tree.path()));
 }
 
-// ---------------------------------------------------------------------------
-// Fail-closed cases
-// ---------------------------------------------------------------------------
-
 TEST(ContentManifestTest, ASymbolicLinkIsRefused) {
   // An identity computed over a link would describe the target, which is outside
   // the tree and can change underneath. Refused rather than followed.
@@ -178,6 +164,33 @@ TEST(ContentManifestTest, ASymbolicLinkIsRefused) {
 TEST(ContentManifestTest, AMissingTreeIsReportedNotAssumedEmpty) {
   const auto files = PJ::inspectContentManifest(std::filesystem::temp_directory_path() / "pj-does-not-exist");
   EXPECT_FALSE(files.has_value());
+}
+
+// "資料-🚀" as UTF-8 bytes, so the literal does not depend on the compiler's source charset.
+// No legacy Windows code page holds these characters: path::string() throws for them there,
+// so the cases below fail on Windows if a path is narrowed instead of encoded as UTF-8.
+const std::string kUnicodeName = "\xE8\xB3\x87\xE6\x96\x99-\xF0\x9F\x9A\x80";
+
+std::filesystem::path missingUnicodePath() {
+  return std::filesystem::temp_directory_path() / PJ::pathFromUtf8(kUnicodeName + "-missing");
+}
+
+TEST(Utf8PathTest, ANameOutsideTheCodePageRoundTripsAsUtf8) {
+  const std::filesystem::path path = PJ::pathFromUtf8(kUnicodeName);
+  EXPECT_EQ(PJ::pathToUtf8(path), kUnicodeName);
+  EXPECT_EQ(PJ::genericUtf8(path), kUnicodeName);
+}
+
+TEST(ContentManifestTest, AMissingTreeIsReportedByItsUnicodeName) {
+  const auto files = PJ::inspectContentManifest(missingUnicodePath());
+  ASSERT_FALSE(files.has_value());
+  EXPECT_NE(files.error().message.find(kUnicodeName), std::string::npos) << files.error().message;
+}
+
+TEST(ContentManifestTest, AMissingFileIsReportedByItsUnicodeName) {
+  const auto digest = PJ::sha256File(missingUnicodePath());
+  ASSERT_FALSE(digest.has_value());
+  EXPECT_NE(digest.error().find(kUnicodeName), std::string::npos) << digest.error();
 }
 
 }  // namespace

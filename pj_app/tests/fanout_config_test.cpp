@@ -17,10 +17,12 @@ using namespace Qt::StringLiterals;
 
 namespace {
 
+using PJ::detail::configStringValues;
 using PJ::detail::extractFanout;
 using PJ::detail::kSavedFilepathKey;
 using PJ::detail::parseDisplayName;
 using PJ::detail::parseDisplaySuffix;
+using PJ::detail::replaceConfigStringValues;
 using PJ::detail::rewriteReplayFilepaths;
 using PJ::detail::SavedFilepath;
 using PJ::detail::stripHostReplayKeys;
@@ -59,16 +61,14 @@ TEST(ExtractFanout, HappyPathReturnsEntriesInOrder) {
   EXPECT_EQ(extractFanout(cfg), (Vec{"a", "b"}));
 }
 
-// A malformed (non-string) entry must be skipped, not silently collapse the
-// whole array — the survivors are still fanned out.
+// A non-string entry is skipped, not collapsing the whole array: the survivors are still fanned out.
 TEST(ExtractFanout, NonStringEntriesAreSkipped) {
   const std::string cfg = R"({"__pj_fanout":["a",5,"b"]})";
   EXPECT_EQ(extractFanout(cfg), (Vec{"a", "b"}));
 }
 
-// If skipping leaves nothing usable, fall back to single-instance — NOT an
-// empty vector (an empty vector would send loadFile into the fanout branch with
-// zero iterations, importing nothing while reporting success).
+// If skipping leaves nothing usable, fall back to single-instance, never an empty vector (zero fan-out iterations:
+// nothing imported, success reported).
 TEST(ExtractFanout, AllNonStringEntriesFallBackToSingleInstance) {
   const std::string cfg = R"({"__pj_fanout":[1,2]})";
   EXPECT_EQ(extractFanout(cfg), Vec{cfg});
@@ -269,6 +269,44 @@ TEST(StripHostReplayKeys, LeavesNonObjectConfigsUntouched) {
        {std::string("not json __pj_saved_filepath"), std::string(R"(["__pj_saved_filepath"])")}) {
     EXPECT_EQ(stripHostReplayKeys(config), config);
   }
+}
+
+// --- configStringValues / replaceConfigStringValues ---------------------------
+
+// The fan-out child is itself a config inside a JSON string: its values are listed, its text is not.
+constexpr char kSideFileConfig[] =
+    R"({"filepath":"/up/1/run.log","dbc":{"can0":["/up/2/a.dbc","/up/2/a.dbc"]},"n":3,)"
+    R"("__pj_fanout":["{\"filepath\":\"/up/1/run.log\",\"dbc\":\"/up/3/b.dbc\"}","not json"]})";
+
+TEST(ConfigStringValues, ListsEveryStringValueOnceIncludingFanoutChildren) {
+  EXPECT_EQ(configStringValues(kSideFileConfig), (QStringList{u"/up/2/a.dbc"_s, u"/up/1/run.log"_s, u"/up/3/b.dbc"_s}))
+      << "object keys in QJsonObject's sorted order, fan-out children last";
+  EXPECT_TRUE(configStringValues("").isEmpty());
+  EXPECT_TRUE(configStringValues(R"(["/up/2/a.dbc"])").isEmpty());
+}
+
+TEST(ReplaceConfigStringValues, ReplacesExactValuesEverywhereAndLeavesTheRest) {
+  const std::string rewritten =
+      replaceConfigStringValues(kSideFileConfig, {{u"/up/2/a.dbc"_s, u"a.dbc"_s}, {u"/up/3/b.dbc"_s, u"b.dbc"_s}})
+          .value();
+  const QJsonObject root = QJsonDocument::fromJson(QByteArray::fromStdString(rewritten)).object();
+  EXPECT_EQ(root.value(u"filepath"_s).toString(), u"/up/1/run.log"_s);
+  EXPECT_EQ(root.value(u"dbc"_s).toObject().value(u"can0"_s).toArray(), (QJsonArray{u"a.dbc"_s, u"a.dbc"_s}));
+  EXPECT_EQ(root.value(u"n"_s).toInt(), 3);
+  const QJsonArray fanout = root.value(u"__pj_fanout"_s).toArray();
+  ASSERT_EQ(fanout.size(), 2);
+  const QJsonObject child = QJsonDocument::fromJson(fanout[0].toString().toUtf8()).object();
+  EXPECT_EQ(child.value(u"dbc"_s).toString(), u"b.dbc"_s);
+  EXPECT_EQ(fanout[1].toString(), u"not json"_s);
+  // A value that merely contains a key is not that key.
+  EXPECT_EQ(
+      replaceConfigStringValues(R"({"p":"/up/2/a.dbc.bak"})", {{u"/up/2/a.dbc"_s, u"a.dbc"_s}}).value(),
+      R"({"p":"/up/2/a.dbc.bak"})");
+}
+
+TEST(ReplaceConfigStringValues, KeepsEmptyConfigsAndRefusesNonObjects) {
+  EXPECT_EQ(replaceConfigStringValues("", {{u"a"_s, u"b"_s}}).value(), "");
+  EXPECT_FALSE(replaceConfigStringValues("[1]", {{u"a"_s, u"b"_s}}).has_value());
 }
 
 }  // namespace

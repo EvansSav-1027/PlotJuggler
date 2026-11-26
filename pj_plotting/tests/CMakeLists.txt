@@ -1,7 +1,7 @@
 find_package(GTest REQUIRED)
 find_package(Qt6 REQUIRED COMPONENTS Test)
 
-# no WARNINGS: 3 of 3 merged tests never compiled with -Werror
+# No WARNINGS: built without PJ_WARNING_FLAGS (-Werror).
 pj_add_test_runner(pj_plotting_core_tests
     MAIN core
     SOURCES
@@ -11,7 +11,7 @@ pj_add_test_runner(pj_plotting_core_tests
     LIBS pj_plotting_core
 )
 
-# no WARNINGS: 2 of 20 merged tests never compiled with -Werror
+# No WARNINGS: built without PJ_WARNING_FLAGS (-Werror).
 pj_add_test_runner(pj_plotting_widget_tests
     MAIN gui
     SOURCES
@@ -24,25 +24,32 @@ pj_add_test_runner(pj_plotting_widget_tests
         dock_widget_context_menu_test.cpp
         dock_widget_discard_test.cpp
         dock_fullscreen_test.cpp
+        plot_docker_palette_test.cpp
         tabbed_widget_tab_test.cpp
         plot_widget_replace_curve_test.cpp
+        plot_widget_curve_colors_test.cpp
         plot_scale_draw_test.cpp
         plot_widget_default_style_test.cpp
         plot_widget_xy_marker_test.cpp
         plot_widget_map_background_test.cpp
+        plot_widget_xy_keep_ratio_test.cpp
         plot_widget_global_markers_test.cpp
         plot_widget_marker_status_test.cpp
+        marker_color_names_test.cpp
         curve_editor_global_markers_test.cpp
         legend_text_diagnostics_test.cpp
+        plot_widget_legend_toggle_test.cpp
+        plot_widget_curve_visibility_test.cpp
         plot_widget_range_offset_test.cpp
         plot_widget_max_zoom_offset_test.cpp
         plot_widget_flat_curve_range_test.cpp
+        plot_curve_nonfinite_test.cpp
         plot_widget_first_rows_fit_test.cpp
         plot_magnifier_clamp_test.cpp
         plot_state_transaction_test.cpp
-        # Links pj_resources so :/filters/builtin_filters.luau is embedded and
-        # auto-registered — SessionManager reads it to install the Luau filter catalogue.
-        # Without it the panel would have no filters to list or apply.
+        widget_state_options_test.cpp
+        # Links pj_resources so :/filters/builtin_filters.luau is embedded and auto-registered: SessionManager reads it
+        # to install the Luau filter catalogue, without which the panel has no filters to list or apply.
         filter_editor_panel_test.cpp
         parameter_form_test.cpp
     LIBS

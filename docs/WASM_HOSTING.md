@@ -45,6 +45,9 @@ through Caddy on the page's own origin rather than on its own port.
    packaged Caddy service reads.
 4. **Start the bridge** on its default port, 9090, where Caddy forwards `/bridge`
    (`pj_bridge_ros2`). On another port, set `PJ_BRIDGE_UPSTREAM=127.0.0.1:<port>`.
+   A Foxglove Bridge (`foxglove_bridge`, port 8765) works the same way: set
+   `PJ_BRIDGE_UPSTREAM=127.0.0.1:8765` and connect the Foxglove Bridge source to
+   `wss://robot.local/bridge`.
 5. **Run Caddy** with the robot's settings:
 
    ```bash
@@ -167,7 +170,8 @@ The Caddyfile reproduces the package's [response contract](./WASM_DEPLOYMENT.md#
 |---|---|---|
 | "PlotJuggler cannot start: this page was not served over HTTPS…" | The page was opened over `http://` from a name other than `localhost`. | Open `https://<robot>/`. |
 | "PlotJuggler cannot start: this page is not cross-origin isolated…" | The server, or a proxy in front of it, does not send the COOP/COEP headers. | Serve through this Caddyfile, and keep the headers through any other proxy. |
-| "PlotJuggler cannot start in this browser…" | The server sends the headers, but the browser cannot isolate the page (an Android WebView, as in DuckDuckGo). | Open the app in a current Chrome, Edge, Firefox or Safari. |
+| "PlotJuggler cannot start in this browser: it does not support WebAssembly SIMD…" | The browser is older than Chrome/Edge 91, Firefox 89 or Safari 16.4 (iOS 16.4). | Update the browser. |
+| "PlotJuggler cannot start in this browser: it does not isolate the page…" | The server sends the headers, but the browser cannot isolate the page (an Android WebView, as in DuckDuckGo). | Open the app in a current Chrome, Edge, Firefox or Safari. |
 | A certificate warning instead of the app | The client does not trust the robot's certificate. | [Certificates](#certificates). |
 | "The stream failed: … the browser refused to open a WebSocket to ws://…" | The preset names a `ws://` URL. | Use `${deployment.ws_origin}/bridge`, or a `wss://` URL. |
 | "The stream failed: … failed to connect to PJ bridge at wss://<robot>/bridge…" | The bridge is not listening at `PJ_BRIDGE_UPSTREAM`: Caddy answers the upgrade with a 502. | Start the bridge on that port. |

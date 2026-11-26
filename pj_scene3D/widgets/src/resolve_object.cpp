@@ -8,6 +8,8 @@
 #include "pj_base/builtin/compressed_point_cloud_codec.hpp"
 #include "pj_base/builtin/frame_transforms_codec.hpp"
 #include "pj_base/builtin/grid_map_codec.hpp"
+#include "pj_base/builtin/mesh_map_codec.hpp"
+#include "pj_base/builtin/mesh_map_update_codec.hpp"
 #include "pj_base/builtin/occupancy_grid_codec.hpp"
 #include "pj_base/builtin/occupancy_grid_update_codec.hpp"
 #include "pj_base/builtin/point_cloud_codec.hpp"
@@ -45,6 +47,8 @@ bool hasCanonical3DCodec(BT type) noexcept {
     case BT::kOccupancyGridUpdate:
     case BT::kVoxelGrid:
     case BT::kGridMap:
+    case BT::kMeshMap:
+    case BT::kMeshMapUpdate:
     case BT::kSceneEntities:
       return true;
     default:
@@ -54,11 +58,9 @@ bool hasCanonical3DCodec(BT type) noexcept {
 
 PJ::Expected<PJ::sdk::ObjectRecord> resolveObject(
     const PJ::SessionManager::ParserBinding& binding, BT type, PJ::Timestamp ts, const PJ::sdk::PayloadView& payload) {
-  // Parser bound -> the topic's objects are parser-decoded messages.
   if (binding) {
     return parseLocked(binding, ts, payload);
   }
-  // No parser -> the bytes are a serialized canonical object; decode by type.
   const auto* data = payload.bytes.data();
   const auto size = payload.bytes.size();
   switch (type) {
@@ -79,6 +81,10 @@ PJ::Expected<PJ::sdk::ObjectRecord> resolveObject(
       return wrapCanonical(PJ::deserializeVoxelGrid(data, size));
     case BT::kGridMap:
       return wrapCanonical(PJ::deserializeGridMap(data, size));
+    case BT::kMeshMap:
+      return wrapCanonical(PJ::deserializeMeshMap(data, size));
+    case BT::kMeshMapUpdate:
+      return wrapCanonical(PJ::deserializeMeshMapUpdate(data, size));
     case BT::kSceneEntities:
       return wrapCanonical(PJ::deserializeSceneEntities(data, size));
     default:

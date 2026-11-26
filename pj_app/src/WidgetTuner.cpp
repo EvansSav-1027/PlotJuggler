@@ -8,24 +8,24 @@
 #include <QComboBox>
 #include <QEvent>
 #include <QFrame>
+#include <QLabel>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QPalette>
-#include <QSettings>
 #include <QString>
 #include <QWidget>
 using namespace Qt::StringLiterals;
 
 #include "pj_widgets/FrameworkTokens.h"
+#include "pj_widgets/SvgUtil.h"
 
 namespace PJ {
 
 namespace {
 
 theme::Theme popupTheme() {
-  const QString theme_name = QSettings().value(QStringLiteral("StyleSheet::theme"), QStringLiteral("light")).toString();
-  return theme::themeFor(theme_name.contains(QStringLiteral("light")));
+  return theme::themeFor(currentTheme().contains(QStringLiteral("light")));
 }
 
 // Combo popup palettes use the same framework input surface as the closed combo.
@@ -37,9 +37,7 @@ QColor popupTextColor() {
   return theme::onSurface(theme::Surface::Input, theme::Emphasis::Default, popupTheme());
 }
 
-// Force every palette role that Fusion reads when painting a popup
-// surface to the theme's popup background. We touch Window, Base,
-// AlternateBase, Button (Fusion uses Button for some popup paints).
+// Every role Fusion reads when painting a popup surface (Button included).
 void applyPopupPalette(QWidget* w) {
   if (w == nullptr) {
     return;
@@ -61,22 +59,30 @@ void applyPopupPalette(QWidget* w) {
 }  // namespace
 
 bool WidgetTuner::eventFilter(QObject* watched, QEvent* event) {
+  // A rich-text label fixes its links' colour from its palette when its text is parsed, so after a live theme switch a
+  // label already shown kept the old link colour (the light theme's dark blue on the dark dialog). Its palette is the
+  // one the stylesheet sets, new only once the new stylesheet has re-polished it (StyleChange), not at the
+  // application palette change before it. QLabel::setText ignores the same text, hence the clear.
+  if (event->type() == QEvent::StyleChange) {
+    if (auto* label = qobject_cast<QLabel*>(watched); label != nullptr && label->text().contains(u"<a "_s)) {
+      const QString text = label->text();
+      label->clear();
+      label->setText(text);
+    }
+    return QObject::eventFilter(watched, event);
+  }
   if (event->type() != QEvent::Polish) {
     return QObject::eventFilter(watched, event);
   }
 
-  // QMenus (including Qt-internal context menus) — tag for QSS.
   if (auto* menu = qobject_cast<QMenu*>(watched); menu != nullptr && menu->objectName().isEmpty()) {
     menu->setObjectName(u"PJMenu"_s);
   }
 
-  // QMessageBox: strip the native system frame. No other chrome.
   if (auto* msg = qobject_cast<QMessageBox*>(watched)) {
     msg->setWindowFlag(Qt::FramelessWindowHint, true);
   }
 
-  // QComboBox popup view — paint its palette directly so Fusion uses
-  // our colour, no QSS specificity required.
   if (auto* combo = qobject_cast<QComboBox*>(watched)) {
     if (auto* view = combo->view(); view != nullptr) {
       applyPopupPalette(view);
@@ -89,7 +95,6 @@ bool WidgetTuner::eventFilter(QObject* watched, QEvent* event) {
     }
   }
 
-  // QComboBoxPrivateContainer — strip frame and shadow, paint palette.
   if (auto* w = qobject_cast<QWidget*>(watched);
       w != nullptr && QString::fromUtf8(w->metaObject()->className()) == "QComboBoxPrivateContainer"_L1) {
     w->setWindowFlag(Qt::NoDropShadowWindowHint, true);

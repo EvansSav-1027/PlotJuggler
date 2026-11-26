@@ -1,7 +1,7 @@
 find_package(Qt6 REQUIRED COMPONENTS Widgets UiTools SvgWidgets)
 
-# Workaround: some Qt packages still publish AGL in transitive OpenGL links,
-# but that framework was removed in newer macOS SDKs.
+# Workaround: some Qt packages still list the AGL framework in transitive OpenGL links, but newer macOS SDKs no
+# longer ship it.
 foreach(_target WrapOpenGL::WrapOpenGL OpenGL::GL)
     if(TARGET ${_target})
         get_target_property(_libs ${_target} INTERFACE_LINK_LIBRARIES)
@@ -23,6 +23,8 @@ add_library(pj_dialog_engine_qt STATIC
     src/widget_adapters.cpp
     src/dialog_engine.cpp
     src/panel_engine.cpp
+    src/browser_save_target.cpp
+    src/browser_save_target.hpp
     src/pj_ui_loader.cpp
     src/chart_preview_widget.cpp
     src/chart_placeholder_overlay.hpp
@@ -52,7 +54,7 @@ target_link_libraries(pj_dialog_engine_qt
     PUBLIC
         plotjuggler_sdk::plugin_host
         pj_widgets
-        plotjuggler_qwt   # backs ChartPreviewWidget (replaced Qt6::Charts)
+        plotjuggler_qwt   # ChartPreviewWidget
         Qt6::Widgets
         Qt6::UiTools
         Qt6::SvgWidgets
@@ -63,10 +65,9 @@ target_link_libraries(pj_dialog_engine_qt
 
 if(PJ_BUILD_TESTS)
     find_package(Qt6 REQUIRED COMPONENTS Test)
-    # Two runners on the shared gui main rather than one executable per file.
-    # mock_dialog.cpp and mock_panel_plugin.cpp both define the plugin entry point
-    # PJ_get_dialog_vtable, and each engine test calls it expecting its own mock,
-    # so those two cannot share a binary.
+    # mock_dialog.cpp and mock_panel_plugin.cpp both define the plugin entry point PJ_get_dialog_vtable, and each
+    # engine test calls it expecting its own mock: they cannot share a binary.
+    # pj_resources: the loader test checks host icons (`:/resources/svg/...`) re-tinted after a .ui load.
     pj_add_test_runner(pj_dialog_host_tests MAIN gui WARNINGS
         SOURCES
             tests/dialog_engine_test.cpp
@@ -74,7 +75,8 @@ if(PJ_BUILD_TESTS)
             tests/widget_binding_test.cpp
             tests/combo_rules_test.cpp
             tests/chart_preview_widget_test.cpp
-        LIBS pj_dialog_engine_qt plotjuggler_sdk::plugin_sdk Qt6::Test
+            tests/browser_save_target_test.cpp
+        LIBS pj_dialog_engine_qt plotjuggler_sdk::plugin_sdk Qt6::Test pj_resources
     )
     set_target_properties(pj_dialog_host_tests PROPERTIES AUTOMOC ON)
 

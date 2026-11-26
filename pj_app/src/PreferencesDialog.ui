@@ -432,7 +432,13 @@
             <string>On startup, send one anonymous ping to count daily users: a hashed machine id, OS name and version, CPU architecture, app version, and package type. Never any personal data, file names, paths, or usage behavior.</string>
            </property>
            <property name="text">
-            <string>Anonymous usage statistics:</string>
+            <string>Anonymous usage statistics (&lt;a href="https://github.com/PlotJuggler/PlotJuggler/blob/main/docs/TELEMETRY.md#what-is-sent"&gt;what is sent&lt;/a&gt;):</string>
+           </property>
+           <property name="textFormat">
+            <enum>Qt::TextFormat::RichText</enum>
+           </property>
+           <property name="openExternalLinks">
+            <bool>true</bool>
            </property>
           </widget>
          </item>
@@ -446,7 +452,73 @@
            </property>
           </widget>
          </item>
-         <item row="8" column="0" colspan="2">
+         <item row="8" column="0">
+          <widget class="QLabel" name="labelUsageStats">
+           <property name="toolTip">
+            <string>Once a day, send anonymous counters of which features and plugins were used: how often a plugin opened a file, streamed, decoded or created a panel, and which plugins are installed. Plugins that are not public are never named. Never any personal data, file names, paths, or topic names.</string>
+           </property>
+           <property name="text">
+            <string>Anonymous feature usage (&lt;a href="https://github.com/PlotJuggler/PlotJuggler/blob/main/docs/TELEMETRY.md#daily-usage-report"&gt;what is sent&lt;/a&gt;):</string>
+           </property>
+           <property name="textFormat">
+            <enum>Qt::TextFormat::RichText</enum>
+           </property>
+           <property name="openExternalLinks">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item row="8" column="1">
+          <widget class="PJ::ToggleSwitch" name="usageStatsToggle" native="true">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+          </widget>
+         </item>
+         <item row="9" column="0">
+          <widget class="QLabel" name="labelSystemFileDialog">
+           <property name="toolTip">
+            <string>Open and save files with the system's own file dialog instead of PlotJuggler's (Save Layout keeps PlotJuggler's). It does not stall on disconnected network drives, but does not follow the app's theme.</string>
+           </property>
+           <property name="text">
+            <string>System file dialog:</string>
+           </property>
+          </widget>
+         </item>
+         <item row="9" column="1">
+          <widget class="PJ::ToggleSwitch" name="systemFileDialogToggle" native="true">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+          </widget>
+         </item>
+         <item row="10" column="0">
+          <widget class="QLabel" name="labelMcpServer">
+           <property name="toolTip">
+            <string>Serve the Model Context Protocol on this computer only (127.0.0.1, behind a secret token), so AI agents such as Claude Code or Codex can open files, read series, and draw in their own tabs. The status bar names an agent while it is active. Shows whether outside agents may connect now (also when allowed with --mcp); on by default; applies on OK. An agent a toolbox plugin starts itself gets its own private access and does not need this.</string>
+           </property>
+           <property name="text">
+            <string>Let AI agents control PlotJuggler (MCP server):</string>
+           </property>
+          </widget>
+         </item>
+         <item row="10" column="1">
+          <widget class="PJ::ToggleSwitch" name="mcpServerToggle" native="true">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+          </widget>
+         </item>
+         <item row="11" column="0" colspan="2">
           <spacer name="appearanceVerticalSpacer">
            <property name="orientation">
             <enum>Qt::Orientation::Vertical</enum>
@@ -570,7 +642,27 @@
            </property>
           </widget>
          </item>
-         <item row="4" column="0" colspan="2">
+         <item row="4" column="0">
+          <widget class="QLabel" name="labelClockTimeZone">
+           <property name="toolTip">
+            <string>Time zone of the clock times shown while the date-time toggle (bottom left) is on.</string>
+           </property>
+           <property name="text">
+            <string>Clock time zone:</string>
+           </property>
+          </widget>
+         </item>
+         <item row="4" column="1">
+          <widget class="PJ::DualOptionsWidget" name="clockTimeZone" native="true">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+          </widget>
+         </item>
+         <item row="5" column="0" colspan="2">
           <spacer name="plottingBottomSpacer">
            <property name="orientation">
             <enum>Qt::Orientation::Vertical</enum>
@@ -614,11 +706,54 @@
        <widget class="QWidget" name="pageScene3D">
         <layout class="QVBoxLayout" name="verticalLayout_2">
          <item>
+          <layout class="QHBoxLayout" name="interpolateTransformsRow">
+           <property name="spacing">
+            <number>16</number>
+           </property>
+           <item>
+            <widget class="QLabel" name="labelInterpolateTransforms">
+             <property name="toolTip">
+              <string>Between two transform samples, move frames smoothly instead of holding the earlier pose until the next one.</string>
+             </property>
+             <property name="text">
+              <string>Interpolate transforms between samples:</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="PJ::ToggleSwitch" name="interpolateTransformsToggle" native="true">
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+               <horstretch>0</horstretch>
+               <verstretch>0</verstretch>
+              </sizepolicy>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <spacer name="interpolateTransformsSpacer">
+             <property name="orientation">
+              <enum>Qt::Orientation::Horizontal</enum>
+             </property>
+             <property name="sizeHint" stdset="0">
+              <size>
+               <width>16</width>
+               <height>20</height>
+              </size>
+             </property>
+            </spacer>
+           </item>
+          </layout>
+         </item>
+         <item>
           <layout class="QHBoxLayout" name="horizontalLayout_4">
+           <property name="spacing">
+            <number>2</number>
+           </property>
            <item>
             <widget class="QLabel" name="label_4">
              <property name="text">
-              <string>Folders containing 3D assets</string>
+              <string>Folders searched for robot packages (package://):</string>
              </property>
             </widget>
            </item>
@@ -636,53 +771,25 @@
             </spacer>
            </item>
            <item>
-            <widget class="QPushButton" name="buttonAddAssetsFolder">
-             <property name="minimumSize">
-              <size>
-               <width>26</width>
-               <height>26</height>
-              </size>
-             </property>
-             <property name="maximumSize">
-              <size>
-               <width>26</width>
-               <height>26</height>
-              </size>
-             </property>
-             <property name="text">
-              <string/>
-             </property>
-             <property name="flat">
-              <bool>true</bool>
-             </property>
-            </widget>
+            <widget class="PJ::SvgButton" name="buttonAddAssetsFolder"/>
            </item>
            <item>
-            <widget class="QPushButton" name="buttonRemoveAssetFolder">
-             <property name="minimumSize">
-              <size>
-               <width>26</width>
-               <height>26</height>
-              </size>
-             </property>
-             <property name="maximumSize">
-              <size>
-               <width>26</width>
-               <height>26</height>
-              </size>
-             </property>
-             <property name="text">
-              <string/>
-             </property>
-             <property name="flat">
-              <bool>true</bool>
-             </property>
-            </widget>
+            <widget class="PJ::SvgButton" name="buttonRemoveAssetFolder"/>
            </item>
           </layout>
          </item>
          <item>
-          <widget class="QListView" name="listAssetFolders"/>
+          <widget class="QListWidget" name="listAssetFolders"/>
+         </item>
+         <item>
+          <widget class="QLabel" name="labelAssetFoldersHint">
+           <property name="text">
+            <string>Add your ROS workspace or any folder that holds robot packages: packages are found in its subfolders. The folders in $ROS_PACKAGE_PATH and $AMENT_PREFIX_PATH, and /opt/ros/&lt;distro&gt;/share, are searched too.</string>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
+          </widget>
          </item>
          <item>
           <spacer name="verticalSpacer_2">

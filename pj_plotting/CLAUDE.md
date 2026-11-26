@@ -1,107 +1,132 @@
 # pj_plotting
 
-## Purpose
-
-Qwt-based plotting module: the PJ4 home for time-series plots, dockers, zoomers, trackers, legends, the curve editor,
-the filter editor panel and the GPU plot canvas (`PlotRhiCanvas`). This is the **largest PJ3 wholesale lift** in the
-repo. It also owns the plot-area **State Transitions** family (discrete-series state strips for string / integer /
-bool fields and floats holding only whole numbers; not Qwt): the `StateSeriesAdapter` reader in `core/` and the
-`StateTransitionsController`/`StateTransitionsDockWidget` binding in `widget/`, over the reusable
-`StateTransitionsView` from `pj_widgets`.
-
-Design that spans several classes (markers on a plot, the canvas internals, the render-test harness):
+Qwt-based plotting module: time-series plots, dockers, zoomers, trackers, legends, the curve editor, the filter editor
+panel and the GPU plot canvas (`PlotRhiCanvas`). It also owns the plot-area State Transitions family (not Qwt):
+discrete-series state strips for string, integer and bool fields and for floats holding only whole numbers, through the
+`StateSeriesAdapter` reader in `core/` and the `StateTransitionsController` / `StateTransitionsDockWidget` binding in
+`widget/`, over the reusable `StateTransitionsView` from `pj_widgets`. How the designs that span several classes work:
 [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md). Each header's doc-comment owns its API contract.
 
-## Module layout
-
-Two targets with a strict direction:
+## Layout
 
 ```
 pj_plotting  ──►  pj_plotting_core  ──►  pj_runtime + pj_datastore + pj_base
-   │                   │
-   │                   └──►  Qwt (external, never patched — see 3rdparty/qwt/README.PJ4.md)
-   │
+   │                   └──►  Qwt (external, never patched: 3rdparty/qwt/README.PJ4.md)
    └──►  pj_runtime, pj_scripting, pj_widgets, ADS (`qt_advanced_docking`), Qt Widgets/Gui/Xml
          (private: pj_datastore, Qt6::GuiPrivate)
 ```
 
-| Subdir | Contents |
-|---|---|
-| `core/` | No Qt Widgets. `DatastoreCurveAdapter` (PJ3-style `QwtSeriesData<QPointF>` over `pj_datastore::DataReader`), `FilteredCurveAdapter` (a `proc::DataProcessor`'s output, the Filter Editor preview), `PointSeriesXY`, `StateSeriesAdapter` (discrete-series run-length reader), `RevisionedSeries.h` (the content-revision contract the canvas caches on), `PlotXml.h` (plot-XML vocabulary shared with `pj_app`'s layout passes). `TrackValueSeries` (a scalar field as time-ordered values, held until the next sample, for colouring an XY track). |
-| `widget/` | The Qt/Qwt widgets, ported from PJ3's `plotjuggler_app/`: `PlotWidgetBase`, `PlotWidget`, `PlotDocker`, `TabbedPlotWidget`, `PlotZoomer`, `PlotPanner`, `PlotMagnifier`, `CurveTracker`, `PlotLegend`, `PlotCurve`, `PlotMarkersItem`, `PlotFocusOverlay`, `PlotScaleDraw`, `DockWidget`, `DockToolbar`, `CurveEditor`, `XYCurveDialog`, `FilterEditorPanel`, `ParameterForm`, `StateTransitionsController`, `StateTransitionsDockWidget`, `PlotRhiCanvas` (private implementation in `widget/src/PlotRhi*`, shaders in `widget/shaders/`). Desktop-only, on lat/lon XY plots (`PlotWidget::isGeographicPlot()`: longitude field on X, latitude on Y, by name via `geoAxisRoleOf`): `MapTileItem` is the on-demand satellite underlay over `MapTileProvider` (async tile fetch, memory + disk cache, QSettings `Plot/map_tile_url`/`Plot/map_tile_attribution`, default Esri World Imagery; `map_background` on `<plot>`), and `TrackColorItem` colours the track by a third field (picker default QSettings `Plot/track_color_default_field` = `SONAR/depth_hi_m`; `track_color_topic`/`track_color_field`/`track_color_map` on `<plot>`), labels via `RasterLabel`. Both are plain QPainter items that `PlotRhiCanvas` rasterizes in their own Z slot. |
-| `tests/` | gtest runners and the QRhi render harness. |
-| `benchmarks/` | `adapter_streaming_benchmark`, `plot_canvas_benchmark` (built with `PJ_BUILD_DEMOS`). |
+- `core/` (no Qt Widgets): `DatastoreCurveAdapter` (a `QwtSeriesData<QPointF>` over `pj_datastore::DataReader`),
+  `FilteredCurveAdapter` (a `proc::DataProcessor`'s output: the Filter Editor preview), `PointSeriesXY`,
+  `StateSeriesAdapter`, `RevisionedSeries.h` (the content-revision contract the canvas caches on), `PlotXml.h` (the
+  plot-XML vocabulary shared with `pj_app`'s layout passes), `TrackValueSeries` (a scalar field as time-ordered
+  values, held until the next sample, for colouring an XY track).
+- `widget/`: the Qt/Qwt widgets. Plots: `PlotWidgetBase`, `PlotWidget`, `PlotCurve`, `PlotZoomer`, `PlotPanner`,
+  `PlotMagnifier`, `CurveTracker`, `PlotLegend`, `PlotMarkersItem`, `PlotScaleDraw`, `PlotRhiCanvas` (private
+  implementation in `widget/src/PlotRhi*`, shaders in `widget/shaders/`). Docking: `PlotDocker`, `TabbedPlotWidget`,
+  `DockWidget`, `DockToolbar`, `PlotFocusOverlay`. Panels: `CurveEditor`, `XYCurveDialog`, `FilterEditorPanel`,
+  `ParameterForm`, `StateTransitionsController`, `StateTransitionsDockWidget`.
+- Desktop-only map overlays on lat/lon XY plots (`PlotWidget::isGeographicPlot()`: longitude field on X, latitude on
+  Y, by name via `geoAxisRoleOf`): `MapTileItem` is the on-demand satellite underlay over `MapTileProvider` (async tile
+  fetch, memory + disk cache, QSettings `Plot/map_tile_url`/`Plot/map_tile_attribution`, default Esri World Imagery;
+  `map_background` on `<plot>`), and `TrackColorItem` colours the track by a third field (picker default QSettings
+  `Plot/track_color_default_field` = `SONAR/depth_hi_m`; `track_color_topic`/`track_color_field`/`track_color_map` on
+  `<plot>`), labels via `RasterLabel`. Both are plain QPainter items that `PlotRhiCanvas` rasterizes in their own Z
+  slot.
+- `tests/` (gtest runners and the QRhi render harness), `benchmarks/` (`PJ_BUILD_DEMOS`).
 
-Derived series (script outputs) reach this module as ordinary datastore topics, through the catalog; see
-`docs/derived_objects/ARCHITECTURE.md` §15 (series) and §17 (scene integration).
+Derived series reach this module as ordinary datastore topics through the catalog
+([docs/derived_objects/ARCHITECTURE.md](../docs/derived_objects/ARCHITECTURE.md) "Series", "Scene integration").
 
-## Rules and pitfalls
+## Invariants
 
-- **Qwt is external and never patched** (`3rdparty/qwt/README.PJ4.md`). PJ-specific Qwt behaviour lives here:
-  `PlotScaleDraw` (fixed-notation tick labels, installed on every axis) and the "Lines and Dots" style
-  (`PlotCurve::drawCurve`: Lines plus one batched, pixel-weeded `drawDots` pass, because per-point QPainter calls are
-  pathological; `PlotRhiCanvas` reads `PlotCurve::dotWidth()` and draws the same dots as geometry). Never add patches
-  under `3rdparty/qwt/src`.
-- **Keep the `Preferences::use_opengl` gate** ("GPU canvas", plus `--disable-opengl`), which selects the raster
-  `QwtPlotCanvas` on desktop: software-raster rendering is CPU-heavy, so do not remove the GPU default without
-  measuring. The browser always uses `PlotRhiCanvas`.
-- **Never make the plot canvas a `WA_NativeWindow`** inside Qt-Advanced-Docking: the native-flag conflict breaks
-  layout.
-- **A series the canvas should cache must be a `RevisionedSeries`** and call `bumpContentRevision()` on every change
-  to what it serves (commit, clear, display-offset move, filter change, new rect of interest). A missed bump draws
-  stale curves; plain Qwt data rebuilds the curve layer on every replot. Tracker-only updates go through
+- **Qwt is never patched.** PJ-specific behaviour lives here: `PlotScaleDraw` (fixed-notation tick labels on every
+  axis; with the date-time toggle on, a time plot's X axis swaps to `PlotTimeScaleDraw` + `PlotTimeScaleEngine`, a
+  seconds adapter over Qwt's millisecond `QwtDateScaleEngine`, through `PlotWidgetBase::setTimeLabelFormat`) and the
+  "Lines and Dots" style (`PlotCurve::drawCurve`: Lines plus one batched, pixel-weeded `drawDots` pass, since
+  per-point QPainter calls are pathologically slow; `PlotRhiCanvas` reads `PlotCurve::dotWidth()` and draws the same
+  dots as geometry). A patch under `3rdparty/qwt/src` breaks the pinned-release build.
+- **Curve adapters never decimate.** Point reduction happens at paint time (Qwt's weeding, `PlotCurve::drawCurve`, the
+  canvas reducer); decimating in an adapter breaks zoom.
+- **A series the canvas should cache is a `RevisionedSeries` and calls `bumpContentRevision()` on every change** to
+  what it serves (commit, clear, display-offset move, filter change, new rect of interest). A missed bump draws stale
+  curves; plain Qwt data rebuilds the curve layer on every replot. Tracker-only updates go through
   `PlotWidgetBase::replotOverlays()` so the curve layer is not rebuilt.
-- **Shader edits:** re-bake the `.qsb` packs with the pinned `qsb` (`widget/shaders/bake.sh <qsb>`) and commit both,
-  or the WASM configure's byte check fails.
-- **QRhi canvas resources:** never let a text resource survive `releaseResources()` (GPU reset / context teardown);
-  set the viewport after binding each pipeline (Vulkan draws nothing otherwise); `renderFailed()` can fire inside
-  `render()`, so a receiver that replaces the canvas connects queued. Use `grabFramebuffer()` /
-  `grabPresentedFrame()` to capture the canvas: `QWidget::grab()` cannot capture QRhi content.
+- **Keep the `Preferences::use_opengl` gate** ("GPU canvas", `--disable-opengl`), which selects the raster
+  `QwtPlotCanvas` on desktop; the browser always uses `PlotRhiCanvas`. Reasoning, not measured here: software-raster
+  rendering is CPU-heavy, so do not drop the GPU default without measuring.
+- **Do not make the plot canvas a `WA_NativeWindow` inside Qt-Advanced-Docking:** it was found to break the dock layout
+  (not re-verified).
+- **Vendored ADS menus stay unreachable in the browser.** ADS opens its tab, title-bar and auto-hide-tab menus with `QMenu::exec()`, which aborts the browser build. They never open because `PlotDocker`'s `HiddenTitleBar` is forced invisible (the tabs and title-bar menu live inside it; `DockToolbar` forwards mouse events to it, never context-menu events) and auto-hide is never enabled (`CDockManager::AutoHideFeatureEnabled` is off by default, so no `CAutoHideTab` exists). Showing the ADS title bar or enabling auto-hide needs those menus replaced first.
+- **QRhi canvas:** a text resource never survives `releaseResources()` (a GPU reset or context teardown reuses it
+  stale); set the viewport after binding each pipeline (Vulkan draws nothing otherwise); `renderFailed()` can fire
+  inside `render()`, so a receiver that replaces the canvas connects queued (the swap deletes the canvas under the
+  signal). To capture the canvas use `grabFramebuffer()` / `grabPresentedFrame()`: `QWidget::grab()` cannot capture
+  QRhi content.
+- **Shader edits** re-bake the `.qsb` packs with the pinned `qsb` (`widget/shaders/bake.sh <qsb>`) and commit both, or
+  the WASM configure's byte check fails.
 - **Marker time frames:** the `__all__` marker family lives on `kAllDatasetsMarkerDataset` in the display frame, so
-  map it through the global time origin only, never a dataset's alignment offset.
-- **The runtime owns marker naming:** recognize marker topics through `pj_runtime/MarkerTopics.h`
-  (`markerTopicsOf`, `scanMarkerTopics`, `publishedMarkerScopes`), never by parsing topic names. The plot knows no
-  engine: the host feeds `setMarkerStatus` / `setSeriesStatus` with plain data.
-- **`TabbedPlotWidget::forEachDocker` / `findDocker`** enumerate the docker tabs in one pass; use them instead of
-  index loops over `dockerCount()`/`dockerAt()` (each a linear scan).
+  map it through the global time origin only, never a dataset's alignment offset, or its markers shift with the
+  dataset.
+- **The runtime owns marker naming:** recognize marker topics through `pj_runtime/MarkerTopics.h` (`markerTopicsOf`,
+  `scanMarkerTopics`, `publishedMarkerScopes`), never by parsing topic names. The plot knows no engine: the host feeds
+  `setMarkerStatus` / `setSeriesStatus` plain data.
+- **A time axis persists in absolute time**, with integer-nanosecond edges (`left_ns` / `right_ns`) as the authority and
+  an explicit `x_basis`; display-relative seconds would restore the wrong window under another display offset.
+- **`TabbedPlotWidget::forEachDocker` / `findDocker`** enumerate the docker tabs in one pass; an index loop over
+  `dockerCount()` / `dockerAt()` is quadratic (each is a linear scan).
+- **The XY keep-ratio fit only widens an axis**, so it always starts from the requested view
+  (`PlotWidgetBase::applyRectKeepingRatio` keeps it), re-fitted on every plot resize and persisted through
+  `requestedView()`. Fitting or saving the axes as shown instead zooms out a little on each resize, and a layout
+  restored at startup or under another window shape comes back wider. The fit also starts from the requested view's
+  tick labels and repeats until the canvas settles: the labels change the axis width, so near a tick-step boundary
+  the labels shown before would pick between two fits, or none would settle.
+- **A new curve takes a palette colour no curve of its plot uses yet; once every colour is in use it takes the
+  least-used one, lowest index first** (`plot_xml::freePaletteIndex` in `PlotXml.h`, over the curves' pens, so
+  restored and user-picked colours count). Both halves are intended: the session counter and `CurveColorRegistry` know
+  only what they handed out and a layout restore sets colours without them, so a plain counter repeats a restored
+  colour; and a fixed slot on exhaustion paints every further curve the same colour, where the least-used rule spreads
+  the repeats evenly. A colour the registry remembers for that curve is honoured as it is.
+- **`PlotWidget` and `StateTransitionsDockWidget` parse their XML once, in `parseState`**, which xmlLoadState and
+  xmlValidateState share, and every attribute xmlSaveState writes is read there through a reporting reader
+  (`pj_runtime/XmlStateOptions.h`, `widget/src/ReportedXml.h`): an attribute read any other way is missing from the
+  options the MCP `widget_state` tool serves. `widget_state_options_test` fails on an unreported saved attribute.
 - **`visibleXRangeChanged`** reports every move of the time axis; `rectChanged` drives the zoom link only.
-- **Object-dock drop hover** consults `IDataWidget::canAcceptObjectTopic` before
-  accepting catalog drags. A view's payload-dependent refusal must be visible in the cursor.
-- **Open Settings / Close Settings** in an object dock's context menu emits
-  `settingsPanelToggleRequested` through `PlotDocker`; the shell focuses that dock
-  and toggles its settings sidebar. The host-supplied visibility query chooses the
-  label when the menu opens.
-
-## Port strategy (root CLAUDE.md "Porting policy")
-
-This module is the canonical example of the **wholesale lift**:
-
-1. **Lift PJ3 files close to verbatim** from `${PJ3_SOURCE_DIR}/plotjuggler_app/`. Class names map directly (PJ3
-   `PlotWidget` → PJ4 `PlotWidget`).
-2. **Apply plotjuggler_sdk style** on the way in, and **preserve `.ui` `objectName` values verbatim**.
-3. **Rebind data reads only:** PJ3's `PlotDataMapRef` / `TransformsMap` consumption becomes
-   `DatastoreCurveAdapter` over `pj_datastore::DataReader`. Do not rewrite plotting logic from scratch.
+- **Object-dock drop hover** consults `IDataWidget::canAcceptObjectTopic` before accepting a catalog drag, so a view's
+  payload-dependent refusal shows in the cursor. "Open Settings" / "Close Settings" in an object dock's context menu
+  emits `settingsPanelToggleRequested` through `PlotDocker`; the host-supplied visibility query picks the label.
+- **A dock's state goes through `DockWidget`'s `IDataWidget` calls**, which forward to the plot or object widget it
+  hosts; a load a user action makes (a paste, an MCP `set_widget_state`) goes through `DockWidget::applyState`, which
+  adds `finishRestore` and the first-topic seeding of an empty click-created object widget. A caller branching on plot
+  versus object itself skips that seeding, and streaming playback is not seeded.
+- **pj_plotting stays agnostic to scene families:** placeholder icons and drops go to the shell through
+  `objectFamilyRequested` and the object-widget factory; the shell alone maps families to kinds.
 
 ## Cross-module rules
 
-- Sibling of `pj_scene2D/widgets` and `pj_scene3D/widgets`: **they never depend on each other.**
+- A sibling of `pj_scene2D/widgets` and `pj_scene3D/widgets`: they never depend on each other.
 - Shared runtime state flows through `pj_runtime::IDataWidget` (so `PlaybackEngine` drives tracker updates without
   coupling to plot internals).
-- Reusable Qt controls that could serve another widget family go in `pj_widgets`, not here.
+- A reusable Qt control that could serve another widget family goes in `pj_widgets`, not here.
 
 ## Tests
 
-`PJ_BUILD_TESTS` enables, through `pj_add_test_runner` (one process per case, runner name as ctest prefix):
+`PJ_BUILD_TESTS` enables, through `pj_add_test_runner` (one process per case, runner name as the ctest prefix):
 
 - `pj_plotting_core_tests` (shared `QCoreApplication` main): the core adapters.
 - `pj_plotting_widget_tests` (shared `QApplication` main, with `pj_resources`): widgets, docking, filter editor,
-  markers. The transaction and legend-diagnostics suites use file-local environments that apply their setup only
-  when those suites are selected.
-- `plot_rhi_render_test`: the canvas against Qwt's own QPainter rendering, registered on every backend of the
-  platform plus `.opengl_dpr2` (`RHI_BACKENDS DPR2`). It needs a real display (xvfb or a Wayland compositor on
-  Linux), skips on `offscreen`, and fails instead under `PJ_REQUIRE_GPU_TESTS=1`. What it pins:
-  [docs/ARCHITECTURE.md §4](./docs/ARCHITECTURE.md#4-render-tests-and-benchmarks).
+  markers.
+- `plot_rhi_render_test`: the canvas against Qwt's own QPainter rendering on every backend of the platform plus
+  `.opengl_dpr2`. It needs a real QPA in `QT_QPA_PLATFORM` (`./test.sh --display`: a private Xvfb on Linux), skips on
+  `offscreen` and fails instead under `PJ_REQUIRE_GPU_TESTS=1`
+  ([docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) "Render tests and benchmarks").
 
 ```bash
 ./test.sh -R '^pj_plotting_(core|widget)_tests\.'
 ```
+
+## Docs
+
+- [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md): core adapters, markers on a plot, `PlotRhiCanvas`, docks and
+  persistence, render tests and benchmarks, known gaps.
+- [docs/TECHNICAL_NOTES.md](./docs/TECHNICAL_NOTES.md): measurements and platform findings behind the choices.

@@ -14,9 +14,19 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QProcessEnvironment>
 #include <QString>
 #include <QTemporaryDir>
+#include <array>
+#include <cstdio>
+#include <filesystem>
+#include <string>
+#include <system_error>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 using namespace Qt::StringLiterals;
 
 // ThreadSanitizer-active detection: GCC defines __SANITIZE_THREAD__; Clang
@@ -49,9 +59,8 @@ TEST(PluginCheckRunnerTest, LocateHelperReturnsExplicitOverride) {
   EXPECT_EQ(PJ::PluginCheckRunner::locateHelper(override_path), override_path);
 }
 
-// Runner returns `ok=false` when the directory does not exist. The helper
-// itself is reachable, so this exercises the helper's own no-valid-plugin
-// exit code path (kExitNoValidPlugin = 4).
+// ok=false when the directory does not exist: the helper is reachable, so this exercises its own no-valid-plugin exit
+// code (kExitNoValidPlugin = 4).
 TEST(PluginCheckRunnerTest, RejectsMissingDirectory) {
   const PJ::PluginCheckRunner runner(helperOptions());
   const PJ::PluginCheckResult result = runner.run(u"/tmp/pj-plugin-check-test-missing-path"_s);
@@ -138,16 +147,50 @@ TEST(PluginCheckRunnerTest, ReportsWidgetFamily) {
 }
 #endif
 
+#ifndef _WIN32
+// A directory name that is not valid UTF-8 (possible on POSIX, where names are bytes) still
+// yields one valid JSON document: the helper replaces the bad bytes instead of aborting in
+// nlohmann::json::dump. Run through popen, since QProcess arguments cannot carry such bytes.
+TEST(PluginCheckRunnerTest, ANonUtf8DirectoryNameStillYieldsValidJson) {
+  QTemporaryDir parent;
+  ASSERT_TRUE(parent.isValid());
+  const std::string directory = parent.path().toStdString() + "/bad\xff";
+  std::error_code created;
+  std::filesystem::create_directory(directory, created);
+  if (created == std::errc::illegal_byte_sequence) {
+    GTEST_SKIP() << "this filesystem (macOS APFS) only stores UTF-8 names, so the case cannot arise";
+  }
+  ASSERT_FALSE(created) << created.message();
+
+  const std::string command = std::string("'") + kHelperPath + "' '" + directory + "'";
+  FILE* pipe = popen(command.c_str(), "r");
+  ASSERT_NE(pipe, nullptr);
+  std::string output;
+  std::array<char, 4096> buffer{};
+  for (size_t n = 0; (n = std::fread(buffer.data(), 1, buffer.size(), pipe)) > 0;) {
+    output.append(buffer.data(), n);
+  }
+  int status = pclose(pipe);           // not const: macOS WIFEXITED casts it to int* (-Wcast-qual)
+  std::filesystem::remove(directory);  // QTemporaryDir cannot name it, so it cannot remove it
+
+  ASSERT_TRUE(WIFEXITED(status)) << "the helper must not abort; raw status " << status;
+  EXPECT_EQ(WEXITSTATUS(status), 4) << "an empty directory is a clean no-valid-plugin rejection";
+  QJsonParseError error{};
+  const QJsonDocument document = QJsonDocument::fromJson(QByteArray::fromStdString(output), &error);
+  ASSERT_EQ(error.error, QJsonParseError::NoError) << output;
+  EXPECT_TRUE(document.object().value(u"directory"_s).toString().endsWith(u"/bad�"_s)) << output;
+}
+#endif
+
 // A helper path that does not exist on disk is caught by the parent-side
 // supervisor, not by the child: the runner sets parent_error and never
 // crashes.
 TEST(PluginCheckRunnerTest, MissingHelperBinaryFailsGracefully) {
 #ifdef PJ_TSAN_BUILD
-  // QProcess learns that a child whose exec failed has exited through its SIGCHLD
-  // handler. TSan runs a deferred signal handler only when the thread next passes
-  // through one of its interceptors, and cmake/sanitizers/tsan.supp makes calls
-  // from libQt6Core bypass them, so Qt blocks forever reading a pipe that handler
-  // would have written. Measured: hangs with that entry, passes in 5 ms without it.
+  // QProcess learns that a child whose exec failed has exited through its SIGCHLD handler. TSan runs a deferred signal
+  // handler only when the thread next passes through one of its interceptors, and cmake/sanitizers/tsan.supp makes
+  // calls from libQt6Core bypass them, so Qt blocks forever reading a pipe that handler would have written. Observed:
+  // hangs with that entry, passes in 5 ms without it.
   GTEST_SKIP() << "QProcess exec-failure path deadlocks under TSan with libQt6Core interceptors ignored";
 #endif
   const PJ::PluginCheckOptions bad_options{std::chrono::milliseconds(5'000), u"/tmp/pj-plugin-check-does-not-exist"_s};

@@ -7,8 +7,8 @@
 // "gauge" (value + status), "table" (one `multiple` number input), "viewer" (one object input).
 // Config tokens switch behaviours: "dynamic" (inputs value, extra), "grow_on_update" (announces a
 // new input from inside on_update), "reject" (load_config fails), "history" (queries history),
-// "throw_on_update" (onUpdate throws; the SDK trampoline contains it), "fail_inputs" (inputs()
-// throws, so the host receives a failed inputs call), "own_state" (save_config returns its own
+// "throw_on_update" (onUpdate throws; the SDK trampoline contains it), "with_value" (a viewer also takes a number),
+// "fail_inputs" (inputs() throws, so the host receives a failed inputs call), "own_state" (save_config returns its own
 // state, whose `unit` collides with the setting of that name). `g.null_widget` makes
 // createWidget return null. A second vtable claims another Qt minor, to exercise the admission
 // refusal; a third ("faulty_widgets") hands the host a string whose length no std::string can hold
@@ -19,9 +19,12 @@
 #include <QLabel>
 #include <QPointer>
 #include <QtGlobal>
+#include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <limits>
+#include <pj_base/sdk/plugin_data_api.hpp>
+#include <pj_base/sdk/service_traits.hpp>
 #include <pj_plugins/sdk/widget_plugin_base.hpp>
 #include <stdexcept>
 #include <string>
@@ -44,6 +47,26 @@ struct ValueCopy {
   std::string label;
 };
 
+inline ValueCopy copyValue(const PJ_widget_value_t& v) {
+  ValueCopy copy;
+  copy.input = v.input;
+  copy.slot = v.slot;
+  copy.kind = v.kind;
+  copy.time = v.time;
+  copy.number = v.number;
+  if (v.text.data != nullptr) {
+    copy.text.assign(v.text.data, v.text.size);
+  }
+  if (v.bytes.data != nullptr) {
+    copy.bytes.assign(v.bytes.data, v.bytes.data + v.bytes.size);
+  }
+  if (v.type_name.data != nullptr) {
+    copy.type_name.assign(v.type_name.data, v.type_name.size);
+  }
+  copy.label.assign(v.label.data == nullptr ? "" : v.label.data, v.label.size);
+  return copy;
+}
+
 // What the plugin saw, reset by every test fixture.
 struct PluginStats {
   int instances = 0;
@@ -58,10 +81,22 @@ struct PluginStats {
   bool history_ok = false;
   std::string last_config;
   std::vector<ValueCopy> last_values;
-  bool null_widget = false;                ///< createWidget returns null
-  bool corrupt_inputs = false;             ///< "faulty_widgets" reports an impossible input name
-  bool corrupt_saved_config = false;       ///< "faulty_widgets" reports an impossible save_config length
-  std::function<void()> on_create_widget;  ///< runs at the start of createWidget
+  std::vector<ValueCopy> values_after_hook;  ///< the host's value span read again after on_update's hook
+  std::vector<ValueCopy> history_values;     ///< what the last history read delivered
+  bool null_widget = false;                  ///< createWidget returns null
+  bool corrupt_inputs = false;               ///< "faulty_widgets" reports an impossible input name
+  bool corrupt_saved_config = false;         ///< "faulty_widgets" reports an impossible save_config length
+  std::function<void()> on_create_widget;    ///< runs at the start of createWidget
+  std::function<void()> on_update;           ///< runs inside onUpdate, after the values are copied
+  std::function<void()> on_save_config;      ///< runs inside saveConfig
+  int update_depth = 0;                      ///< onUpdate calls currently on the stack
+  int max_update_depth = 0;                  ///< deepest onUpdate nesting seen (1 = never re-entered)
+  bool values_changed_under_call = false;    ///< the host's value span changed while onUpdate ran
+  bool offered_playback = false;             ///< bind found pj.playback.v1
+  sdk::PlaybackHostView playback;            ///< the live instance's pj.playback.v1; invalid once it is destroyed
+  /// The user edits the live instance's own state (the JSON its save_config returns) in its UI, and the
+  /// widget reports it with notify_config_changed. Empty once the instance is destroyed.
+  std::function<void(std::string)> edit_in_widget;
 };
 inline PluginStats g;
 
@@ -88,6 +123,8 @@ class TestPlugin : public WidgetPluginBase {
 
   ~TestPlugin() override {
     ++g.destroyed;
+    g.playback = {};
+    g.edit_in_widget = nullptr;
     if (label_ != nullptr) {
       // The host must have taken the widget out of the tree before this runs.
       if (label_->parent() != nullptr) {
@@ -96,6 +133,20 @@ class TestPlugin : public WidgetPluginBase {
       delete label_.data();
       ++g.widgets_deleted_by_plugin;
     }
+  }
+
+  Status bind(sdk::ServiceRegistry services) override {
+    Status bound = WidgetPluginBase::bind(services);
+    if (bound) {
+      const auto playback = services.get<sdk::PlaybackHostService>();
+      g.offered_playback = playback.has_value();
+      g.playback = playback.value_or(sdk::PlaybackHostView{});
+      g.edit_in_widget = [this](std::string state) {
+        config_ = std::move(state);
+        widgetHost().notifyConfigChanged();
+      };
+    }
+    return bound;
   }
 
   std::vector<WidgetInput> inputs() const override {
@@ -107,6 +158,9 @@ class TestPlugin : public WidgetPluginBase {
       result.emplace_back("rows", "Rows", "", WidgetInputKind::kNumber, true);
     } else if (type_ == "viewer") {
       result.emplace_back("frame", "Frame", "", WidgetInputKind::kObject);
+      if (has("with_value")) {
+        result.emplace_back("value", "Value", "V");
+      }
     } else if (has("dynamic")) {
       result.emplace_back("value", "Value", "V");
       result.emplace_back("extra", "Extra");
@@ -140,26 +194,28 @@ class TestPlugin : public WidgetPluginBase {
     if (has("throw_on_update")) {
       throw std::runtime_error("on_update failed");
     }
+    ++g.update_depth;
+    g.max_update_depth = std::max(g.max_update_depth, g.update_depth);
     g.last_values.clear();
+    std::vector<double> times;  // this call's own copy: g.last_values is rewritten by a nested call
     for (const PJ_widget_value_t& v : values) {
-      ValueCopy copy;
-      copy.input = v.input;
-      copy.slot = v.slot;
-      copy.kind = v.kind;
-      copy.time = v.time;
-      copy.number = v.number;
-      if (v.text.data != nullptr) {
-        copy.text.assign(v.text.data, v.text.size);
-      }
-      if (v.bytes.data != nullptr) {
-        copy.bytes.assign(v.bytes.data, v.bytes.data + v.bytes.size);
-      }
-      if (v.type_name.data != nullptr) {
-        copy.type_name.assign(v.type_name.data, v.type_name.size);
-      }
-      copy.label.assign(v.label.data == nullptr ? "" : v.label.data, v.label.size);
-      g.last_values.push_back(std::move(copy));
+      g.last_values.push_back(copyValue(v));
+      times.push_back(v.time);
     }
+    if (g.on_update) {
+      g.on_update();
+      g.values_after_hook.clear();
+      for (const PJ_widget_value_t& v : values) {
+        g.values_after_hook.push_back(copyValue(v));
+      }
+    }
+    // Read after the hook: a nested on_update would have refilled the host's span under this call.
+    for (std::size_t i = 0; i < values.size() && i < times.size(); ++i) {
+      if (values[i].time != times[i]) {
+        g.values_changed_under_call = true;
+      }
+    }
+    --g.update_depth;
     if (has("history")) {
       readHistory();
     }
@@ -170,6 +226,9 @@ class TestPlugin : public WidgetPluginBase {
   }
 
   std::string saveConfig() const override {
+    if (g.on_save_config) {
+      g.on_save_config();
+    }
     if (has("own_state")) {
       return R"({"unit":"from_state","own_state":true})";
     }
@@ -189,8 +248,11 @@ class TestPlugin : public WidgetPluginBase {
  private:
   void readHistory() {
     g.history_samples = 0;
-    const Expected<uint32_t> total =
-        widgetHost().queryHistory(0, 0, 0.0, 100.0, 0, [](const PJ_widget_value_t&) { ++g.history_samples; });
+    g.history_values.clear();
+    const Expected<uint32_t> total = widgetHost().queryHistory(0, 0, 0.0, 100.0, 0, [](const PJ_widget_value_t& v) {
+      ++g.history_samples;
+      g.history_values.push_back(copyValue(v));
+    });
     g.history_ok = total.has_value();
     g.history_total = total ? *total : 0U;
   }

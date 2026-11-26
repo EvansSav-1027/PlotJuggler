@@ -1,13 +1,7 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
-//
-// The curve list must not offer an object topic as a drag payload when no view
-// can display its type (e.g. an occupancy grid update): the drop could
-// only end in the "Cannot display topic" dead end. The row stays selectable
-// (context menu, force-streaming) and carries a tooltip saying why it cannot
-// be dragged; displayable object topics keep dragging. Attempting the gesture
-// anyway is answered, not swallowed: the tree's not-draggable drag signals surface as
-// the panel's toastRequested (the shell shows a toast).
+// CurveListPanel: object-topic drag payloads and tooltips, toasts for refused drags, demand dimming, displayed
+// marks, and the Custom Topics view (rows, glyphs, pins, edit/delete gating).
 
 #include <gtest/gtest.h>
 
@@ -33,8 +27,11 @@
 #include <string>
 #include <vector>
 
+#include "PendingDisplayBinder.h"
+#include "TopicDemandController.h"
 #include "dataset_test_helpers.h"
 #include "pj_base/sdk/platform.hpp"
+#include "pj_plotting/PlotWidget.h"
 #include "pj_runtime/AppSession.h"
 #include "pj_runtime/CatalogModel.h"
 #include "pj_runtime/SessionManager.h"
@@ -47,8 +44,7 @@ using namespace Qt::StringLiterals;
 namespace PJ {
 namespace {
 
-// The organization name sandboxes the panel's QSettings reads away from the
-// user's real preferences; only this suite may select that settings scope.
+// Sandboxes the panel's QSettings away from the user's real preferences; only this suite selects that scope.
 struct QtEnvironment : ::testing::Environment {
   void SetUp() override {
     if (!pj_app_test::isTestSuiteSelected("CurveListPanelTest")) {
@@ -60,9 +56,8 @@ struct QtEnvironment : ::testing::Environment {
 };
 static auto* const kEnv = ::testing::AddGlobalTestEnvironment(new QtEnvironment);
 
-// Depth-first search for the row resolving to `catalog_key`, independent of the
-// tree's view mode (hierarchical vs show-topics lay the same topic out under
-// different node chains).
+// Depth-first search for the row resolving to `catalog_key`, in either view mode (hierarchical and show-topics
+// lay the same topic out under different node chains).
 QTreeWidgetItem* findRowByCatalogKey(QTreeWidgetItem* item, const QString& catalog_key) {
   if (CurveTreeView::catalogKeyOf(item) == catalog_key) {
     return item;
@@ -84,8 +79,8 @@ QString keyOfTopic(const CatalogModel& catalog, const QString& topic_name) {
   return {};
 }
 
-// Drive the right-button press plus the context event Linux delivers before a
-// drag can start. Close a real menu through its nested loop, recording its UI.
+// Right-press plus the context event Linux delivers before a drag can start. A queued callback records the
+// menu's button labels and closes it, because a real menu runs a nested loop.
 QStringList rightClickMenuButtons(CurveTreeView& tree, QTreeWidgetItem* row) {
   const QPoint pos = tree.visualItemRect(row).center();
   const QPoint global = tree.viewport()->mapToGlobal(pos);
@@ -256,7 +251,7 @@ TEST(CurveListPanelTest, HoverTooltipReportsTypeAndCounts) {
   ASSERT_NE(scalar_row, nullptr);
   ASSERT_NE(image_row, nullptr);
 
-  // Drive the real hover path; QToolTip::text() reads back what the view showed.
+  // QToolTip::text() reads back what the real hover path showed.
   const auto hover = [&](QTreeWidgetItem* item) {
     const QRect rect = tree->visualItemRect(item);
     const QPoint pos(rect.left() + 4, rect.center().y());
@@ -274,7 +269,7 @@ TEST(CurveListPanelTest, HoverTooltipReportsTypeAndCounts) {
   EXPECT_TRUE(dataset_tip.contains(u"<span style=\"font-weight:600\">Topics:</span> 2"_s)) << dataset_tip.toStdString();
 }
 
-TEST(CurveListPanelTest, UndisplayableObjectTopicRowIsDragInertWithTooltip) {
+TEST(CurveListPanelTest, NoViewObjectTopicRowDragsToACustomWidgetWithTooltip) {
   AppSession app_session;
   const DatasetId dataset = pj_test::createDataset(app_session, "drive.mcap");
   ASSERT_NE(dataset, 0U);
@@ -286,6 +281,13 @@ TEST(CurveListPanelTest, UndisplayableObjectTopicRowIsDragInertWithTooltip) {
           .metadata_json = R"({"builtin_object_type":"kOccupancyGridUpdate"})",
       });
   ASSERT_TRUE(update_topic.has_value()) << update_topic.error();
+  auto mesh_update_topic = app_session.sessionManager().objectStore().registerTopic(
+      ObjectTopicDescriptor{
+          .dataset_id = dataset,
+          .topic_name = "/navmesh/updates",
+          .metadata_json = R"({"builtin_object_type":"kMeshMapUpdate"})",
+      });
+  ASSERT_TRUE(mesh_update_topic.has_value()) << mesh_update_topic.error();
   auto image_topic = app_session.sessionManager().objectStore().registerTopic(
       ObjectTopicDescriptor{
           .dataset_id = dataset,
@@ -310,15 +312,23 @@ TEST(CurveListPanelTest, UndisplayableObjectTopicRowIsDragInertWithTooltip) {
   ASSERT_NE(image_row, nullptr);
 
   EXPECT_TRUE(update_row->flags().testFlag(Qt::ItemIsSelectable));
-  EXPECT_FALSE(update_row->flags().testFlag(Qt::ItemIsDragEnabled));
-  EXPECT_FALSE(update_row->toolTip(0).isEmpty());
+  // No built-in view shows it, but a Custom Widget input takes any object type: it drags.
+  EXPECT_TRUE(update_row->flags().testFlag(Qt::ItemIsDragEnabled));
+  EXPECT_TRUE(update_row->toolTip(0).contains(u"Custom Widget"_s)) << update_row->toolTip(0).toStdString();
 
   EXPECT_TRUE(image_row->flags().testFlag(Qt::ItemIsDragEnabled));
   EXPECT_TRUE(image_row->toolTip(0).isEmpty());
 
-  // Not-draggable drag feedback wiring: the tree's signals must surface as
-  // toastRequested. Invoked directly (signals are public-callable) — the
-  // gesture mechanics that fire them are covered by curve_tree_view_test.
+  // A mesh-map patch has no view of its own (its map's layer applies it), so it drags to a Custom Widget too.
+  const QString mesh_update_key = keyOfTopic(app_session.catalogModel(), u"/navmesh/updates"_s);
+  QTreeWidgetItem* mesh_update_row = findRowByCatalogKey(tree->invisibleRootItem(), mesh_update_key);
+  ASSERT_NE(mesh_update_row, nullptr);
+  EXPECT_TRUE(mesh_update_row->flags().testFlag(Qt::ItemIsDragEnabled));
+  EXPECT_TRUE(mesh_update_row->toolTip(0).contains(u"mesh map"_s)) << mesh_update_row->toolTip(0).toStdString();
+  EXPECT_TRUE(mesh_update_row->toolTip(0).contains(u"Custom Widget"_s)) << mesh_update_row->toolTip(0).toStdString();
+
+  // Toasts for the tree's not-draggable signals, emitted directly; the gestures that fire them are covered by
+  // pj_widgets/tests/curve_tree_view_test.cpp.
   QStringList toasts;
   QObject::connect(
       &panel, &CurveListPanel::toastRequested, [&toasts](const QString& message) { toasts.append(message); });
@@ -364,7 +374,39 @@ TEST(CurveListPanelTest, CameraInfoTopicRowCanBeDraggedToAPanel) {
   EXPECT_EQ(CurveTreeView::decodeCatalogKeys(payload.get()), QStringList{key});
 }
 
-// A topic of a per-topic-pause-capable dataset that nothing references is dimmed; displaying it undims it; a dataset
+// No built-in view displays a mesh asset, but a Custom Widget can read any object type: the row starts a drag and says
+// where it goes.
+TEST(CurveListPanelTest, MeshTopicRowCanBeDraggedToACustomWidget) {
+  AppSession app_session;
+  const DatasetId dataset = pj_test::createDataset(app_session, "drive.mcap");
+  ASSERT_NE(dataset, 0U);
+  auto topic = app_session.sessionManager().objectStore().registerTopic(
+      ObjectTopicDescriptor{
+          .dataset_id = dataset,
+          .topic_name = "/model",
+          .metadata_json = R"({"builtin_object_type":"kMesh3D"})",
+      });
+  ASSERT_TRUE(topic.has_value()) << topic.error();
+  app_session.catalogModel().rebuildFromDatastore();
+
+  CurveListPanel panel;
+  panel.setCatalog(&app_session.catalogModel());
+  auto* tree = panel.findChild<CurveTreeView*>(u"treeView"_s);
+  ASSERT_NE(tree, nullptr);
+  const QString key = keyOfTopic(app_session.catalogModel(), u"/model"_s);
+  QTreeWidgetItem* row = findRowByCatalogKey(tree->invisibleRootItem(), key);
+  ASSERT_NE(row, nullptr);
+
+  EXPECT_TRUE(row->flags().testFlag(Qt::ItemIsDragEnabled));
+  EXPECT_EQ(row->toolTip(0), u"Drop it on a Custom Widget panel."_s);
+
+  row->setSelected(true);
+  const std::unique_ptr<QMimeData> payload(tree->createDragMimeData(Qt::LeftButton));
+  ASSERT_NE(payload, nullptr);
+  EXPECT_EQ(CurveTreeView::decodeCatalogKeys(payload.get()), QStringList{key});
+}
+
+// A topic of a per-topic-pause-capable dataset that nothing references is dimmed; referencing it undims it; a dataset
 // that cannot pause topics never dims; a panel without a tracker dims nothing.
 TEST(CurveListPanelTest, UnsubscribedRowsFollowTheDemandTracker) {
   AppSession app_session;
@@ -414,9 +456,70 @@ TEST(CurveListPanelTest, UnsubscribedRowsFollowTheDemandTracker) {
   EXPECT_FALSE(tree->isKeyUnsubscribed(key_b));
 }
 
-// A demand change walks the catalog only while some dataset can pause topics, and it reads that capability at every
-// change, not once when the tracker attached: a dataset that becomes pause-capable afterwards dims its idle topics, and
-// one that stops being so is cleared (the walk is skipped, the flags still pushed).
+// A row is marked displayed while a plot inside the panel's scope shows it, and the mark follows the scope (the
+// shell's selected dock), the Custom Topics view and the plot's lifetime.
+TEST(CurveListPanelTest, DisplayedRowsFollowTheWidgetsInScope) {
+  AppSession app_session;
+  SessionManager& session = app_session.sessionManager();
+  CatalogModel& catalog = app_session.catalogModel();
+  const DatasetId dataset = pj_test::createDataset(app_session, "file.mcap");
+  ASSERT_NE(pj_test::addScalarTopic(app_session, dataset, "/speed"), 0U);
+  QString key;
+  for (const CatalogItem& item : catalog.items()) {
+    if (item.topic_name == u"/speed"_s && isScalarField(item)) {
+      key = item.key;
+    }
+  }
+  ASSERT_FALSE(key.isEmpty());
+
+  PendingDisplayBinder binder(catalog, &app_session.topicDemandTracker());
+  TopicDemandController controller(
+      catalog, app_session.topicDemandTracker(), session.dataProcessorService(), binder, session.dataEngine());
+  QWidget selected_a;
+  QWidget selected_b;
+  auto* plot = new PlotWidget(&session, &catalog, &selected_a);
+  controller.registerPlot(plot);
+
+  CurveListPanel panel;
+  panel.setCatalog(&catalog);
+  auto* tree = panel.findChild<CurveTreeView*>(u"treeView"_s);
+  ASSERT_NE(tree, nullptr);
+  const QWidget* selected = &selected_a;
+  panel.setTopicDemandController(&controller);
+  panel.setDisplayedScope([&selected]() { return selected; });
+  const auto marked = [&]() {
+    QCoreApplication::processEvents();  // the refresh runs on the next event-loop turn
+    return CurveTreeView::isMarkedDisplayed(findRowByCatalogKey(tree->invisibleRootItem(), key));
+  };
+
+  EXPECT_FALSE(marked());
+  ASSERT_NE(plot->addCurve(key), nullptr);
+  EXPECT_TRUE(marked());
+
+  selected = &selected_b;
+  panel.scheduleDisplayedKeysRefresh();
+  EXPECT_FALSE(marked()) << "a plot outside the scope marks nothing";
+  selected = &selected_a;
+  panel.scheduleDisplayedKeysRefresh();
+  EXPECT_TRUE(marked());
+
+  // A series listed under Custom Topics leaves the Datasets tree; its row there carries the mark instead.
+  auto* custom = panel.findChild<CurveTreeView*>(u"customView"_s);
+  ASSERT_NE(custom, nullptr);
+  panel.setCustomTopics({{.key = key, .owner = {}, .name = u"speed"_s}});
+  QCoreApplication::processEvents();
+  ASSERT_EQ(findRowByCatalogKey(tree->invisibleRootItem(), key), nullptr);
+  EXPECT_TRUE(CurveTreeView::isMarkedDisplayed(findRowByCatalogKey(custom->invisibleRootItem(), key)));
+
+  delete plot;
+  QCoreApplication::processEvents();
+  EXPECT_FALSE(CurveTreeView::isMarkedDisplayed(findRowByCatalogKey(custom->invisibleRootItem(), key)))
+      << "a destroyed plot releases its mark";
+}
+
+// A demand change walks the catalog only while some dataset can pause topics, and reads that capability at every
+// change, not once at tracker attach: a dataset that becomes pause-capable later dims its idle topics, and one that
+// stops being so is cleared (the walk is skipped, the flags are still pushed).
 TEST(CurveListPanelTest, DemandChangeWalksTheCatalogOnlyWhileADatasetCanPauseTopics) {
   AppSession app_session;
   const DatasetId stream = pj_test::createDataset(app_session, "stream");
@@ -470,9 +573,8 @@ TEST(CurveListPanelTest, DemandChangeWalksTheCatalogOnlyWhileADatasetCanPauseTop
   EXPECT_FALSE(tree->isKeyUnsubscribed(key_b)) << "the skipped walk still clears the flags it set";
 }
 
-// PJ_BENCH=1: one demand change in a catalog of 10k object topics, a dataset that cannot pause topics (nothing to
-// dim) apart from one that can (the flags are recomputed). The fakes are production's: the real panel, catalog
-// and tracker.
+// PJ_BENCH=1: prints the median cost of one demand change among 10k object topics, for a dataset that cannot pause
+// topics (nothing to dim) and one that can (flags recomputed). No assertions; real panel, catalog and tracker.
 TEST(CurveListPanelTest, BenchDemandChangeAmongTenThousandTopics) {
   if (!PJ::sdk::getEnv("PJ_BENCH")) {
     GTEST_SKIP() << "set PJ_BENCH=1";
@@ -546,10 +648,9 @@ QPushButton* deleteButtonOf(CurveListPanel& panel) {
 
 constexpr const char* kEditor = "toolbox-transform-editor";
 
-// UI-07: an object row of the Custom Topics view is built like its Datasets-tree twin (drags, family icon), names
-// its creator, shows the glyph of its node's state (computing while an older result is shown, the lag in the
-// tooltip), and the pencil is enabled only for a row the declared editor owns. A state-only change repaints the
-// glyph without rebuilding the rows.
+// An object row of the Custom Topics view is built like its Datasets-tree twin (drags, family icon), names its creator,
+// shows its node's state glyph (computing while an older result is shown, the lag in the tooltip) and enables the
+// pencil only for a row the declared editor owns. A state-only change repaints the glyph without rebuilding rows.
 TEST(CurveListPanelTest, CustomTopicsObjectRowDragsShowsGlyphAndGatesEdit) {
   AppSession app_session;
   const DatasetId dataset = pj_test::createDataset(app_session, "drive.mcap");
@@ -620,9 +721,8 @@ TEST(CurveListPanelTest, CustomTopicsObjectRowDragsShowsGlyphAndGatesEdit) {
   EXPECT_FALSE(row_a->toolTip(0).contains(u"Computing"_s));
 }
 
-// UI-08: Custom Topics object rows are flat (one top-level row per topic, named after the recipe, `recipe/output`
-// never split), an external plugin's rows carry its badge (presentation only), and the tooltip names the creator
-// and the dataset.
+// Custom Topics object rows are flat (one top-level row per topic, named after the recipe, `recipe/output` never
+// split); an external plugin's rows carry its badge (presentation only); the tooltip names the creator and dataset.
 TEST(CurveListPanelTest, CustomTopicsRowsAreFlatNamedAndBadged) {
   AppSession app_session;
   const DatasetId dataset = pj_test::createDataset(app_session, "drive.mcap");
@@ -685,8 +785,8 @@ TEST(CurveListPanelTest, CustomTopicsRowsAreFlatNamedAndBadged) {
   EXPECT_EQ(CurveTreeView::badgeOf(findRowByCatalogKey(bare_custom->invisibleRootItem(), crop)), u"assistant"_s);
 }
 
-// UI-09: the pencil AND Delete follow the owner: another plugin's rows are use-only, the editor's rows can be
-// edited and deleted, and one use-only row in a selection blocks Delete for all of it.
+// The pencil AND Delete follow the owner: another plugin's rows are use-only, the editor's rows can be edited and
+// deleted, and one use-only row in a selection blocks Delete for all of it.
 TEST(CurveListPanelTest, ReadOnlyRowsDisableEditAndDelete) {
   AppSession app_session;
   const DatasetId dataset = pj_test::createDataset(app_session, "drive.mcap");
@@ -734,7 +834,53 @@ TEST(CurveListPanelTest, ReadOnlyRowsDisableEditAndDelete) {
   EXPECT_FALSE(remove->isEnabled()) << "a mixed selection cannot be deleted";
 }
 
-// UI-03: a row no plugin owns (a recipe restored without an owner) is no editor's: read-only, like another plugin's.
+// An editor that shows other owners' recipes read-only turns the pencil into "view" on their rows; Delete stays off.
+TEST(CurveListPanelTest, ReadOnlyRowsOpenAViewWhenTheEditorShowsOne) {
+  AppSession app_session;
+  const DatasetId dataset = pj_test::createDataset(app_session, "drive.mcap");
+  ASSERT_NE(dataset, 0U);
+  registerClouds(app_session, dataset, {"assistant/a/out", "legacy/out"});
+  CurveListPanel panel;
+  panel.setEditorPluginId(QString::fromLatin1(kEditor));
+  panel.setEditorViewsOthers(true);
+  panel.setCatalog(&app_session.catalogModel());
+  panel.setOwnerResolver([](const QString& id) {
+    return CurveListPanel::OwnerInfo{id == u"assistant"_s ? u"Assistant Agent"_s : id, {}};
+  });
+  auto* custom = panel.findChild<CurveTreeView*>(u"customView"_s);
+  auto* edit = panel.findChild<QToolButton*>(u"buttonEditCustom"_s);
+  QPushButton* remove = deleteButtonOf(panel);
+  ASSERT_NE(custom, nullptr);
+  ASSERT_NE(edit, nullptr);
+  ASSERT_NE(remove, nullptr);
+  const QString external = keyOfTopic(app_session.catalogModel(), u"assistant/a/out"_s);
+  const QString orphan = keyOfTopic(app_session.catalogModel(), u"legacy/out"_s);
+  panel.setCustomTopics({
+      {.key = external, .owner = u"assistant"_s, .name = u"a"_s},
+      {.key = orphan, .name = u"out"_s},
+  });
+  QStringList requested;
+  QObject::connect(&panel, &CurveListPanel::editCustomTopicRequested, [&](const QString& key) { requested << key; });
+
+  custom->clearSelection();
+  findRowByCatalogKey(custom->invisibleRootItem(), external)->setSelected(true);
+  EXPECT_TRUE(edit->isEnabled());
+  EXPECT_EQ(edit->toolTip(), u"View the formula (created by Assistant Agent; read-only)"_s);
+  EXPECT_FALSE(remove->isEnabled());
+  EXPECT_EQ(remove->toolTip(), u"Created by Assistant Agent; read-only"_s);
+  edit->click();
+  EXPECT_EQ(requested, QStringList{external});
+
+  custom->clearSelection();
+  findRowByCatalogKey(custom->invisibleRootItem(), orphan)->setSelected(true);
+  EXPECT_TRUE(edit->isEnabled());
+  EXPECT_EQ(edit->toolTip(), u"View the formula (read-only)"_s);
+
+  panel.setEditorViewsOthers(false);
+  EXPECT_FALSE(edit->isEnabled()) << "an editor that cannot show a view leaves the row closed";
+}
+
+// A row no plugin owns (a recipe restored without an owner) is no editor's: read-only, like another plugin's.
 TEST(CurveListPanelTest, RowsWithNoOwnerAreReadOnly) {
   AppSession app_session;
   const DatasetId dataset = pj_test::createDataset(app_session, "drive.mcap");
@@ -759,8 +905,8 @@ TEST(CurveListPanelTest, RowsWithNoOwnerAreReadOnly) {
   EXPECT_EQ(remove->toolTip(), u"Read-only"_s);
 }
 
-// PIN-09: a finding says when it was computed on the display axis (resolved by the host), never in raw
-// nanoseconds, and never as a second line of the row text (D26).
+// A finding says when it was computed on the display axis (resolved by the host), never in raw nanoseconds and
+// never as a second line of the row text.
 TEST(CurveListPanelTest, PinnedRowTooltipShowsDisplaySeconds) {
   AppSession app_session;
   const DatasetId dataset = pj_test::createDataset(app_session, "drive.mcap");
@@ -793,8 +939,8 @@ TEST(CurveListPanelTest, PinnedRowTooltipShowsDisplaySeconds) {
   EXPECT_FALSE(row->toolTip(0).contains(u"Pinned at"_s)) << row->toolTip(0).toStdString();
 }
 
-// UI-15: a state change of one node writes only its row: another row, hovered for its error, sees no model change at
-// all, since its glyph and its whole tooltip (creator, state) are written in one pass and are equal.
+// A state change of one node writes only its row: another row, hovered for its error, sees no model change at all,
+// since its glyph and its whole tooltip (creator, state) are written in one pass and are equal.
 TEST(CurveListPanelTest, OneNodeStateChangeLeavesOtherRowsUntouched) {
   AppSession app_session;
   const DatasetId dataset = pj_test::createDataset(app_session, "drive.mcap");
@@ -840,8 +986,8 @@ TEST(CurveListPanelTest, OneNodeStateChangeLeavesOtherRowsUntouched) {
   EXPECT_EQ(row_b->toolTip(0), tooltip_b);
 }
 
-// UI-08: a row kept across a merge follows the catalog: the anchor's new label reaches its tooltip although the
-// recipe rows did not change.
+// A row kept across a merge follows the catalog: the anchor's new label reaches its tooltip although the recipe
+// rows did not change.
 TEST(CurveListPanelTest, CustomRowFollowsTheCatalogAcrossAMerge) {
   AppSession app_session;
   const DatasetId anchor = pj_test::createDataset(app_session, "run", /*own_time_domain=*/true);
@@ -893,7 +1039,7 @@ TEST(CurveListPanelTest, CustomRowDimmingFollowsTheDemand) {
   EXPECT_FALSE(custom->isKeyUnsubscribed(key));
 }
 
-// PIN-09: re-sent rows equal to the shown ones still re-word the pin when the display axis moved.
+// Re-sent rows equal to the shown ones still re-word the pin when the display axis moved.
 TEST(CurveListPanelTest, PinnedTooltipFollowsTheAxisWithEqualRows) {
   AppSession app_session;
   const DatasetId dataset = pj_test::createDataset(app_session, "drive.mcap");
@@ -919,8 +1065,8 @@ TEST(CurveListPanelTest, PinnedTooltipFollowsTheAxisWithEqualRows) {
   EXPECT_TRUE(row->toolTip(0).contains(u"Pinned at 10.000 s"_s)) << row->toolTip(0).toStdString();
 }
 
-// UI-10: the "+" stands for an editor to open: hidden until a toolbox declaring custom_topics_editor is named,
-// hidden again when it goes.
+// The "+" stands for an editor to open: hidden until a toolbox declaring custom_topics_editor is named, hidden
+// again when it goes.
 TEST(CurveListPanelTest, AddButtonFollowsTheDeclaredEditor) {
   CurveListPanel panel;
   auto* add = panel.findChild<QToolButton*>(u"buttonAddCustom"_s);

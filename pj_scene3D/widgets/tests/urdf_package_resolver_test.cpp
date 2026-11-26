@@ -7,11 +7,15 @@
 #include <QByteArray>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QMap>
 #include <QSettings>
 #include <QString>
+#include <QStringList>
+#include <QTemporaryDir>
 #include <QTemporaryFile>
 #include <QUrl>
+#include <QVariantMap>
 #include <string>
 
 using namespace Qt::StringLiterals;
@@ -27,7 +31,6 @@ std::string fixtures() {
   return std::string(PJ_SCENE3D_FIXTURES_DIR);
 }
 
-// A throwaway in-memory QSettings (Ini format, unique temp file per test).
 class ScopedSettings {
  public:
   ScopedSettings() {
@@ -45,38 +48,61 @@ class ScopedSettings {
   std::unique_ptr<QSettings> settings_;
 };
 
-// ---------------------------------------------------------------------------
-// URI-scheme dispatch + the package:// guard
-// ---------------------------------------------------------------------------
-
 TEST(UrdfResolver, FileSchemeStrippedToAbsolutePath) {
   UrdfPackageResolver r;
-  const ResolvedMesh m = r.resolveUri("file:///abs/path/mesh.stl", "/some/dir", false);
+  const ResolvedMesh m = r.resolveUri("file:///abs/path/mesh.stl", "/some/dir", false, {}, false);
   EXPECT_TRUE(m.resolved);
   EXPECT_EQ(m.path, "/abs/path/mesh.stl");
   EXPECT_FALSE(m.is_url);
 }
 
+// A ref the URDF names on a network share (SMB on Windows) never resolves: a file:// URL with a host other than
+// localhost, or an absolute "//host/..." path (POSIX reads "//tmp/x" as "/tmp/x", so there it names an existing file
+// and is refused, not merely missing). A package root on a share came from the user's layout and still resolves.
+TEST(UrdfResolver, NetworkShareRefsNeverResolve) {
+  QTemporaryFile existing;
+  ASSERT_TRUE(existing.open());
+  existing.close();
+  UrdfPackageResolver r;
+  QStringList refs{u"file://203.0.113.9/share/m.stl"_s};
+#ifndef Q_OS_WIN
+  refs << u"/"_s + existing.fileName();
+#endif
+  for (const QString& ref : refs) {
+    SCOPED_TRACE(ref.toStdString());
+    const ResolvedMesh m = r.resolveUri(ref.toStdString(), "/some/dir", /*source_is_url=*/false, {}, false);
+    EXPECT_FALSE(m.resolved) << m.path;
+    EXPECT_EQ(m.issue, MeshResolveIssue::kNetworkShare);
+  }
+  const QMap<QString, QUrl> share_root{{u"pkg"_s, QUrl(u"file://fileserver/team/pkg/"_s)}};
+  const ResolvedMesh rooted = r.resolveUri("package://pkg/m.stl", "", /*source_is_url=*/false, share_root, false);
+  EXPECT_TRUE(rooted.resolved);
+  EXPECT_EQ(rooted.path, "//fileserver/team/pkg/m.stl");
+  const ResolvedMesh localhost =
+      r.resolveUri("file://localhost/abs/m.stl", "/some/dir", /*source_is_url=*/false, {}, false);
+  EXPECT_TRUE(localhost.resolved);
+  EXPECT_EQ(localhost.path, "/abs/m.stl");
+}
+
 TEST(UrdfResolver, BarePathJoinsUrdfDirAndSkipsPackageSearch) {
   UrdfPackageResolver r;
   r.addSearchRoot(QString::fromStdString(fixtures() + "/search_root"));
-  // This bare path's first segment matches a package dir in the search root,
-  // but the guard must keep it OUT of the package search.
-  const ResolvedMesh m = r.resolveUri("demo_description/meshes/x.stl", "/urdf/dir", false);
+  // This bare path's first segment matches a package dir in the search root, but the guard must keep it OUT of the
+  // package search.
+  const ResolvedMesh m = r.resolveUri("demo_description/meshes/x.stl", "/urdf/dir", false, {}, false);
   EXPECT_TRUE(m.resolved);
   EXPECT_EQ(m.path, "/urdf/dir/demo_description/meshes/x.stl");
-  // The chain never ran: no package recorded on the result.
   EXPECT_TRUE(m.package.empty());
   EXPECT_EQ(m.issue, MeshResolveIssue::kNone);
 }
 
 TEST(UrdfResolver, HttpBlockedForNonUrlSource) {
   UrdfPackageResolver r;
-  const ResolvedMesh blocked = r.resolveUri("https://host/m.stl", "/dir", /*source_is_url=*/false);
+  const ResolvedMesh blocked = r.resolveUri("https://host/m.stl", "/dir", /*source_is_url=*/false, {}, false);
   EXPECT_FALSE(blocked.resolved);
   EXPECT_EQ(blocked.issue, MeshResolveIssue::kBlockedHttp);
   EXPECT_TRUE(blocked.package.empty());  // not a package:// ref
-  const ResolvedMesh allowed = r.resolveUri("https://host/m.stl", "https://host/", /*source_is_url=*/true);
+  const ResolvedMesh allowed = r.resolveUri("https://host/m.stl", "https://host/", /*source_is_url=*/true, {}, false);
   EXPECT_TRUE(allowed.resolved);
   EXPECT_TRUE(allowed.is_url);
   EXPECT_EQ(allowed.issue, MeshResolveIssue::kNone);
@@ -91,20 +117,17 @@ TEST(UrdfResolver, AbsolutePathPassthroughAndMissing) {
   existing.write("STL");
   existing.close();
   const std::string abs = existing.fileName().toStdString();
-  const ResolvedMesh hit = r.resolveUri(abs, "/some/urdf/dir", /*source_is_url=*/false);
+  const ResolvedMesh hit = r.resolveUri(abs, "/some/urdf/dir", /*source_is_url=*/false, {}, false);
   EXPECT_TRUE(hit.resolved);
   EXPECT_EQ(hit.path, abs);  // verbatim, not "/some/urdf/dir" + abs
   EXPECT_FALSE(hit.is_url);
   EXPECT_EQ(hit.issue, MeshResolveIssue::kNone);
 
-  const ResolvedMesh miss = r.resolveUri("/does/not/exist/arm.stl", "/some/urdf/dir", /*source_is_url=*/false);
+  const ResolvedMesh miss =
+      r.resolveUri("/does/not/exist/arm.stl", "/some/urdf/dir", /*source_is_url=*/false, {}, false);
   EXPECT_FALSE(miss.resolved);
   EXPECT_EQ(miss.issue, MeshResolveIssue::kMissingFile);
 }
-
-// ---------------------------------------------------------------------------
-// Chain step 0 — embedded-asset exact-name lookup
-// ---------------------------------------------------------------------------
 
 TEST(UrdfResolver, Step0_AttachmentExactNameHit) {
   UrdfPackageResolver r;
@@ -112,42 +135,27 @@ TEST(UrdfResolver, Step0_AttachmentExactNameHit) {
   att.insert("package://demo_description/meshes/base.dae", QByteArray("DAE-BYTES"));
   r.setEmbeddedAssets(att);
 
-  const ResolvedMesh m = r.resolveUri("package://demo_description/meshes/base.dae", "", false);
+  const ResolvedMesh m = r.resolveUri("package://demo_description/meshes/base.dae", "", false, {}, false);
   ASSERT_TRUE(m.resolved);
-  // Extracted to a temp file; the bytes must round-trip.
   QFile f(QString::fromStdString(m.path));
   ASSERT_TRUE(f.open(QIODevice::ReadOnly));
   EXPECT_EQ(f.readAll(), QByteArray("DAE-BYTES"));
 }
-
-// ---------------------------------------------------------------------------
-// Chain step 1 — remembered per-source map (QSettings)
-// ---------------------------------------------------------------------------
 
 TEST(UrdfResolver, Step1_RememberedPerSourceMapHit) {
   ScopedSettings s;
   UrdfPackageResolver r;
   r.setSettings(s.get());
   r.setSourcePath("/data/run42.dat");
-  // rememberPackageRoot writes both the per-source map and the global roots.
-  r.rememberPackageRoot("demo_description", QString::fromStdString(fixtures() + "/search_root/demo_description"));
-
-  // A fresh resolver reading the same settings + source path resolves via step 1.
-  UrdfPackageResolver r2;
-  r2.setSettings(s.get());
-  r2.setSourcePath("/data/run42.dat");
-  const std::string p = r2.resolve("demo_description", "meshes/base.stl", "", false);
+  const QVariantMap packages{
+      {u"demo_description"_s, QString::fromStdString(fixtures() + "/search_root/demo_description")}};
+  s.get()->setValue(u"pj_scene3d/urdf_per_source_packages"_s, QVariantMap{{u"/data/run42.dat"_s, packages}});
+  const std::string p = r.resolve("demo_description", "meshes/base.stl", "", false);
   EXPECT_EQ(p, fixtures() + "/search_root/demo_description/meshes/base.stl");
 }
 
-// ---------------------------------------------------------------------------
-// Chain step 2 — ancestor heuristic (walk up urdf_dir for basename == pkg)
-// ---------------------------------------------------------------------------
-
 TEST(UrdfResolver, Step2_AncestorHeuristicHit) {
   UrdfPackageResolver r;
-  // urdf_dir is inside ws/demo_description/ ; walking up finds the pkg-named
-  // ancestor and verifies ancestor/rel exists.
   const std::string urdf_dir = fixtures() + "/ws/demo_description";
   const std::string p = r.resolve("demo_description", "meshes/anc.stl", urdf_dir, false);
   EXPECT_EQ(p, fixtures() + "/ws/demo_description/meshes/anc.stl");
@@ -156,8 +164,7 @@ TEST(UrdfResolver, Step2_AncestorHeuristicHit) {
 TEST(UrdfResolver, Step2_AncestorRejectsWhenRelMissing) {
   UrdfPackageResolver r;
   const std::string urdf_dir = fixtures() + "/ws/demo_description";
-  // The ancestor basename matches, but the rel file does not exist there → no
-  // false-positive accept; falls through (and, with no roots, is unresolved).
+  // The ancestor basename matches but the rel file does not exist there: no false-positive accept, it falls through.
   const std::string p = r.resolve("demo_description", "meshes/DOES_NOT_EXIST.stl", urdf_dir, false);
   EXPECT_TRUE(p.empty());
 }
@@ -168,10 +175,6 @@ TEST(UrdfResolver, Step2_UrlAncestorHeuristic) {
   const std::string p = r.resolve("demo_description", "meshes/base.dae", base, /*source_is_url=*/true);
   EXPECT_EQ(p, "https://example.com/repo/demo_description/meshes/base.dae");
 }
-
-// ---------------------------------------------------------------------------
-// Chain step 3 — search roots (basename match, no package.xml)
-// ---------------------------------------------------------------------------
 
 TEST(UrdfResolver, Step3_SearchRootHit) {
   UrdfPackageResolver r;
@@ -193,34 +196,25 @@ TEST(UrdfResolver, Step3_AutoSeedFromEnv) {
   EXPECT_EQ(p, fixtures() + "/search_root/demo_description/meshes/base.stl");
 }
 
-// ---------------------------------------------------------------------------
-// Chain miss — unresolved package is reported on the result (not a global tally)
-// ---------------------------------------------------------------------------
-
 TEST(UrdfResolver, PackageMissReportedOnResult) {
   UrdfPackageResolver r;  // no assets, no settings, no roots
-  // resolve() (the package chain) returns "" on a miss; resolveUri() surfaces
-  // the offending package + reason in the return value (no resolver-global tally).
   const std::string p = r.resolve("ghost_pkg", "meshes/x.stl", "", false);
   EXPECT_TRUE(p.empty());
-  const ResolvedMesh m = r.resolveUri("package://ghost_pkg/meshes/x.stl", "", false);
+  const ResolvedMesh m = r.resolveUri("package://ghost_pkg/meshes/x.stl", "", false, {}, false);
   EXPECT_FALSE(m.resolved);
   EXPECT_EQ(m.package, "ghost_pkg");
   EXPECT_EQ(m.issue, MeshResolveIssue::kUnresolvedPackage);
 }
 
-// A malformed package:// URI (no "/rel" part) is reported as kMalformedRef.
 TEST(UrdfResolver, MalformedPackageUriReported) {
   UrdfPackageResolver r;
-  const ResolvedMesh m = r.resolveUri("package://justpkg", "", false);
+  const ResolvedMesh m = r.resolveUri("package://justpkg", "", false, {}, false);
   EXPECT_FALSE(m.resolved);
   EXPECT_EQ(m.issue, MeshResolveIssue::kMalformedRef);
   EXPECT_TRUE(m.package.empty());
 }
 
-// ---------------------------------------------------------------------------
-// Stop-at-first-hit ordering: attachment beats search root.
-// ---------------------------------------------------------------------------
+// Stop at the first hit: an attachment beats a search root.
 
 TEST(UrdfResolver, AttachmentTakesPriorityOverSearchRoot) {
   UrdfPackageResolver r;
@@ -235,47 +229,23 @@ TEST(UrdfResolver, AttachmentTakesPriorityOverSearchRoot) {
   EXPECT_EQ(f.readAll(), QByteArray("ATTACHED"));  // not the on-disk search-root file
 }
 
-// rememberPackageRoot persists globally and makes the package resolvable.
-TEST(UrdfResolver, RememberPersistsAndResolves) {
-  ScopedSettings s;
-  UrdfPackageResolver r;
-  r.setSettings(s.get());
-  r.setSourcePath("/data/x.dat");
-  EXPECT_TRUE(r.resolve("demo_description", "meshes/base.stl", "", false).empty());
-
-  r.rememberPackageRoot("demo_description", QString::fromStdString(fixtures() + "/search_root/demo_description"));
-  // Now resolvable via the freshly-added global root.
-  const std::string p = r.resolve("demo_description", "meshes/base.stl", "", false);
-  EXPECT_EQ(p, fixtures() + "/search_root/demo_description/meshes/base.stl");
-}
-
-// rememberPackageRoot must enable cross-dataset (step-3) resolution: a FRESH
-// resolver on a DIFFERENT source (so the per-source map, step 1, misses) resolves
-// via the persisted GLOBAL search root. Regression guard for the
-// parent-vs-package-dir double-nesting bug (which made step 3 silently miss).
-TEST(UrdfResolver, RememberEnablesCrossDatasetSearchRoot) {
+// A folder added by "Locate..." serves every dataset, not only the one it was picked for.
+TEST(UrdfResolver, AddedUserFolderResolvesForEverySource) {
   ScopedSettings s;
   UrdfPackageResolver r1;
   r1.setSettings(s.get());
   r1.setSourcePath("/data/first.dat");
-  r1.rememberPackageRoot("demo_description", QString::fromStdString(fixtures() + "/search_root/demo_description"));
+  r1.addUserFolder(QString::fromStdString(fixtures() + "/search_root"));
 
   UrdfPackageResolver r2;
   r2.setSettings(s.get());
-  r2.setSourcePath("/data/second.dat");  // different source → step 1 cannot hit
-  r2.autoSeedSearchRoots("");            // loads the persisted global root (the PARENT dir)
+  r2.setSourcePath("/data/second.dat");
   const std::string p = r2.resolve("demo_description", "meshes/base.stl", "", false);
   EXPECT_EQ(p, fixtures() + "/search_root/demo_description/meshes/base.stl");
 }
 
-// ---------------------------------------------------------------------------
-// Attachment extraction: collision-proof on-disk names + immutable rewrite-skip
-// ---------------------------------------------------------------------------
-
-// Two well-formed refs that flatten to the SAME name ("package://pkg/a/b.stl" vs
-// "package://pkg/a_b.stl" both -> "package___pkg_a_b.stl") must extract to
-// DISTINCT files with their respective bytes — the hash prefix disambiguates
-// them.
+// Two well-formed refs that flatten to the SAME name ("package://pkg/a/b.stl" vs "package://pkg/a_b.stl", both
+// "package___pkg_a_b.stl") must extract to DISTINCT files with their own bytes: the hash prefix disambiguates them.
 TEST(UrdfResolver, CollidingAttachmentRefsExtractToDistinctFiles) {
   UrdfPackageResolver r;
   QMap<QString, QByteArray> att;
@@ -283,8 +253,8 @@ TEST(UrdfResolver, CollidingAttachmentRefsExtractToDistinctFiles) {
   att.insert("package://pkg/a_b.stl", QByteArray("SECOND"));
   r.setEmbeddedAssets(att);
 
-  const ResolvedMesh first = r.resolveUri("package://pkg/a/b.stl", "", false);
-  const ResolvedMesh second = r.resolveUri("package://pkg/a_b.stl", "", false);
+  const ResolvedMesh first = r.resolveUri("package://pkg/a/b.stl", "", false, {}, false);
+  const ResolvedMesh second = r.resolveUri("package://pkg/a_b.stl", "", false, {}, false);
   ASSERT_TRUE(first.resolved);
   ASSERT_TRUE(second.resolved);
   EXPECT_NE(first.path, second.path);  // distinct on-disk files, no overwrite
@@ -297,31 +267,26 @@ TEST(UrdfResolver, CollidingAttachmentRefsExtractToDistinctFiles) {
   EXPECT_EQ(f2.readAll(), QByteArray("SECOND"));
 }
 
-// A second resolve of the same attachment returns the same path WITHOUT
-// rewriting the file (immutable content) — guards the truncation-under-assimp
-// race. We overwrite the extracted bytes out-of-band, resolve
-// again, and assert the resolver left our bytes intact (it did not reopen
-// WriteOnly).
+// A second resolve of the same attachment returns the same path WITHOUT rewriting the file (immutable content; guards
+// the truncation-under-assimp race): the extracted bytes are overwritten out-of-band, resolved again, and must stay
+// intact (the resolver did not reopen WriteOnly).
 TEST(UrdfResolver, AttachmentReResolveDoesNotRewrite) {
   UrdfPackageResolver r;
   QMap<QString, QByteArray> att;
   att.insert("package://demo/mesh.stl", QByteArray("ORIGINAL"));
   r.setEmbeddedAssets(att);
 
-  const ResolvedMesh first = r.resolveUri("package://demo/mesh.stl", "", false);
+  const ResolvedMesh first = r.resolveUri("package://demo/mesh.stl", "", false, {}, false);
   ASSERT_TRUE(first.resolved);
-  // Tamper with the extracted file out-of-band.
   {
     QFile tamper(QString::fromStdString(first.path));
     ASSERT_TRUE(tamper.open(QIODevice::WriteOnly | QIODevice::Truncate));
     tamper.write("TAMPERED");
     tamper.close();
   }
-  const ResolvedMesh second = r.resolveUri("package://demo/mesh.stl", "", false);
+  const ResolvedMesh second = r.resolveUri("package://demo/mesh.stl", "", false, {}, false);
   ASSERT_TRUE(second.resolved);
   EXPECT_EQ(second.path, first.path);
-  // The resolver must NOT have rewritten the (immutable) file with attachment
-  // bytes — our tampered content is still there.
   QFile check(QString::fromStdString(second.path));
   ASSERT_TRUE(check.open(QIODevice::ReadOnly));
   EXPECT_EQ(check.readAll(), QByteArray("TAMPERED"));
@@ -334,28 +299,22 @@ TEST(UrdfResolver, SetAttachmentsResetsExtractionDir) {
   QMap<QString, QByteArray> first_map;
   first_map.insert("package://demo/mesh.stl", QByteArray("OLD"));
   r.setEmbeddedAssets(first_map);
-  const ResolvedMesh old = r.resolveUri("package://demo/mesh.stl", "", false);
+  const ResolvedMesh old = r.resolveUri("package://demo/mesh.stl", "", false, {}, false);
   ASSERT_TRUE(old.resolved);
 
   QMap<QString, QByteArray> second_map;
   second_map.insert("package://demo/mesh.stl", QByteArray("NEW"));
   r.setEmbeddedAssets(second_map);
-  const ResolvedMesh fresh = r.resolveUri("package://demo/mesh.stl", "", false);
+  const ResolvedMesh fresh = r.resolveUri("package://demo/mesh.stl", "", false, {}, false);
   ASSERT_TRUE(fresh.resolved);
   QFile f(QString::fromStdString(fresh.path));
   ASSERT_TRUE(f.open(QIODevice::ReadOnly));
   EXPECT_EQ(f.readAll(), QByteArray("NEW"));
 }
 
-// ---------------------------------------------------------------------------
-// Explicit per-model package URL roots
-// ---------------------------------------------------------------------------
-
-// The dock shares one resolver across its robots, so each model's mapping
-// travels with the call: two models naming the same package resolve to their
-// own roots, and a model without a mapping keeps the legacy chain. An HTTP root
-// works for a topic source of a web-hosted layout, yet the topic's own http refs
-// stay blocked.
+// The dock shares one resolver across its robots, so each model's mapping travels with the call: two models naming
+// the same package resolve to their own roots, and a model without a mapping keeps the default chain. An HTTP root
+// works for a topic source of a web-hosted layout, yet the topic's own http refs stay blocked.
 TEST(UrdfResolver, TwoModelsKeepIndependentMappings) {
   UrdfPackageResolver shared;
   shared.addSearchRoot(QString::fromStdString(fixtures() + "/search_root"));
@@ -375,7 +334,7 @@ TEST(UrdfResolver, TwoModelsKeepIndependentMappings) {
   ASSERT_TRUE(second.resolved);
   EXPECT_EQ(second.path, "https://second.test/v2/pkg/meshes/base.stl");
 
-  const ResolvedMesh legacy = shared.resolveUri("package://demo_description/meshes/base.stl", "", false);
+  const ResolvedMesh legacy = shared.resolveUri("package://demo_description/meshes/base.stl", "", false, {}, false);
   ASSERT_TRUE(legacy.resolved);
   EXPECT_FALSE(legacy.is_url);
   EXPECT_EQ(legacy.path, fixtures() + "/search_root/demo_description/meshes/base.stl");
@@ -403,13 +362,13 @@ TEST(UrdfResolver, DesktopNetworkRootsNeedAUrlSourceOrAWebLayout) {
   UrdfPackageResolver local;
   local.addSearchRoot(QString::fromStdString(fixtures() + "/search_root"));
 
-  const ResolvedMesh topic = local.resolveUri(uri, "", /*source_is_url=*/false, roots);
+  const ResolvedMesh topic = local.resolveUri(uri, "", /*source_is_url=*/false, roots, false);
   ASSERT_TRUE(topic.resolved);
   EXPECT_FALSE(topic.is_url);
   EXPECT_EQ(topic.path, fixtures() + "/search_root/demo_description/meshes/base.stl");
 
   UrdfPackageResolver bare;
-  const ResolvedMesh missing = bare.resolveUri(uri, "", /*source_is_url=*/false, roots);
+  const ResolvedMesh missing = bare.resolveUri(uri, "", /*source_is_url=*/false, roots, false);
   EXPECT_EQ(missing.issue, MeshResolveIssue::kUnresolvedPackage);
   EXPECT_EQ(missing.package, "demo_description");
 
@@ -439,13 +398,12 @@ TEST(UrdfResolver, EncodedTraversalStaysInsideTheMappedRoot) {
        }) {
     const std::string uri = std::string("package://pkg/") + rel;
     for (const QMap<QString, QUrl>* roots : {&file_roots, &http_roots}) {
-      const ResolvedMesh mesh = resolver.resolveUri(uri, "", false, *roots);
+      const ResolvedMesh mesh = resolver.resolveUri(uri, "", false, *roots, false);
       EXPECT_FALSE(mesh.resolved) << rel << " -> " << mesh.path;
       EXPECT_EQ(mesh.issue, MeshResolveIssue::kUnresolvedPackage) << rel;
     }
   }
-  // An ordinary encoded character is still fine.
-  const ResolvedMesh spaced = resolver.resolveUri("package://pkg/meshes/my%20part.stl", "", false, file_roots);
+  const ResolvedMesh spaced = resolver.resolveUri("package://pkg/meshes/my%20part.stl", "", false, file_roots, false);
   ASSERT_TRUE(spaced.resolved);
   EXPECT_EQ(spaced.path, "/allowed/pkg/meshes/my part.stl");
 }
@@ -461,13 +419,15 @@ TEST(UrdfResolver, RemoteOnlyRefusesLocalResources) {
   const std::string local_mesh = fixtures() + "/search_root/demo_description/meshes/base.stl";
   const std::string local_package = "package://demo_description/meshes/base.stl";
   const std::string urdf_dir = "https://host.test/presets/robot/";
+  // fromLocalFile: "file://" + "C:/..." would name host "C".
+  const std::string local_mesh_url = QUrl::fromLocalFile(QString::fromStdString(local_mesh)).toString().toStdString();
 
   // Without the policy, the same references reach the local files.
-  EXPECT_TRUE(resolver.resolveUri("file://" + local_mesh, urdf_dir, true).resolved);
-  EXPECT_TRUE(resolver.resolveUri(local_mesh, urdf_dir, true).resolved);
-  EXPECT_TRUE(resolver.resolveUri(local_package, urdf_dir, true).resolved);
+  EXPECT_TRUE(resolver.resolveUri(local_mesh_url, urdf_dir, true, {}, false).resolved);
+  EXPECT_TRUE(resolver.resolveUri(local_mesh, urdf_dir, true, {}, false).resolved);
+  EXPECT_TRUE(resolver.resolveUri(local_package, urdf_dir, true, {}, false).resolved);
 
-  for (const std::string& uri : {"file://" + local_mesh, local_mesh, local_package}) {
+  for (const std::string& uri : {local_mesh_url, local_mesh, local_package}) {
     const ResolvedMesh blocked = resolver.resolveUri(uri, urdf_dir, true, {}, /*remote_only=*/true);
     EXPECT_FALSE(blocked.resolved) << uri << " -> " << blocked.path;
   }
@@ -487,6 +447,151 @@ TEST(UrdfResolver, RemoteOnlyRefusesLocalResources) {
   const ResolvedMesh mapped = resolver.resolveUri(local_package, urdf_dir, true, http_root, true);
   ASSERT_TRUE(mapped.resolved);
   EXPECT_EQ(mapped.path, "https://cdn.test/demo_description/meshes/base.stl");
+}
+
+void touch(const QString& path) {
+  ASSERT_TRUE(QDir().mkpath(QFileInfo(path).absolutePath()));
+  QFile file(path);
+  ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+}
+
+// A user-chosen folder is a workspace, not a package parent: ~/ws/src/<repo>/<pkg> must resolve from ~/ws.
+TEST(UrdfResolver, UserFolderFindsPackagesAtWorkspaceDepth) {
+  QTemporaryDir ws;
+  ASSERT_TRUE(ws.isValid());
+  touch(ws.filePath(u"src/robot_repo/arm_description/package.xml"_s));
+  touch(ws.filePath(u"src/robot_repo/arm_description/meshes/link.stl"_s));
+  ScopedSettings s;
+  UrdfPackageResolver::setGlobalSearchRoots(*s.get(), {ws.path()});
+
+  UrdfPackageResolver r;
+  r.setSettings(s.get());
+  r.autoSeedSearchRoots("");
+  EXPECT_EQ(
+      QString::fromStdString(r.resolve("arm_description", "meshes/link.stl", "", false)),
+      ws.filePath(u"src/robot_repo/arm_description/meshes/link.stl"_s));
+}
+
+// colcon's build/ and log/ copies, hidden folders and a package's own subfolders are not searched.
+TEST(UrdfResolver, UserFolderSkipsBuildOutputAndNestedPackages) {
+  QTemporaryDir ws;
+  ASSERT_TRUE(ws.isValid());
+  touch(ws.filePath(u"build/arm_description/meshes/link.stl"_s));
+  touch(ws.filePath(u".cache/arm_description/meshes/link.stl"_s));
+  touch(ws.filePath(u"log/arm_description/meshes/link.stl"_s));
+  touch(ws.filePath(u"src/outer_pkg/package.xml"_s));
+  touch(ws.filePath(u"src/outer_pkg/arm_description/meshes/link.stl"_s));
+  ScopedSettings s;
+  UrdfPackageResolver::setGlobalSearchRoots(*s.get(), {ws.path()});
+
+  UrdfPackageResolver r;
+  r.setSettings(s.get());
+  r.autoSeedSearchRoots("");
+  EXPECT_TRUE(r.resolve("arm_description", "meshes/link.stl", "", false).empty());
+}
+
+// The URDF's own folder is searched one level deep only: the data folder may be $HOME.
+TEST(UrdfResolver, AutoSeededFoldersAreNotSearchedDeep) {
+  QTemporaryDir data;
+  ASSERT_TRUE(data.isValid());
+  touch(data.filePath(u"deep/arm_description/meshes/link.stl"_s));
+  UrdfPackageResolver r;
+  r.autoSeedSearchRoots(data.path());
+  EXPECT_TRUE(r.resolve("arm_description", "meshes/link.stl", "", false).empty());
+}
+
+// Preferences edits the user's folders; the next miss reads the new list, no reset needed.
+TEST(UrdfResolver, UserFoldersAreReadOnEveryMiss) {
+  QTemporaryDir ws;
+  ASSERT_TRUE(ws.isValid());
+  touch(ws.filePath(u"src/arm_description/meshes/link.stl"_s));
+  ScopedSettings s;
+  UrdfPackageResolver r;
+  r.setSettings(s.get());
+  EXPECT_TRUE(r.resolve("arm_description", "meshes/link.stl", "", false).empty());
+
+  UrdfPackageResolver::setGlobalSearchRoots(*s.get(), {ws.path()});
+  EXPECT_FALSE(r.resolve("arm_description", "meshes/link.stl", "", false).empty());
+
+  UrdfPackageResolver::setGlobalSearchRoots(*s.get(), {});
+  EXPECT_TRUE(r.resolve("arm_description", "meshes/link.stl", "", false).empty());
+}
+
+// colcon's isolated install puts the package under install/<pkg>/share/<pkg>; install/<pkg> itself holds no meshes.
+TEST(UrdfResolver, UserFolderFindsColconInstallLayout) {
+  QTemporaryDir ws;
+  ASSERT_TRUE(ws.isValid());
+  touch(ws.filePath(u"install/arm_description/share/arm_description/package.xml"_s));
+  touch(ws.filePath(u"install/arm_description/share/arm_description/meshes/link.stl"_s));
+  ScopedSettings s;
+  UrdfPackageResolver::setGlobalSearchRoots(*s.get(), {ws.path()});
+  UrdfPackageResolver r;
+  r.setSettings(s.get());
+  EXPECT_EQ(
+      QString::fromStdString(r.resolve("arm_description", "meshes/link.stl", "", false)),
+      ws.filePath(u"install/arm_description/share/arm_description/meshes/link.stl"_s));
+}
+
+// A package folder added as itself resolves its own package, and is not searched inside for others.
+TEST(UrdfResolver, UserFolderMayBeThePackageItself) {
+  QTemporaryDir ws;
+  ASSERT_TRUE(ws.isValid());
+  const QString pkg_dir = ws.filePath(u"src/arm_description"_s);
+  touch(pkg_dir + u"/package.xml"_s);
+  touch(pkg_dir + u"/meshes/link.stl"_s);
+  touch(pkg_dir + u"/vendored_description/meshes/link.stl"_s);
+  ScopedSettings s;
+  UrdfPackageResolver::setGlobalSearchRoots(*s.get(), {pkg_dir});
+  UrdfPackageResolver r;
+  r.setSettings(s.get());
+  EXPECT_EQ(
+      QString::fromStdString(r.resolve("arm_description", "meshes/link.stl", "", false)),
+      pkg_dir + u"/meshes/link.stl"_s);
+  EXPECT_TRUE(r.resolve("vendored_description", "meshes/link.stl", "", false).empty());
+  EXPECT_TRUE(r.folderHasPackage(pkg_dir, u"arm_description"_s));
+  EXPECT_TRUE(r.folderHasPackage(ws.path(), u"arm_description"_s));
+  EXPECT_FALSE(r.folderHasPackage(ws.path(), u"ghost_pkg"_s));
+}
+
+// The walk of a folder is cached; a package cloned into it later is found once the cache is cleared (Retry, Locate).
+TEST(UrdfResolver, ClearPackageIndexesFindsPackagesAddedSince) {
+  QTemporaryDir ws;
+  ASSERT_TRUE(ws.isValid());
+  ScopedSettings s;
+  UrdfPackageResolver::setGlobalSearchRoots(*s.get(), {ws.path()});
+  UrdfPackageResolver r;
+  r.setSettings(s.get());
+  EXPECT_TRUE(r.resolve("arm_description", "meshes/link.stl", "", false).empty());
+
+  touch(ws.filePath(u"src/repo/arm_description/meshes/link.stl"_s));
+  EXPECT_TRUE(r.resolve("arm_description", "meshes/link.stl", "", false).empty());
+  r.clearPackageIndexes();
+  EXPECT_FALSE(r.resolve("arm_description", "meshes/link.stl", "", false).empty());
+}
+
+// "Locate..." stores the folder the user chose, whatever its depth.
+TEST(UrdfResolver, AddUserFolderStoresTheChosenFolder) {
+  QTemporaryDir ws;
+  ASSERT_TRUE(ws.isValid());
+  touch(ws.filePath(u"src/repo/arm_description/meshes/link.stl"_s));
+  ScopedSettings s;
+  UrdfPackageResolver r;
+  r.setSettings(s.get());
+  r.addUserFolder(ws.path());
+  r.addUserFolder(ws.path() + u"/"_s);
+  EXPECT_EQ(UrdfPackageResolver::globalSearchRoots(*s.get()), QStringList{QDir::cleanPath(ws.path())});
+  EXPECT_FALSE(r.resolve("arm_description", "meshes/link.stl", "", false).empty());
+}
+
+TEST(UrdfResolver, RosDistroShareFoldersListsInstalledDistrosNewestFirst) {
+  QTemporaryDir opt_ros;
+  ASSERT_TRUE(opt_ros.isValid());
+  ASSERT_TRUE(QDir().mkpath(opt_ros.filePath(u"humble/share"_s)));
+  ASSERT_TRUE(QDir().mkpath(opt_ros.filePath(u"jazzy/share"_s)));
+  ASSERT_TRUE(QDir().mkpath(opt_ros.filePath(u"not_a_distro"_s)));
+  EXPECT_EQ(
+      UrdfPackageResolver::rosDistroShareFolders(opt_ros.path()),
+      (QStringList{opt_ros.filePath(u"jazzy/share"_s), opt_ros.filePath(u"humble/share"_s)}));
 }
 
 }  // namespace

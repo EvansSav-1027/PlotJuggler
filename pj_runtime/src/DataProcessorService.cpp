@@ -42,6 +42,38 @@ namespace PJ {
 namespace {
 std::vector<std::string> inputFieldPaths(const DataEngine& engine, const TopicStorage& storage);
 std::string normalizedFieldPath(std::string path);
+
+/// "<topic>/<field>", or "<topic>" when the field path is empty.
+std::string inputName(std::string topic, const std::string& field_path) {
+  return field_path.empty() ? topic : topic + "/" + field_path;
+}
+
+/// `error`, a failure of `node`, with "; <input> is text" appended for each input of `node` that holds text;
+/// `input_names[i]` names input i. Empty when `error` is.
+std::string nodeFailure(
+    const IncrementalEngine& derived, NodeId node, std::string error, const std::vector<std::string>& input_names) {
+  if (error.empty()) {
+    return error;
+  }
+  if (const auto binding = derived.inputBindingState(node); binding.has_value()) {
+    for (std::size_t i = 0; i < binding->kinds.size() && i < input_names.size(); ++i) {
+      if (binding->kinds[i] == StorageKind::kString) {
+        error += "; " + input_names[i] + " is text";
+      }
+    }
+  }
+  return error;
+}
+
+/// The "<topic>/<field>" name of each input binding.
+std::vector<std::string> bindingNames(const std::vector<DataProcessorService::TransformInputBinding>& bindings) {
+  std::vector<std::string> names;
+  names.reserve(bindings.size());
+  for (const auto& binding : bindings) {
+    names.push_back(inputName(binding.topic_name, binding.field_path));
+  }
+  return names;
+}
 }  // namespace
 
 DataProcessorService::DataProcessorService(DataEngine& engine)
@@ -97,8 +129,7 @@ Expected<DataProcessorService::FilterHandle> DataProcessorService::applyFilter(
         "its panel. Create that transform as a persistent one first.");
   }
 
-  // Shared so the host could later keep its own handle (preview/reconfigure);
-  // the engine owns the adapter, the adapter shares the processor.
+  // The engine owns the adapter; the adapter shares the processor.
   std::shared_ptr<proc::DataProcessor> shared = std::move(processor);
   auto node = derived_->addSisoTransform(
       input_topic_id, output_name, dataset_id, std::make_unique<proc::ProcessorSisoAdapter>(shared),
@@ -107,9 +138,26 @@ Expected<DataProcessorService::FilterHandle> DataProcessorService::applyFilter(
     return PJ::unexpected(node.error());
   }
 
-  // Eager run over the already-committed input (file path: a single full pass).
+  std::string input_field_path;
+  std::string input_name;
+  {
+    const auto engine_lock = engine_.lockEngine();
+    if (const TopicStorage* input = engine_.getTopicStorage(input_topic_id)) {
+      const std::vector<std::string> paths = inputFieldPaths(engine_, *input);
+      if (input_column_index < paths.size()) {
+        input_field_path = paths[input_column_index];
+      }
+      input_name = inputName(input->descriptor().name, input_field_path);
+    }
+  }
+
+  // Eager run over the already-committed input (file path: a single full pass). The pass runs every dirty node, so a
+  // failure may be another node's: only the new node's own error refuses it.
   derived_->onSourceCommitted(std::vector<TopicId>{input_topic_id});
   if (Status scheduled = derived_->scheduleAll(); !scheduled.has_value()) {
+    reportTransformFailures();
+  }
+  if (std::string error = nodeFailure(*derived_, *node, derived_->nodeError(*node), {input_name}); !error.empty()) {
     // Roll back the just-registered node + output topic. Leaving them reserves the output
     // name forever (no recipe is stored yet, so clearAllFilters can't reach it). Capture the
     // outputs BEFORE removeNode — afterwards outputTopics(*node) returns {}.
@@ -118,7 +166,7 @@ Expected<DataProcessorService::FilterHandle> DataProcessorService::applyFilter(
     for (TopicId out : outs) {
       engine_.retireTopic(out);
     }
-    return PJ::unexpected(scheduled.error());
+    return PJ::unexpected(error);
   }
 
   const std::vector<TopicId> outputs = derived_->outputTopics(*node);
@@ -133,21 +181,13 @@ Expected<DataProcessorService::FilterHandle> DataProcessorService::applyFilter(
   recipe.output_topic_id = outputs.front();
   recipe.input_topic_id = input_topic_id;
   recipe.input_column_index = input_column_index;
-  {
-    const auto engine_lock = engine_.lockEngine();
-    if (const TopicStorage* input = engine_.getTopicStorage(input_topic_id)) {
-      const std::vector<std::string> paths = inputFieldPaths(engine_, *input);
-      if (input_column_index < paths.size()) {
-        recipe.input_field_path = paths[input_column_index];
-      }
-    }
-  }
+  recipe.input_field_path = std::move(input_field_path);
   recipe.dataset_id = dataset_id;
   recipe.processor_id = shared->id();
   recipe.output_name = output_name;
   recipe.processor = shared;
   // Capture the filter's defining module source from the LIVE processor so a saved
-  // layout embeds it as <source_fallback> (M7) and reopens on a machine without this
+  // layout embeds it as <source_fallback> and reopens on a machine without this
   // filter installed. Reading it off the processor (not re-deriving from the
   // catalogue) keeps it authoritative even for a filter restored from an embedded
   // source whose id is absent from this machine's catalogue — so re-saving keeps it.
@@ -537,7 +577,18 @@ Status DataProcessorService::updateFilter(NodeId node_id, std::shared_ptr<proc::
   if (Status replaced =
           derived_->replaceSisoTransform(node_id, std::make_unique<proc::ProcessorSisoAdapter>(processor));
       !replaced.has_value()) {
-    return replaced;
+    // The engine reverted and replayed, rewriting the outputs (old chunks freed).
+    announceRewrittenOutputs(outputsWithDependents(node_id));
+    std::vector<std::string> input_names;
+    const auto recipe = std::find_if(
+        recipes_.begin(), recipes_.end(), [node_id](const auto& entry) { return entry.second.node_id == node_id; });
+    if (recipe != recipes_.end()) {
+      const auto engine_lock = engine_.lockEngine();
+      if (const TopicStorage* input = engine_.getTopicStorage(recipe->second.input_topic_id)) {
+        input_names.push_back(inputName(input->descriptor().name, recipe->second.input_field_path));
+      }
+    }
+    return PJ::unexpected(nodeFailure(*derived_, node_id, replaced.error(), input_names));
   }
   for (auto& [out_tid, recipe] : recipes_) {
     if (recipe.node_id == node_id) {
@@ -553,7 +604,7 @@ Status DataProcessorService::updateFilter(NodeId node_id, std::shared_ptr<proc::
       break;
     }
   }
-  announceChangedOutputs(outputsWithDependents(node_id));
+  announceRewrittenOutputs(outputsWithDependents(node_id));
   return PJ::okStatus();
 }
 
@@ -596,12 +647,9 @@ std::unique_ptr<proc::DataProcessor> DataProcessorService::makeRestoredProcessor
   return nullptr;
 }
 
-// --- Plugin-created transforms (pj.data_processors.v1 host side) ---
-
 namespace {
-// Infer the backend from the payload's leading bytes / first-line directive
-// (data-only ABI: nothing executable crosses, so the host picks the backend from
-// the bytes). WASM/Python are recognized but diagnosed as unavailable in this build.
+// Infers the backend from the payload's leading bytes or first-line directive (data-only ABI: nothing executable
+// crosses, so the host picks the backend from the bytes): `-- pj-script: luau|lua|python`. A WASM magic is refused.
 Expected<std::string> inferTransformBackend(const std::string& script) {
   if (script.size() >= 4 && script.compare(0, 4, "\0asm", 4) == 0) {
     return PJ::unexpected("pj.data_processors: WASM backend is reserved for a future host build");
@@ -678,28 +726,17 @@ std::optional<std::pair<TopicId, DatasetId>> DataProcessorService::resolveInputT
   return matches.size() == 1 ? std::optional{matches.front()} : std::nullopt;
 }
 
-std::optional<std::string> DataProcessorService::datasetSourceName(DatasetId dataset_id) const {
-  const auto engine_lock = engine_.lockEngine();
-  const DatasetInfo* info = engine_.getDataset(dataset_id);
-  return info != nullptr ? std::optional{info->source_name} : std::nullopt;
-}
-
 std::string DataProcessorService::readBackInputName(
     const std::string& bare, const TransformInputBinding& binding) const {
   bool ambiguous = false;
   if (binding.dataset_source.empty() || resolveInputField(bare, std::nullopt, &ambiguous).has_value() || !ambiguous) {
     return bare;
   }
-  const std::vector<DatasetId> datasets = engine_.listDatasets();
-  const auto source_name_of = [this](DatasetId ds) { return datasetSourceName(ds); };
-  std::vector<std::string> source_names;
-  for (const DatasetId ds : datasets) {
-    source_names.push_back(source_name_of(ds).value_or(std::string{}));
-  }
-  const std::string qualified = sdk::qualifiedSeriesName(binding.dataset_source, bare);
+  // Echoed under the dataset's label, which a caller can send back, unless a longer label shadows that prefix.
+  const std::string label = engine_.datasetLabel(binding.dataset_id);
+  const std::string qualified = sdk::qualifiedSeriesName(label, bare);
   const bool round_trips =
-      splitDatasetQualifier(qualified, source_names).dataset_source == binding.dataset_source &&
-      uniqueDatasetForSource(binding.dataset_source, datasets, source_name_of).id == binding.dataset_id;
+      !label.empty() && splitDatasetQualifier(qualified, engine_.datasetLabels()).dataset_source == label;
   return round_trips ? qualified : bare;
 }
 
@@ -709,7 +746,8 @@ std::optional<DataProcessorService::ResolvedInput> DataProcessorService::resolve
   // Exact whole-topic name → the topic's first leaf column.
   bool topic_ambiguous = false;
   if (const auto topic = resolveInputTopic(name, only_dataset, &topic_ambiguous)) {
-    return ResolvedInput{topic->first, topic->second, 0};
+    const TopicStorage* storage = engine_.getTopicStorage(topic->first);
+    return ResolvedInput{topic->first, topic->second, storage != nullptr ? storage->firstLiveColumn() : 0};
   }
   if (topic_ambiguous) {
     if (ambiguous != nullptr) {
@@ -737,7 +775,13 @@ std::optional<DataProcessorService::ResolvedInput> DataProcessorService::resolve
         const std::string wanted = normalizedFieldPath(name.substr(tn.size() + 1));
         const std::vector<std::string> paths = inputFieldPaths(engine_, *storage);
         bool ambiguous_field = false;
-        const std::optional<std::size_t> column = uniqueColumnForFieldPath(paths, wanted, ambiguous_field);
+        std::optional<std::size_t> column = uniqueColumnForFieldPath(paths, wanted, ambiguous_field);
+        // A column a reload lost is not offered to a new binding by name, as a topic a reload lost is not; a live
+        // binding to it keeps it (resolveInputBinding).
+        if (column.has_value() && *column < storage->columnDescriptors().size() &&
+            storage->isColumnRetired(storage->columnDescriptors()[*column].field_id)) {
+          column.reset();
+        }
         if (!column.has_value()) {
           if (ambiguous_field && ambiguous != nullptr) {
             *ambiguous = true;
@@ -883,14 +927,11 @@ Status DataProcessorService::validateScript(
 
 namespace {
 
-// A grouped MIMO output is requested EXPLICITLY as a single structured `outputs`
-// entry "<topic>:<field1>,<field2>,...,<fieldN>": the host then materializes ONE
-// topic named <topic> with those N named columns (column k = the script's k-th
-// result), instead of N separate scalar topics. Returns {topic, [fields]} when the
-// single output entry has that shape (non-empty topic + >= 1 non-empty field);
-// otherwise {"", {}} and each output stays its own scalar topic. This keeps the
-// intent unambiguous (unlike inferring a shared prefix) and entirely host-side —
-// the plugin opts in by naming, e.g. outputs = {"rpy:roll,pitch,yaw"}.
+// A grouped MIMO output is requested EXPLICITLY as a single structured `outputs` entry "<topic>:<f1>,<f2>,...,<fN>":
+// the host then materializes ONE topic named <topic> with those N named columns (column k = the script's k-th result)
+// instead of N scalar topics. Returns {topic, [fields]} when the single output entry has that shape (non-empty topic
+// and >= 1 non-empty field), else {"", {}} and each output stays its own scalar topic. Explicit naming keeps the
+// intent unambiguous (unlike inferring a shared prefix); the plugin opts in, e.g. outputs = {"rpy:roll,pitch,yaw"}.
 std::pair<std::string, std::vector<std::string>> parseGroupedOutput(const std::vector<std::string>& outputs) {
   if (outputs.size() != 1) {
     return {"", {}};
@@ -934,9 +975,8 @@ std::vector<std::string> DataProcessorService::materializedTopicNames(const Tran
 
 Expected<DataProcessorService::TransformRecipe> DataProcessorService::installTransform(
     TransformRecipe recipe, bool time_sliced) {
-  // 1. Shape: N inputs -> M outputs (SISO is the 1->1 case). Field-level binding
-  //    (a column within a multi-column input) is still a follow-up: inputs resolve
-  //    to whole scalar topics here.
+  // 1. Shape: N inputs -> M outputs (SISO is the 1->1 case). Inputs resolve to whole
+  //    scalar topics: no binding to a column within a multi-column input.
   if (recipe.inputs.empty() || recipe.outputs.empty()) {
     return PJ::unexpected("pj.data_processors: transform requires at least one input and one output");
   }
@@ -972,16 +1012,10 @@ Expected<DataProcessorService::TransformRecipe> DataProcessorService::installTra
   std::vector<std::size_t> input_columns;  // leaf column per input (field-level binding)
   input_topic_ids.reserve(recipe.inputs.size());
   input_columns.reserve(recipe.inputs.size());
-  // Dataset-qualified plugin inputs, "dataset_source:topic/field" — the same
-  // form SeriesPath::display() prints. The SDK splitter gives the longest
-  // loaded prefix precedence; unmatched prefixes remain part of the bare name.
-  const std::vector<DatasetId> datasets = engine_.listDatasets();
-  const auto source_name_of = [this](DatasetId ds) { return datasetSourceName(ds); };
-  std::vector<std::string> source_names;
-  for (const DatasetId ds : datasets) {
-    source_names.push_back(source_name_of(ds).value_or(std::string{}));
-  }
-  std::optional<std::pair<DatasetId, std::string>> qualified_dataset;  // (id, source) the qualifiers agree on
+  // Dataset-qualified plugin inputs, "label:topic/field" (DataEngine::datasetLabel). The SDK splitter gives the
+  // longest loaded label precedence; unmatched prefixes remain part of the bare name.
+  const std::vector<std::string> labels = engine_.datasetLabels();
+  std::optional<std::pair<DatasetId, std::string>> qualified_dataset;  // (id, label) the qualifiers agree on
   for (std::size_t index = 0; index < recipe.inputs.size(); ++index) {
     const std::string in_name = recipe.inputs[index];
     std::optional<ResolvedInput> resolved;
@@ -993,24 +1027,19 @@ Expected<DataProcessorService::TransformRecipe> DataProcessorService::installTra
         return PJ::unexpected(exact.error());
       }
       resolved = std::move(*exact);
-    } else if (const DatasetQualifierSplit split = splitDatasetQualifier(in_name, source_names); split.qualified) {
-      const UniqueDatasetLookup target = uniqueDatasetForSource(split.dataset_source, datasets, source_name_of);
-      if (target.ambiguous) {
-        return PJ::unexpected(
-            "pj.data_processors: transform input dataset source is ambiguous (loaded more than once): " +
-            split.dataset_source);
+    } else if (const DatasetQualifierSplit split = splitDatasetQualifier(in_name, labels); split.qualified) {
+      const std::optional<DatasetId> target = engine_.datasetByLabel(split.dataset_source);
+      if (!target.has_value()) {
+        return PJ::unexpected("pj.data_processors: transform input dataset label not found: " + split.dataset_source);
       }
-      if (!target.id.has_value()) {
-        return PJ::unexpected("pj.data_processors: transform input dataset source not found: " + split.dataset_source);
-      }
-      if (qualified_dataset.has_value() && qualified_dataset->first != *target.id) {
+      if (qualified_dataset.has_value() && qualified_dataset->first != *target) {
         return PJ::unexpected(
             "pj.data_processors: transform inputs must agree on one dataset, but they name both '" +
             qualified_dataset->second + "' and '" + split.dataset_source + "'");
       }
-      qualified_dataset.emplace(*target.id, split.dataset_source);
+      qualified_dataset.emplace(*target, split.dataset_source);
       bool ambiguous = false;
-      resolved = resolveInputField(split.bare, target.id, &ambiguous);
+      resolved = resolveInputField(split.bare, target, &ambiguous);
       if (!resolved.has_value()) {
         return PJ::unexpected(
             "pj.data_processors: input topic/field " + std::string(ambiguous ? "is ambiguous" : "not found") +
@@ -1042,7 +1071,7 @@ Expected<DataProcessorService::TransformRecipe> DataProcessorService::installTra
     if (!resolved.has_value()) {
       std::string msg = "pj.data_processors: input topic/field not found: " + in_name;
       if (in_name.find(':') != std::string::npos) {
-        msg += " (if the part before ':' was meant as a dataset qualifier, no loaded dataset has that source name)";
+        msg += " (if the part before ':' was meant as a dataset qualifier, no loaded dataset has that label)";
       }
       return PJ::unexpected(msg);
     }
@@ -1158,12 +1187,14 @@ Expected<DataProcessorService::TransformRecipe> DataProcessorService::installTra
                                     old.node_id, std::make_unique<proc::ProcessorSisoAdapter>(std::move(siso_op)))
                               : derived_->replaceMimoTransform(old.node_id, std::move(mimo_op));
     if (!replaced.has_value()) {
-      return PJ::unexpected(replaced.error());
+      // The engine reverted and replayed, rewriting the outputs (old chunks freed).
+      announceRewrittenOutputs(outputsWithDependents(old.node_id));
+      return PJ::unexpected(nodeFailure(*derived_, old.node_id, replaced.error(), bindingNames(recipe.input_bindings)));
     }
     recipe.node_id = old.node_id;
     recipe.output_topic_ids = old.output_topic_ids;
     existing->second = recipe;
-    announceChangedOutputs(outputsWithDependents(recipe.node_id));
+    announceRewrittenOutputs(outputsWithDependents(recipe.node_id));
     return recipe;
   }
   // 7. Install the eager node and run it over the committed input(s).
@@ -1194,13 +1225,19 @@ Expected<DataProcessorService::TransformRecipe> DataProcessorService::installTra
     materialized = derived_->scheduleAll();
   }
   if (!materialized.has_value()) {
+    reportTransformFailures();
+  }
+  // The pass runs every dirty node, so a failure may be another node's: only the new node's own error refuses it.
+  if (std::string error =
+          nodeFailure(*derived_, *node, derived_->nodeError(*node), bindingNames(recipe.input_bindings));
+      !error.empty()) {
     // Roll back the half-installed node + its output topic (capture outputs first).
     const std::vector<TopicId> outs = derived_->outputTopics(*node);
     (void)derived_->removeNode(*node);
     for (const TopicId out : outs) {
       engine_.retireTopic(out);
     }
-    return PJ::unexpected(materialized.error());
+    return PJ::unexpected(error);
   }
   const std::vector<TopicId> outputs = derived_->outputTopics(*node);
   if (outputs.empty()) {
@@ -1224,10 +1261,14 @@ void DataProcessorService::armMaterializationTimer() {
   }
   if (!materialize_timer_) {
     materialize_timer_ = std::make_unique<QTimer>();
+    // Single-shot, re-armed per slice: Qt 6.12.0's browser dispatcher re-arms its native timer after a pass only when
+    // a nonzero-interval timer fired (QEventDispatcherWasm::sendTimerEvents), so a repeating zero-interval timer
+    // stops whenever no other timer is running. Each start() registers the timer, which arms it.
+    materialize_timer_->setSingleShot(true);
     materialize_timer_->setInterval(0);
     QObject::connect(materialize_timer_.get(), &QTimer::timeout, materialize_timer_.get(), [this]() {
-      if (stepMaterialization()) {
-        materialize_timer_->stop();
+      if (!stepMaterialization()) {
+        materialize_timer_->start();
       }
     });
   }
@@ -1328,6 +1369,13 @@ void DataProcessorService::announceGrownOutputs() {
   }
 }
 
+void DataProcessorService::announceRewrittenOutputs(const std::vector<TopicId>& outputs) const {
+  if (session_ != nullptr && !outputs.empty()) {
+    session_->notifyIngest(QVector<TopicId>(outputs.begin(), outputs.end()), /*live=*/false);
+  }
+  announceChangedOutputs(outputs);
+}
+
 void DataProcessorService::announceChangedOutputs(const std::vector<TopicId>& outputs) const {
   if (!outputs_changed_sink_ || outputs.empty()) {
     return;
@@ -1405,6 +1453,35 @@ Status DataProcessorService::removeTransform(std::string_view namespaced_key) {
     return removed_dependents;
   }
   return removeTransformOnly(namespaced_key);
+}
+
+Status DataProcessorService::removeOwnTransform(std::string_view namespaced_key) {
+  const auto it = transform_recipes_.find(std::string(namespaced_key));
+  if (it == transform_recipes_.end()) {
+    return removeTransform(namespaced_key);  // its unknown-key error
+  }
+  const TransformRecipe& removed = it->second;
+  std::unordered_set<TopicId> affected(removed.output_topic_ids.begin(), removed.output_topic_ids.end());
+  std::string foreign;
+  const auto name = [&foreign](const std::string& reader) { foreign += (foreign.empty() ? "" : ", ") + reader; };
+  forEachDependentProcessor(
+      affected, /*include_ephemeral_transforms=*/true,
+      [&name](TopicId, const FilterRecipe& filter) { name("'" + filter.output_name + "' (a filter)"); },
+      [&name, &removed](const std::string&, const TransformRecipe& reader) {
+        if (reader.owner_plugin != removed.owner_plugin) {
+          for (const std::string& output : reader.outputs) {
+            name("'" + output + "' (made by '" + reader.owner_plugin + "')");
+          }
+        }
+      });
+  if (!foreign.empty()) {
+    return PJ::unexpected(
+        "pj.data_processors: '" + removed.user_id +
+        "' was not removed: series of other owners are built on it and "
+        "would be deleted with it: " +
+        foreign + ". Only their owners can remove those.");
+  }
+  return removeTransform(namespaced_key);
 }
 
 Status DataProcessorService::removeTransformOnly(std::string_view namespaced_key) {
@@ -1583,14 +1660,15 @@ Status DataProcessorService::removeProcessorsDependingOn(const std::vector<Topic
   // The visitor discovers parents before children (a processor is visited only
   // after one of its inputs joined the affected set), so reverse order removes
   // leaf-first — no dependent ever outlives one of its inputs' producers.
+  Status first_failure = PJ::okStatus();
   for (auto it = dependents.rbegin(); it != dependents.rend(); ++it) {
     Status removed = it->kind == Dependent::Kind::kFilter ? removeFilterOnly(it->filter_node)
                                                           : removeTransformOnly(it->transform_key);
-    if (!removed.has_value()) {
-      return removed;
+    if (!removed.has_value() && first_failure.has_value()) {
+      first_failure = std::move(removed);
     }
   }
-  return PJ::okStatus();
+  return first_failure;
 }
 
 void DataProcessorService::removeEphemerals(const std::unordered_set<std::string>& keys) {

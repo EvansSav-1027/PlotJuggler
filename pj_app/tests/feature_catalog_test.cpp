@@ -1,11 +1,9 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
-//
-// resources/feature_catalog.json tells the assistant agent where things are in
-// the UI. These tests hold it to the UI: each entry point must contain the
-// complete live label of every menu, action and button it names, read from the
-// real widgets, so renaming one fails here until the catalog follows. The host's
-// own default entry points are held to the same labels.
+// resources/feature_catalog.json tells the assistant agent where things are in the UI. These tests hold it to the
+// UI: each entry point must contain the complete live label of every menu, action and button it names, read from the
+// real widgets, so renaming one fails here until the catalog follows. The host's own default entry points are held
+// to the same labels.
 
 #include <gtest/gtest.h>
 
@@ -185,6 +183,7 @@ LiveLabels readLiveLabels(PJ::MainWindow& window) {
   labels["playback.loop"] = toolTipOf(window, "playbackLoop");
   labels["playback.rate"] = toolTipOf(window, "playbackRate");
   labels["playback.step"] = toolTipOf(window, "labelStep");
+  labels["playback.date_time"] = toolTipOf(window, "buttonUseDateTime");
   if (auto* tabs = window.findChild<PJ::TabbedPlotWidget*>()) {
     labels["tabs.toggle_bottom"] = tabs->bottomPanelButton()->toolTip().toStdString();
   }
@@ -202,6 +201,7 @@ LiveLabels readLiveLabels(PJ::MainWindow& window) {
   labels["viz.3d"] = toolTipOf(placeholder, "buttonVizScene3D");
   labels["viz.state"] = toolTipOf(placeholder, "buttonVizStateTransitions");
   labels["viz.custom"] = toolTipOf(placeholder, "buttonVizCustomWidget");
+  labels["viz.log"] = toolTipOf(placeholder, "buttonVizLog");
 
   // Preferences pages (one nav row each) and the startup update check.
   PJ::PreferencesDialog prefs(Peer::theme(window), &window);
@@ -211,11 +211,13 @@ LiveLabels readLiveLabels(PJ::MainWindow& window) {
     }
   }
   labels["prefs.check_updates"] = textOf(prefs, "labelCheckUpdates");
+  labels["prefs.clock_time_zone"] = textOf(prefs, "labelClockTimeZone");
+  labels["prefs.mcp_server"] = textOf(prefs, "labelMcpServer");
+  labels["prefs.package_folders"] = textOf(prefs, "label_4");
   return live;
 }
 
-// The live labels each core entry's entry point names. An entry missing here
-// fails the test: a new catalog entry gets its labels checked from day one.
+// The live labels each core entry's entry point names; an entry missing here fails the test.
 const std::map<std::string, std::vector<std::string>>& labelsNamedBy() {
   static const std::map<std::string, std::vector<std::string>> table = {
       {"open_data_file", {"menu.file", "action.open_data", "sources.title", "sources.tab_file", "sources.load_file"}},
@@ -230,10 +232,13 @@ const std::map<std::string, std::vector<std::string>>& labelsNamedBy() {
       {"custom_series", {"custom.title", "custom.add"}},
       {"viewer_2d", {"viz.2d", "datasets.title"}},
       {"scene_3d", {"viz.3d", "datasets.title"}},
+      {"robot_packages", {"viz.3d", "menu.file", "action.preferences", "prefs.package_folders"}},
       {"playback", {"playback.play", "playback.loop", "playback.rate", "playback.step"}},
+      {"clock_time", {"playback.date_time", "menu.file", "action.preferences", "prefs.clock_time_zone"}},
       {"source_timeline", {"tabs.toggle_bottom", "timeline.align", "timeline.merge", "datasets.title"}},
       {"state_transitions", {"viz.state", "datasets.title"}},
       {"custom_widget", {"viz.custom", "datasets.title"}},
+      {"log_panel", {"viz.log", "datasets.title"}},
       {"plot_tabs", {"plot.split_h", "plot.split_v", "plot.fullscreen", "datasets.title"}},
       // This entry uses command-line flags or held keys, without widget labels.
       {"axis_wheel_zoom", {}},
@@ -241,6 +246,7 @@ const std::map<std::string, std::vector<std::string>>& labelsNamedBy() {
       {"diagnostics", {"titlebar.diagnostics"}},
       {"check_updates",
        {"menu.help", "action.check_updates", "menu.file", "action.preferences", "prefs.check_updates"}},
+      {"mcp_server", {"menu.file", "action.preferences", "prefs.mcp_server"}},
   };
   return table;
 }
@@ -305,9 +311,8 @@ TEST_F(FeatureCatalogResourceTest, ResourceIsValidAndEveryEntryHasEvidence) {
   }
 }
 
-// "path#token; path#token": each cited file exists and its text contains the
-// token, so a citation survives moved lines and fails only when the code it
-// cites is gone.
+// "path#token; path#token": each cited file exists and contains the token, so a citation survives moved lines
+// and fails only when the code it cites is gone.
 TEST_F(FeatureCatalogResourceTest, EvidenceTokensAppearInTheCitedFiles) {
   const Json doc = resource();
   ASSERT_TRUE(doc.is_object());

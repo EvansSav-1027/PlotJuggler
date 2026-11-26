@@ -1,32 +1,39 @@
 # Browser sample presets
 
-The "try it with sample data" presets of the WebAssembly build. Packaging with
+The "try it with sample data" presets of the WebAssembly build. The welcome
+dialog finds them in `presets/index.json` beside the page. Each sample's layout and
+thumbnail live on PlotJuggler's asset host (`https://assets.plotjuggler.io`, a
+Cloudflare R2 bucket whose `v1/` files never change) beside the recording they
+open, and `index.json` names them by absolute URL; a layout names its recording
+and robot models by absolute URL too.
+
+`index.json` here is the source of the index `app.plotjuggler.io` serves: change
+it, then upload it
+([`packaging/web/README.md`](../../packaging/web/README.md#sample-index)). The
+tests and self-hosted packages read this file, and
 `node scripts/package_wasm.mjs --presets resources/wasm-presets ...` deploys this
-directory verbatim under the page's `presets/`, where the welcome dialog finds
-`index.json`. Each sample is an ordinary source-saving layout with its data
-beside it, or on PlotJuggler's asset host (`https://assets.plotjuggler.io`, a
-Cloudflare R2 bucket whose `v1/` files never change) when the data is too large
-for the repository. How to author one, the packaging rules and the hosting notes are in
-[`docs/WASM_PRESETS.md`](../../docs/WASM_PRESETS.md).
+directory verbatim under the page's `presets/`. Adding or changing a sample: upload
+its layout or thumbnail under a new name, point `index.json` at it and list it in
+`tests/wasm/fixtures/hosted_assets.json`. How to author one, the packaging rules
+and the hosting notes are in [`docs/WASM_PRESETS.md`](../../docs/WASM_PRESETS.md).
 
-| Sample | Files | Bytes |
-|---|---|---|
-| `builtin_filters/` | layout, thumbnail (recording hosted, see below) | 15,010 |
-| `anymal/` | layout, thumbnail (recording and robot models hosted, see below) | 32,273 |
-| `city_drive/` | layout, thumbnail (recording and car model hosted, see below) | 54,455 |
-
-The layouts and this file are authored for this repository and fall
-under its license (MPL-2.0), and so do the thumbnails: PlotJuggler renders of
-the loaded samples (browser screenshots, downscaled to 384x216, 8-bit palette; the
-ANYmal and city-drive ones show only their 3D view, the built-in filters one its
-two plots).
-
-## `builtin_filters/` — built-in filters
-
-| File | Bytes |
+| Sample | Layout and thumbnail on the asset host |
 |---|---|
-| `layout.pj4.xml` | 4,144 |
-| `thumbnail.png` | 10,866 |
+| `builtin_filters` | `v1/nissan_leaf/builtin_filters_layout.pj4.xml`, `builtin_filters_thumbnail.png` |
+| `anymal` | `v1/grand_tour_2/anymal_layout.pj4.xml`, `anymal_thumbnail.png` |
+| `pandaset` | `v1/pandaset/pandaset_layout_v4.pj4.xml`, `pandaset_thumbnail.png` |
+| `lilocbench` | `v1/lilocbench/lilocbench_layout.pj4.xml`, `lilocbench_thumbnail.png` |
+| `uzhfpv` | `v1/uzhfpv/uzhfpv_layout.pj4.xml`, `uzhfpv_thumbnail.png` |
+| `microduck` | `v1/microduck/microduck_layout_v2.pj4.xml`, `microduck_thumbnail_v2.png` |
+
+The layouts, the thumbnails and this file are PlotJuggler's own and fall under
+this repository's license (MPL-2.0); the thumbnails are PlotJuggler renders of
+the loaded samples (browser screenshots, downscaled to 384x216, 8-bit palette; the
+ANYmal and PandaSet ones show only a 3D view, the built-in filters one its
+two plots; the LILocBench one is a desktop render of its orbit view; the Microduck one
+shows its 3D view, its cameras and its state strip).
+
+## `builtin_filters` — built-in filters
 
 Three plots of one signal: a car's gyro yaw rate (`/nissan/gps/duro/imu`,
 `angular_velocity/z`, about 99 Hz) as recorded, the same signal through the
@@ -55,12 +62,7 @@ status, vehicle speed and steering). It is re-compressed with zstd
 Redistribution basis: the dataset's authors provide it "for research and
 educational purposes" (© SZE-JKK).
 
-## `anymal/` — ANYmal GrandTour
-
-| File | Bytes |
-|---|---|
-| `layout.pj4.xml` | 10,104 |
-| `thumbnail.png` | 22,169 |
+## `anymal` — ANYmal GrandTour
 
 The layout loads three hosted folders (each with its own license and provenance
 notes; `https://assets.plotjuggler.io/index.html` lists every file):
@@ -101,44 +103,192 @@ a converter outside this repository from the dataset's Zarr streams and a
 curated MCAP of the same mission; the topics, rates and processing above are
 what it did.
 
-## `city_drive/` — self-driving car
+## `pandaset` — self-driving car
 
-| File | Bytes |
-|---|---|
-| `layout.pj4.xml` | 6,648 |
-| `thumbnail.png` | 47,807 |
+The layout loads `v1/pandaset/pandaset_092-094_20s_v3.mcap` (161,649,466 bytes, SHA-256
+`3579c1361ae5cd86c4f0abd2d684c2870dce2eea00cb9304ebc8352bbae24064`, pinned by
+the layout's `content_sha256`) from the asset host: 20 s of
+[PandaSet](https://pandaset.org), sequences 092 (frames 40-79), 093 and 094, which
+PandaSet recorded back to back on a suburban arterial in Silicon Valley (GPS about
+37.372 N, 122.05 W), by day, at 60-70 km/h and braking to 27 km/h at the end; Unix
+time 1557593251.900 to 1557593271.900. The sequences join at 1557593256.000 and
+1557593264.000, with their original timestamps. Each sequence has its own world
+origin: `map` is 092's, and 093 and 094 are chained onto it by extrapolating the
+previous sequence's last lidar step, so `map` to `base_link` has no jump at a join.
+It was converted from the PandaSet release as mirrored, unofficially, on
+[Hugging Face](https://huggingface.co/datasets/georghess/pandaset), and holds:
 
-The layout loads `v1/boreas/boreas_city_drive.mcap` (261,292,684 bytes, SHA-256
-`db4e548caa266c5408c266bed953610e82676016ae7f48c890af5b53116db82b`, pinned by
-the layout's `content_sha256`) from the asset host: 30 s of the
-[Boreas Autonomous Driving Dataset](https://registry.opendata.aws/boreas),
-sequence `boreas-2021-07-27-14-43` (a sunny arterial road in Toronto), from Unix
-time 1627411555.976352 to 1627411585.976352. It holds the front camera (the
-dataset's rectified 2448x2048 PNGs as JPEG, quality 80, 10 Hz, with its
-projection as `camera_info`), every Velodyne Alpha Prime scan (~10 Hz, ~199k
-points; x, y, z and intensity, stored ring by ring and Cloudini-compressed at
-1 cm), and the post-processed Applanix solution as `/tf` (map to applanix,
-50 Hz), odometry (50 Hz, velocity in the vehicle frame), IMU (100 Hz) and fix
-(10 Hz); `/tf_static` carries the dataset's lidar and camera calibration.
-`README.txt` beside it describes each topic and the conversion, and gives the
-citation the dataset asks for. The layout's 3D view starts centred on the car's
-first position and follows it.
+- `/lidar/pandar64` (10 Hz): every Pandar64 point in the sensor frame, x, y, z,
+  intensity and `class_id` (the semantic class; 0 in 092 and 093, which have no
+  segmentation), Cloudini-compressed (x, y, z on a 2 mm grid, intensity at 1,
+  `class_id` lossless). The PandarGT lidar is not included;
+- the six cameras (`/camera/<name>/image`: front_left, front, front_right, right,
+  back, left; 10 Hz), downscaled from 1920x1080 to 800x450 and re-encoded as JPEG
+  (quality 75), with their `camera_info` for that size, and `/camera/<name>/boxes`,
+  the annotated cuboids projected into each image as outlines;
+- `/boxes`: the annotated cuboids as `foxglove.SceneUpdate` in `base_link`,
+  coloured by class group (vehicles orange, pedestrians blue, cyclists green, other
+  grey), the ego car a magenta box, frame-locked to `base_link`;
+- `/tf`: `map` to `base_link` per sweep, and every sensor (the lidar and the six
+  cameras) as one fixed child of `base_link`. PandaSet gives each camera's pose in
+  the world per image and no mounting: the converter derives it from the camera's
+  pose relative to the car's pose interpolated to the image's timestamp (the
+  positions agree within 0.6 to 3.3 cm per camera over the recording);
+- `/ego` (JSON): speed from PandaSet's GPS velocity, heading and yaw rate from the
+  lidar poses (within one sequence), and the GPS position; `/objects` (JSON): object
+  counts per sweep, which step at the joins because each sequence was annotated on
+  its own.
 
-The car itself is `v2/boreas_vehicle/` (1.3 MB) on the asset host: `vehicle.urdf`
-places a stand-in model at the recording's `applanix` frame (on the roof, about
-2.1 m above the road by the lidar's ground returns), 0.4 m forward of centred,
-where its hood edge meets the front camera image where the real hood ends; the
-dataset ships no model of its Lincoln MKZ. The
-mesh, `meshes/prius_hybrid.glb`, is Open Robotics' "Prius Hybrid" from
-[Gazebo Fuel](https://fuel.gazebosim.org/1.0/OpenRobotics/models/Prius%20Hybrid)
-(version 3, by Ian Chen) converted to binary glTF with its textures, scaled to
-the MKZ's 4.9 m in the URDF; `PROVENANCE.txt` gives the source hashes and the
-conversion.
+`README_v3.txt` beside it gives the attribution and the citation and lists the changes
+made. The layout shows the six cameras across the top with their box overlays;
+below them the yaw rate, the speed and an aerial (top-down orthographic) view
+coloured by intensity in a column, beside a large orbiting 3D view coloured by
+height; both 3D views draw the lidar and the boxes in `base_link`. Its MCAP Loader
+does not select `/objects`.
 
-Redistribution basis: the Boreas dataset is released under CC BY 4.0 (its
-[AWS Open Data registry entry](https://registry.opendata.aws/boreas)); the
-`README.txt` beside the recording gives the attribution and lists the changes
-made, as the license requires. The car model is released under CC0 1.0
-(`LICENSE` beside it). The recording was made with a converter outside
-this repository from the dataset's files; the topics, rates and processing
-above are what it did.
+Privacy: the images are not anonymised. PandaSet does not blur faces or licence
+plates; in this recording the closest driver (sequence 094, front-right and right
+cameras, about 4 m) is recognisable at 800x450, and plates are 6 m or farther and
+not legible at that size.
+
+Redistribution basis: PandaSet (c) Scale AI, Inc. and Hesai Photonics Technology
+Co., Ltd, is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+with the PandaSet Dataset Terms; the `README_v3.txt` beside the recording gives that
+attribution, lists the changes made, as the licence requires, and states that the
+recording is not endorsed by Scale AI or Hesai. The recording was made with a
+converter outside this repository; the topics and processing above are what it did.
+
+## `lilocbench` — office robot
+
+The layout loads `v1/lilocbench/lilocbench_office_300s.mcap` (118,326,193 bytes, SHA-256
+`d0f338250526b2a6277fa6f290b023ee9d13a12bf368acc60e6e58c41ff80f5c`, pinned by
+the layout's `content_sha256`) from the asset host: 300 s of
+[LILocBench](https://www.ipb.uni-bonn.de/html/projects/localization_benchmark/)
+(Photogrammetry & Robotics Lab, University of Bonn), the first 300 s of its
+"mapping" sequence, a Clearpath Dingo driving through the rooms of an office
+floor in December 2024; Unix time 1733375659.713 to 1733375959.644, with the
+original timestamps. It was converted from the sequence's camera-free bag, its
+image archive, its ground-truth file and the benchmark's office map, and holds:
+
+- `/scan_front`, `/scan_rear` (15 Hz) and `/odom` (14.5 Hz): both SICK laser
+  scans and the wheel odometry, unchanged;
+- `/camera/color/image` and `/camera/depth/image` (5 Hz): every third frame of
+  the front RealSense D455, downscaled from 640x480 to 320x240, the colour as JPEG
+  (quality 80), the depth as 16-bit PNG in millimetres, with their `camera_info`
+  for that size. The left and right cameras are not included;
+- `/ground_truth/pose` (20 Hz): the benchmark's ground-truth pose of `base_link`
+  (from ceiling markers), x, y and yaw;
+- `/tf`: `map` to `odom` computed from the ground truth and the odometry, so that
+  `map` to `base_link` is the ground truth, `odom` to `base_link`, and the laser
+  and camera frames. The localization shown is therefore the dataset's ground
+  truth, not an algorithm's estimate;
+- `/odom_in_map`: the wheel odometry expressed in `map` from the first pose, to
+  show its drift against the ground truth;
+- `/map`: the benchmark's occupancy map, cropped to the 31.6 m x 19.7 m it knows.
+
+`README.txt` beside it gives the attribution and the citation and lists the changes
+made. The layout shows the map from above (top-down orthographic) following the
+robot, with both scans; the front camera; an orbit view that follows the robot too,
+with the depth image as a cloud; the correction the ground truth applies to the
+odometry over time; and an XY plot of the path by odometry against the ground truth.
+Both follow cameras start on the robot's first position, because a follow camera
+tracks the frame's movement and does not jump to it.
+
+Privacy: one person, the robot's operator, is in view of the camera from 112.5 s to
+118.5 s. His face is blurred in those 32 images; he is also seen from the shoulders
+down from 65 s to 67 s. The frames were reviewed at one-second spacing for other
+people. Whiteboards and posters are visible but not legible at 320x240.
+
+Redistribution basis: the authors distribute LILocBench under the Creative Commons
+Attribution-NonCommercial-ShareAlike license (their page names no version), so this
+sample may be hosted only while its use is non-commercial, and the recording is
+shared under the same license; the `README.txt` beside it gives the attribution,
+lists the changes and states that it is not endorsed by the authors. The recording
+was made with a converter outside this repository; the topics and processing above
+are what it did.
+
+## `uzhfpv` — racing drone
+
+The layout loads `v1/uzhfpv/uzhfpv_indoor_forward_6.mcap` (37,381,188 bytes, SHA-256
+`27501952fe2fd0b7de53b904ae94dc56ea1fa6f2fd19db46456933742a621740`, pinned by
+the layout's `content_sha256`) from the asset host: 29.1 s of sequence `indoor_forward_6` of the
+[UZH-FPV Drone Racing Dataset](https://fpv.ifi.uzh.ch/) (Robotics and Perception Group, University of
+Zurich): a racing quadrotor flies about five laps of a gated track in a hangar, at up to
+42 km/h; Unix time 1540821388.575 (0.5 s before take-off) to 1540821417.681 (the end of the ground truth).
+It was converted from the dataset's text exports (`indoor_forward_6_snapdragon_with_gt.zip`,
+`indoor_forward_6_davis_with_gt.zip`) and the Snapdragon calibration (`indoor_forward_calib_snapdragon.zip`),
+and holds:
+
+- `/snappy_cam/stereo_l/image` (27 Hz): the Snapdragon's left fisheye camera, 640x480 greyscale, re-encoded as
+  JPEG (quality 80), with `camera_info` from the calibration (equidistant model). The right camera is not
+  included;
+- `/dvs/events_image` (at each fisheye frame): the DAVIS 346 event camera drawn as the events of the 10 ms before
+  the frame, ON red and OFF blue on black (PNG). The DAVIS clock is moved onto the Snapdragon's by the offset
+  between the dataset's two ground-truth files (35.0 ms). The raw event stream, the DAVIS image frames and its IMU
+  are not included;
+- `/snappy_imu` (500 Hz): the Snapdragon IMU;
+- `/groundtruth/pose` (100 Hz, every fifth sample of the dataset's 500 Hz ground truth) and `/tf` (`world` to
+  `body`, the Snapdragon IMU), with `/tf_static` `body` to `cam_left` from the calibration;
+- `/groundtruth/speed_kmh`: the ground-truth speed in km/h, from central differences of the 500 Hz positions
+  over a 50 ms moving average.
+
+Timestamps are the dataset's own; the calibration's camera-to-IMU time shift (-16.7 ms) is not applied.
+`README.txt` beside it gives the attribution and the citations and lists the changes made. The layout shows
+the fisheye and the event camera above a 3D view in `world` with the drone's frame and its trail over the whole
+flight, beside the track seen from above (an XY plot of the ground-truth position), the speed, the gyroscope and
+the accelerometer.
+
+Privacy: the images are not anonymised. People stand at the far edge of the hangar in some frames; at 640x480
+their faces are a few pixels and not recognisable.
+
+Redistribution basis: the UZH-FPV Drone Racing Dataset is released under
+[CC BY-NC-SA 3.0](http://creativecommons.org/licenses/by-nc-sa/3.0/) ("free for non-commercial use (including
+research)", [fpv.ifi.uzh.ch/datasets](https://fpv.ifi.uzh.ch/datasets/)); the recording is an adaptation shared
+under the same licence, and the `README.txt` beside it gives the attribution, lists the changes made and
+states that it is not endorsed by the University of Zurich. The recording was made with a converter outside this
+repository; the topics and processing above are what it did.
+
+## `microduck` — walking biped
+
+The layout loads two hosted folders:
+
+- `v1/microduck/microduck_walk_v2.mcap` (6,676,989 bytes, SHA-256
+  `a3d614d42a77dea9f14744f6d66983b8588127def1f0de9e4c661c9273837c1e`, pinned by the layout's
+  `content_sha256`): PlotJuggler's own recording of a simulated
+  [Microduck](https://pollen-robotics.com/microduck/), the 25 cm open-source biped by Pollen Robotics
+  ([microduck_rl](https://github.com/pollen-robotics/microduck_rl)), 37.5 s cut from a longer session (62.024 s
+  to 99.562 s of it, timestamps unchanged except the first frame of each camera and the URDF
+  message, stamped at the first instant), licensed
+  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The robot stands, walks, kicks, falls at about 93.5 s and gets back up. It
+  holds `/state` (49 Hz, JSON: the base pose and velocity, the commanded velocity, the active `policy` and the
+  position, velocity, control target and action of 14 joints), `/tf` (781 Hz, every link), `/robot_description`
+  (the URDF, which names its meshes `package://microduck_description/...`) and two H.264 cameras,
+  `/camera/head` and `/camera/external` (30 Hz, `foxglove.CompressedVideo`, renders of the simulation),
+  re-encoded from the session's own streams with no B-frames so that each stream starts on a keyframe, every frame kept. The
+  cut starts on the last `/tf` burst before the first video frame, and the first frame of each camera is stamped
+  there (9 ms early), so the robot, the state and both cameras all have a sample at the first instant.
+  `README_v2.txt` beside it describes the topics and gives the credit.
+- `v1/microduck_description/` (21.6 MB): the 38 STL meshes the URDF references, unmodified from
+  [adityakamath/microduck_description](https://github.com/adityakamath/microduck_description) at commit
+  `4d378791e561`, which takes them from microduck_rl. `package_url_roots` on the layout's robot model maps the
+  package to this folder.
+
+The layout shows the robot in 3D following its base, both cameras, a plot of the body tilt shaded by fall markers,
+and a State Transitions strip over `robot_state`, a
+derived series with text output (`output = "string"`, `pj_scripting/docs/FILTER_CLASS.md`). Both derived series
+are Luau transforms in the layout's `<data_processors>`, owned by the Transform Editor so a visitor can open and
+edit them: `tilt_deg` is the angle between the body's up axis and the vertical, from the base quaternion;
+`robot_state` keeps a posture (up, falling, on the ground, getting up) from that tilt and the base height
+(falling past 20°, on the ground past 60° with the base under 0.09 m, up again under 10°) and, while up, says
+"walking" when a knee turned faster than 1 rad/s in the last 0.5 s, "standing" otherwise. Over the recording it
+reads standing 56 %, walking 39 %, on the ground 3.7 %, getting up 1.3 % and falling 0.3 %; the kicks count as
+walking. The fall markers come from a Marker Editor rule in the layout's `<data_processors>` (a `<generator>` whose id
+is the Marker Editor's, `toolbox-anomaly-detector/rule/tilt_deg/value`: applying a rule on `tilt_deg/value` there
+replaces it) reading the tilt and the base height: falling (past 20°),
+on the ground (past 60° with the base under 0.09 m) and getting up, the same thresholds as `robot_state`.
+
+Redistribution basis: the recording is PlotJuggler's own. The meshes are © Pollen Robotics under
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) (microduck_rl's `LICENSE-MODELS.md`;
+microduck_description's Apache-2.0 covers only its URDF, xacro and launch files): they are shared unmodified under
+the same licence, for non-commercial use, with `LICENSE-MODELS.md`, microduck_description's `LICENSE` and a
+`PROVENANCE.txt` giving the attribution and the source commits beside them.

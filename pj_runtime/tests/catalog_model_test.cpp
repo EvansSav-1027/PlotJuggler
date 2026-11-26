@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -17,9 +18,11 @@
 #include "on_demand_test_utils.h"
 #include "pj_base/builtin/plot_markers.hpp"
 #include "pj_base/sdk/platform.hpp"
+#include "pj_base/sdk/plugin_data_api.hpp"
 #include "pj_base/type_tree.hpp"
 #include "pj_datastore/engine.hpp"
 #include "pj_datastore/object_store.hpp"
+#include "pj_datastore/plugin_data_host.hpp"
 #include "pj_datastore/writer.hpp"
 #include "pj_runtime/CatalogModel.h"
 #include "pj_runtime/MarkerTopics.h"
@@ -154,7 +157,7 @@ TEST(CatalogModelTest, FindScalarForMarkerKeyForgetsAFieldTheCatalogDropped) {
   EXPECT_FALSE(catalog.findScalarForMarkerKey(*dataset, key).has_value());
 }
 
-// An on-demand input may read a string field (D4); a marker rule may not, its resolver reading numeric series only.
+// An on-demand input may read a string field; a marker rule may not, its resolver reading numeric series only.
 // The two answers are remembered apart: the string field found for an input stays refused to a marker rule.
 TEST(CatalogModelTest, FindScalarForMarkerKeyFindsAStringFieldOnlyWhenAsked) {
   PJ::SessionManager session;
@@ -227,10 +230,13 @@ TEST(CatalogModelTest, PluginDropNameQualifiesAnObjectTopicTwoDatasetsShare) {
   EXPECT_EQ(
       catalog.pluginDropName(*catalog.objectTopicKey(run_b, cloud_b)), std::optional<std::string>{"b.mcap:/cloud"});
 
-  // A source loaded twice cannot be addressed by name, so a qualifier would only name the wrong one.
+  // A source loaded twice is qualified by the catalog's labels: the newer copy is "b.mcap (2)".
   const auto [run_c, cloud_c] = registerCloud("b.mcap");
   catalog.rebuildFromDatastore();
-  EXPECT_EQ(catalog.pluginDropName(*catalog.objectTopicKey(run_c, cloud_c)), std::optional<std::string>{"/cloud"});
+  EXPECT_EQ(
+      catalog.pluginDropName(*catalog.objectTopicKey(run_b, cloud_b)), std::optional<std::string>{"b.mcap:/cloud"});
+  EXPECT_EQ(
+      catalog.pluginDropName(*catalog.objectTopicKey(run_c, cloud_c)), std::optional<std::string>{"b.mcap (2):/cloud"});
 }
 
 // A paused topic has no stored data yet, but its name still tells the plugin what was dropped.
@@ -324,15 +330,11 @@ TEST(CatalogModelTest, KeepsDuplicateDatasetTopicsVisibleUnderDatasetRoot) {
   EXPECT_EQ(second_descriptor->topic_id, second_topic);
 }
 
-// Regression guard for the "topics duplicated after create/delete/recreate"
-// bug. Two datasets with the same source_name must get
-// STABLE, distinct display labels — the lower-id one keeps the un-suffixed base
-// label and the higher-id one gets " (2)" — even after a delete/recreate cycle
-// that scrambles the engine's (robin_map) dataset iteration order. Before the
-// fix, that order was used directly, so a pre-existing shown dataset could be
-// relabeled base->" (2)"; the view (which groups tree nodes by the label string)
-// never learned of the relabel and merged both datasets' topics into one node
-// (doubled fields). Sorting dataset ids pins the base label to the oldest.
+// Two datasets with the same source_name get stable, distinct display labels (the lower-id one keeps the un-suffixed
+// base label, the higher-id one gets " (2)"), even after a delete/recreate cycle that scrambles the engine's
+// (robin_map) dataset iteration order: a relabel of a shown dataset is never announced to the view (which groups tree
+// nodes by the label string), so it would merge both datasets' topics into one node (doubled fields). Sorting dataset
+// ids pins the base label to the oldest.
 TEST(CatalogModelTest, DatasetLabelStableForDuplicateSourceAcrossDeleteRecreate) {
   PJ::SessionManager session;
   PJ::CatalogModel catalog(&session);
@@ -344,7 +346,6 @@ TEST(CatalogModelTest, DatasetLabelStableForDuplicateSourceAcrossDeleteRecreate)
     return static_cast<PJ::DatasetId>(*ds);
   };
 
-  // First cycle: two same-named datasets, then delete both (real delete).
   const auto a = make("[stream] X");
   const auto b = make("[stream] X");
   catalog.rebuildFromDatastore();
@@ -354,7 +355,6 @@ TEST(CatalogModelTest, DatasetLabelStableForDuplicateSourceAcrossDeleteRecreate)
   session.dataEngine().removeDataset(b);
   catalog.rebuildFromDatastore();
 
-  // Recreate two more with the SAME name — new (higher) monotonic ids.
   const auto c = make("[stream] X");
   const auto d = make("[stream] X");
   catalog.rebuildFromDatastore();
@@ -644,11 +644,9 @@ TEST(CatalogModelTest, RemovedObjectTopicStaysHiddenAcrossRebuild) {
 }
 
 TEST(CatalogModelTest, RestoreDatasetBringsBackClearedItems) {
-  // Reproduces the layout-reload bug: a dataset hidden by clearAll
-  // (which is what Clear All Curves calls) stays filtered out of every
-  // future rebuildFromDatastore. restoreDataset() lifts the filter for
-  // exactly one id so FileLoader can reuse an existing engine dataset
-  // without un-hiding unrelated cleared datasets.
+  // A dataset hidden by clearAll (Clear All Curves) stays filtered out of every future rebuildFromDatastore;
+  // restoreDataset() lifts the filter for exactly one id so FileLoader can reuse an existing engine dataset without
+  // un-hiding unrelated cleared datasets.
   PJ::SessionManager session;
   PJ::CatalogModel catalog(&session);
 
@@ -675,11 +673,10 @@ TEST(CatalogModelTest, RestoreDatasetBringsBackClearedItems) {
       << "restoreDataset must surface only the targeted dataset, not the other cleared one";
 }
 
-// Regression for the remove-then-reload bug (PR #131): removeDataset tombstones a DatasetId in the
-// catalog, and an in-place reload of the same file deliberately REUSES that id (replaceDataset keeps
-// DatasetId/TopicId stable so curve keys survive). The tombstone therefore outlives the swap, so the
-// reloaded data stays invisible unless the caller (FileLoader) lifts it with restoreDataset. This locks
-// that contract: a real replaceDataset reusing a removed id does NOT self-un-hide; restoreDataset does.
+// removeDataset tombstones a DatasetId in the catalog, and an in-place reload of the same file deliberately reuses that
+// id (replaceDataset keeps DatasetId/TopicId stable so curve keys survive). The tombstone outlives the swap, so the
+// reloaded data stays invisible unless the caller (FileLoader) lifts it with restoreDataset: a real replaceDataset
+// reusing a removed id does not self-un-hide; restoreDataset does.
 TEST(CatalogModelTest, ReloadReusingRemovedDatasetIdStaysHiddenUntilRestore) {
   PJ::SessionManager session;
   PJ::CatalogModel catalog(&session);
@@ -709,18 +706,18 @@ TEST(CatalogModelTest, ReloadReusingRemovedDatasetIdStaysHiddenUntilRestore) {
   session.replaceDataset(staged_engine, staged_store, *staged, *dataset, {});
   catalog.rebuildFromDatastore();
 
-  // The bug: the swap reused the tombstoned id, so the rebuild still filters the dataset out.
+  // The swap reused the tombstoned id, so the rebuild still filters the dataset out.
   EXPECT_TRUE(catalog.items().empty())
       << "an in-place reload reusing a removed DatasetId must stay hidden until restoreDataset";
 
-  // The fix recipe FileLoader applies on the replace path: lift the tombstone for the reused id.
+  // What FileLoader applies on the replace path: lift the tombstone for the reused id.
   catalog.restoreDataset(*dataset);
   const auto items = catalog.items();
   ASSERT_EQ(items.size(), 1U) << "restoreDataset must surface the reloaded dataset";
   EXPECT_EQ(items[0].dataset_id, *dataset);
 }
 
-// --- setDatasetDisplayName (issue #98) --------------------------------------
+// --- setDatasetDisplayName ---
 
 TEST(CatalogModelTest, DisplayNameOverrideReplacesLabelButKeepsSourceName) {
   PJ::SessionManager session;
@@ -810,11 +807,9 @@ TEST(CatalogModelTest, DisplayNameOverrideSurvivesClearAndRestore) {
   EXPECT_EQ(catalog.curves().at(0).dataset_name, u"pusht_v21"_s);
 }
 
-// Regression for the single-instance path: rebuildFromDatastore signals only
-// add/remove keyed by curve identity (never a relabel), so the override must be
-// in place BEFORE the topic is committed for its label to ride the itemAdded
-// signal that incremental subscribers (the curve tree) consume. FileLoader
-// relies on this by calling setDatasetDisplayName before start().
+// rebuildFromDatastore signals only add/remove keyed by curve identity (never a relabel), so the override must be in
+// place before the topic is committed for its label to ride the itemAdded signal that incremental subscribers (the
+// curve tree) consume. FileLoader calls setDatasetDisplayName before start() for this reason.
 TEST(CatalogModelTest, DisplayNameOverrideSetBeforeCommitReachesItemAddedSignal) {
   PJ::SessionManager session;
   PJ::CatalogModel catalog(&session);
@@ -994,10 +989,8 @@ TEST(CatalogModelPathResolve, ReturnsNulloptForAbsentTopicOrField) {
   EXPECT_FALSE(catalog.descriptorForPath(*a, u"/vehicle/speed"_s, u"nope"_s).has_value());
 }
 
-// ===========================================================================
-// In-place reload (DataEngine/ObjectStore::replaceDatasetFrom) keeps curve/object
-// keys stable — the runtime guarantee that plots and 2D docks keep bindings.
-// ===========================================================================
+// ---- In-place reload (DataEngine/ObjectStore::replaceDatasetFrom) keeps curve/object keys stable ----
+// Plots and 2D docks keep their bindings.
 
 TEST(CatalogModelReloadTest, ScalarReplaceKeepsCurveKeyAndEmitsNoRemoval) {
   PJ::SessionManager session;
@@ -1084,12 +1077,186 @@ TEST(CatalogModelReloadTest, ObjectReplaceKeepsObjectTopicKey) {
   EXPECT_EQ(removed_emissions, 0);
 }
 
-// samplesIngested is now gated on a content fingerprint (rebuildIfChanged) so
-// row-only ingest batches skip the full rebuild. The gate must NEVER skip a real
-// structural change — a false skip would drop a newly-ingested topic from the
-// catalog. Each new topic arrives via the gated commit path (addScalarTopic
-// commits, which emits samplesIngested), so this pins the anti-false-skip
-// property end-to-end.
+// A reload whose file lost a column (a CSV reparsed with that column as the time axis) refills the topic in place: the
+// column the refill no longer writes leaves the curve list and the plugin catalog, the others keep their keys.
+TEST(CatalogModelReloadTest, RefillDropsColumnTheReloadNoLongerWrites) {
+  PJ::SessionManager session;
+  PJ::CatalogModel catalog(&session);
+  auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "data.csv"});
+  ASSERT_TRUE(dataset.has_value());
+
+  PJ::TopicId topic = 0;
+  {
+    PJ::DataWriter writer = session.dataEngine().createWriter();
+    auto registered = writer.registerTopic(*dataset, PJ::TopicDescriptor{.name = "data"});
+    ASSERT_TRUE(registered.has_value()) << registered.error();
+    topic = *registered;
+    for (const char* field : {"time", "a", "b"}) {
+      ASSERT_TRUE(writer.ensureColumn(topic, field, PJ::PrimitiveType::kFloat64).has_value());
+    }
+    for (int row = 0; row < 3; ++row) {
+      ASSERT_TRUE(writer.beginRow(topic, 100 + row).has_value());
+      writer.set(topic, 0, 0.5 * row);
+      writer.set(topic, 1, 1.5 * row);
+      writer.set(topic, 2, 2.5 * row);
+      ASSERT_TRUE(writer.finishRow(topic).has_value());
+    }
+    ASSERT_FALSE(session.commitChunks(writer.flushAll()).empty());
+  }
+  catalog.rebuildFromDatastore();
+  const auto key_of = [&catalog](const QString& field) -> QString {
+    for (const auto& curve : catalog.curves()) {
+      if (curve.field_path == field) {
+        return curve.name;
+      }
+    }
+    return {};
+  };
+  ASSERT_EQ(catalog.curves().size(), 3U);
+  const QString key_time = key_of(u"time"_s);
+  const QString key_a = key_of(u"a"_s);
+  const QString key_b = key_of(u"b"_s);
+
+  QStringList removed;
+  QObject::connect(&catalog, &PJ::CatalogModel::itemsRemoved, &catalog, [&removed](const QStringList& keys) {
+    removed.append(keys);
+  });
+  {
+    PJ::RefillGuard guard = session.beginRefill(*dataset);
+    PJ::DataWriter writer = session.dataEngine().createWriter();
+    const auto a = writer.ensureColumn(topic, "a", PJ::PrimitiveType::kFloat64);
+    const auto b = writer.ensureColumn(topic, "b", PJ::PrimitiveType::kFloat64);
+    ASSERT_TRUE(a.has_value() && b.has_value());
+    for (int row = 0; row < 3; ++row) {
+      ASSERT_TRUE(writer.beginRow(topic, 200 + row).has_value());
+      writer.set(topic, *a, 1.0);
+      writer.set(topic, *b, 2.0);
+      ASSERT_TRUE(writer.finishRow(topic).has_value());
+    }
+    ASSERT_FALSE(session.commitChunks(writer.flushAll()).empty());
+    guard.pruneVanishedTopics();
+    guard.commit();
+  }
+  catalog.rebuildIfChanged();
+
+  EXPECT_EQ(catalog.curves().size(), 2U) << "the column the reload no longer writes leaves the curve list";
+  EXPECT_TRUE(key_of(u"time"_s).isEmpty());
+  EXPECT_EQ(key_of(u"a"_s), key_a) << "a refilled column keeps its curve key";
+  EXPECT_EQ(key_of(u"b"_s), key_b);
+  EXPECT_TRUE(removed.contains(key_time)) << "plots on the vanished column hear it go";
+
+  PJ::DatastoreToolboxHost toolbox_host(session.dataEngine(), session.objectStore());
+  PJ::sdk::ToolboxHostView toolbox(toolbox_host.raw());
+  auto snapshot = toolbox.catalogSnapshot();
+  ASSERT_TRUE(snapshot.has_value()) << snapshot.error();
+  ASSERT_EQ(snapshot->topics().size(), 1U);
+  EXPECT_EQ(snapshot->topics()[0].field_count, 2U) << "plugins and agents no longer list the vanished field";
+}
+
+// The CSV of RefillDropsColumnTheReloadNoLongerWrites as a reusable shape: a "data" topic whose "time" column a
+// reload stops writing, beside a float column "a" with fractional values.
+struct LostColumnFixture {
+  PJ::SessionManager session;
+  PJ::CatalogModel catalog{&session};
+  PJ::DatasetId dataset = 0;
+  PJ::TopicId topic = 0;
+  PJ::PrimitiveType time_type;
+
+  enum class End { kPruneAndCommit, kCommitWithoutPrune, kRollback };
+
+  explicit LostColumnFixture(PJ::PrimitiveType vanishing_type) : time_type(vanishing_type) {
+    dataset = *session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "data.csv"});
+    PJ::DataWriter writer = session.dataEngine().createWriter();
+    topic = *writer.registerTopic(dataset, PJ::TopicDescriptor{.name = "data"});
+    EXPECT_TRUE(writer.ensureColumn(topic, "time", vanishing_type).has_value());
+    EXPECT_TRUE(writer.ensureColumn(topic, "a", PJ::PrimitiveType::kFloat64).has_value());
+    writeRows(writer, /*with_time=*/true);
+    catalog.rebuildFromDatastore();
+  }
+
+  void writeRows(PJ::DataWriter& writer, bool with_time) {
+    for (int row = 0; row < 3; ++row) {
+      ASSERT_TRUE(writer.beginRow(topic, 100 + row).has_value());
+      if (with_time && time_type == PJ::PrimitiveType::kInt64) {
+        writer.set<int64_t>(topic, 0, row);
+      } else if (with_time) {
+        writer.set<double>(topic, 0, 0.5 * row);
+      }
+      writer.set<double>(topic, 1, 1.5 + row);
+      ASSERT_TRUE(writer.finishRow(topic).has_value());
+    }
+    ASSERT_FALSE(session.commitChunks(writer.flushAll()).empty());
+  }
+
+  // One reload of the file; `during` runs after the detach and again after the refill wrote its rows.
+  void reload(bool with_time, End end, const std::function<void()>& during = {}) {
+    std::optional<PJ::RefillGuard> guard = session.beginRefill(dataset);
+    if (during) {
+      during();
+    }
+    PJ::DataWriter writer = session.dataEngine().createWriter();
+    writeRows(writer, with_time);
+    if (during) {
+      during();
+    }
+    if (end == End::kPruneAndCommit) {
+      guard->pruneVanishedTopics();
+    }
+    if (end != End::kRollback) {
+      guard->commit();
+    }
+  }
+
+  [[nodiscard]] bool timeListed() {
+    catalog.rebuildIfChanged();
+    const auto curves = catalog.curves();
+    return std::any_of(
+        curves.begin(), curves.end(), [](const PJ::CurveDescriptor& c) { return c.field_path == u"time"_s; });
+  }
+};
+
+TEST(CatalogModelReloadTest, ColumnLostByAReloadStaysHiddenThroughTheNextReload) {
+  LostColumnFixture fx(PJ::PrimitiveType::kFloat64);
+  fx.reload(/*with_time=*/false, LostColumnFixture::End::kPruneAndCommit);
+  ASSERT_FALSE(fx.timeListed());
+  fx.reload(/*with_time=*/false, LostColumnFixture::End::kPruneAndCommit, [&fx]() {
+    EXPECT_FALSE(fx.timeListed()) << "the refill must not bring the ghost back";
+  });
+  EXPECT_FALSE(fx.timeListed());
+}
+
+TEST(CatalogModelReloadTest, KeptPartialReloadKeepsTheLostColumnHidden) {
+  LostColumnFixture fx(PJ::PrimitiveType::kFloat64);
+  fx.reload(/*with_time=*/false, LostColumnFixture::End::kPruneAndCommit);
+  ASSERT_FALSE(fx.timeListed());
+  fx.reload(/*with_time=*/false, LostColumnFixture::End::kCommitWithoutPrune);
+  EXPECT_FALSE(fx.timeListed()) << "a cancelled load kept as partial does not prune, nor resurrect";
+}
+
+TEST(CatalogModelReloadTest, RolledBackReloadRestoresTheHiddenColumn) {
+  LostColumnFixture fx(PJ::PrimitiveType::kFloat64);
+  fx.reload(/*with_time=*/false, LostColumnFixture::End::kPruneAndCommit);
+  ASSERT_FALSE(fx.timeListed());
+  bool shown_after_write = false;
+  fx.reload(/*with_time=*/true, LostColumnFixture::End::kRollback, [&fx, &shown_after_write]() {
+    shown_after_write = fx.timeListed();
+  });
+  EXPECT_TRUE(shown_after_write) << "the attempted refill gave the column values";
+  EXPECT_FALSE(fx.timeListed()) << "the rollback restores the prior data, column hidden";
+}
+
+// Only the retired-column term of the fingerprint moves: the lost column is not a float (no whole-number signature)
+// and "a" keeps fractional values, so a rebuildIfChanged that ignored retirement would keep the ghost.
+TEST(CatalogModelReloadTest, FingerprintNoticesARetiredNonFloatColumn) {
+  LostColumnFixture fx(PJ::PrimitiveType::kInt64);
+  ASSERT_TRUE(fx.timeListed());
+  fx.reload(/*with_time=*/false, LostColumnFixture::End::kPruneAndCommit);
+  EXPECT_FALSE(fx.timeListed());
+}
+
+// samplesIngested is gated on a content fingerprint (rebuildIfChanged) so row-only ingest batches skip the full
+// rebuild. The gate must never skip a real structural change: a false skip would drop a newly-ingested topic from the
+// catalog. Each new topic arrives via the gated commit path (addScalarTopic commits, which emits samplesIngested).
 TEST(CatalogModelTest, IngestGateSurfacesEveryNewTopic) {
   PJ::SessionManager session;
   PJ::CatalogModel catalog(&session);
@@ -1137,26 +1304,88 @@ TEST(CatalogModelTest, ScalarValueAtReturnsLatestSampleAtOrBeforeTime) {
   const PJ::DisplayOffset offset = session.displayOffset(*dataset);
   auto displayOf = [&](PJ::Timestamp raw_ns) { return PJ::toAxisDouble(PJ::rawToDisplaySeconds(raw_ns, offset)); };
 
-  // Between the 2nd and 3rd sample → holds the 2nd sample's value.
   auto mid = catalog.scalarValueAt(key, displayOf(2'500'000'000));
   ASSERT_TRUE(mid.has_value());
   EXPECT_DOUBLE_EQ(*mid, 20.0);
 
-  // Exactly on the last sample → that sample.
   auto on_sample = catalog.scalarValueAt(key, displayOf(3'000'000'000));
   ASSERT_TRUE(on_sample.has_value());
   EXPECT_DOUBLE_EQ(*on_sample, 30.0);
 
-  // After the last sample → still the last sample (zero-order hold forward).
   auto after = catalog.scalarValueAt(key, displayOf(9'000'000'000));
   ASSERT_TRUE(after.has_value());
   EXPECT_DOUBLE_EQ(*after, 30.0);
 
-  // Before the first sample → no value.
   EXPECT_FALSE(catalog.scalarValueAt(key, displayOf(500'000'000)).has_value());
 
-  // Unknown / non-scalar key → no value.
   EXPECT_FALSE(catalog.scalarValueAt(u"not-a-key"_s, displayOf(2'500'000'000)).has_value());
+}
+
+// Topics whose messages leave some columns null (a /tf TFMessage whose messages
+// carry different transforms, variable-length arrays, JSON with optional keys)
+// must still show a value: scalarValueAt holds the newest row that HAS a value
+// for the column (the plot tracker's lookup), not the newest row of the topic.
+TEST(CatalogModelTest, ScalarValueAtSkipsRowsWhereTheColumnIsNull) {
+  PJ::SessionManager session;
+  PJ::CatalogModel catalog(&session);
+
+  auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "sparse.mcap"});
+  ASSERT_TRUE(dataset.has_value()) << dataset.error();
+
+  // struct sparse { float64 a; float64 b } with alternating populated columns.
+  PJ::DataWriter writer = session.dataEngine().createWriter();
+  auto a = PJ::makePrimitive("a", PJ::PrimitiveType::kFloat64);
+  auto b = PJ::makePrimitive("b", PJ::PrimitiveType::kFloat64);
+  auto schema_or = writer.registerSchema("sparse", PJ::makeStruct("sparse", {a, b}));
+  ASSERT_TRUE(schema_or.has_value()) << schema_or.error();
+  PJ::TopicDescriptor td;
+  td.name = "/sparse";
+  td.schema_id = *schema_or;
+  auto topic_or = writer.registerTopic(*dataset, td);
+  ASSERT_TRUE(topic_or.has_value()) << topic_or.error();
+  const PJ::TopicId topic = *topic_or;
+
+  ASSERT_TRUE(writer.beginRow(topic, 1'000'000'000).has_value());
+  writer.set(topic, 0, 10.0);
+  writer.setNull(topic, 1);
+  ASSERT_TRUE(writer.finishRow(topic).has_value());
+  ASSERT_TRUE(writer.beginRow(topic, 2'000'000'000).has_value());
+  writer.setNull(topic, 0);
+  writer.set(topic, 1, 20.0);
+  ASSERT_TRUE(writer.finishRow(topic).has_value());
+  ASSERT_FALSE(session.commitChunks(writer.flushAll()).empty());
+
+  QString key_a;
+  QString key_b;
+  for (const auto& item : catalog.items()) {
+    const auto* scalar = PJ::asScalarField(item);
+    ASSERT_NE(scalar, nullptr);
+    (scalar->column_index == 0 ? key_a : key_b) = item.key;
+  }
+  ASSERT_FALSE(key_a.isEmpty());
+  ASSERT_FALSE(key_b.isEmpty());
+
+  const PJ::DisplayOffset offset = session.displayOffset(*dataset);
+  auto displayOf = [&](PJ::Timestamp raw_ns) { return PJ::toAxisDouble(PJ::rawToDisplaySeconds(raw_ns, offset)); };
+
+  // The newest row (@2s) has no `a`: hold the @1s value instead of showing "-".
+  const auto a_held = catalog.scalarValueAt(key_a, displayOf(2'500'000'000));
+  ASSERT_TRUE(a_held.has_value());
+  EXPECT_DOUBLE_EQ(*a_held, 10.0);
+
+  // `b` has no sample yet at 1.5s (its only value is @2s): no value, never a made-up one.
+  EXPECT_FALSE(catalog.scalarValueAt(key_b, displayOf(1'500'000'000)).has_value());
+
+  // Streaming commits each batch as its own chunk: a newer chunk without `a`
+  // still holds the value from the older one.
+  ASSERT_TRUE(writer.beginRow(topic, 3'000'000'000).has_value());
+  writer.setNull(topic, 0);
+  writer.set(topic, 1, 30.0);
+  ASSERT_TRUE(writer.finishRow(topic).has_value());
+  ASSERT_FALSE(session.commitChunks(writer.flushAll()).empty());
+  const auto a_across_chunks = catalog.scalarValueAt(key_a, displayOf(3'500'000'000));
+  ASSERT_TRUE(a_across_chunks.has_value());
+  EXPECT_DOUBLE_EQ(*a_across_chunks, 10.0);
 }
 
 // String-typed fields surface in the catalog as scalar items (so the curve list
@@ -1211,7 +1440,6 @@ TEST(CatalogModelTest, StringFieldIsCatalogedAsScalarReadableButNotPlottable) {
   EXPECT_TRUE(catalog.curveDescriptor(numeric_key).has_value());
   EXPECT_FALSE(catalog.curveDescriptor(string_key).has_value());
 
-  // Key classification.
   EXPECT_TRUE(catalog.isScalarKey(numeric_key));
   EXPECT_TRUE(catalog.isScalarKey(string_key));
   EXPECT_FALSE(catalog.isStringKey(numeric_key));
@@ -1224,10 +1452,8 @@ TEST(CatalogModelTest, StringFieldIsCatalogedAsScalarReadableButNotPlottable) {
   auto mid = catalog.stringValueAt(string_key, displayOf(2'500'000'000));
   ASSERT_TRUE(mid.has_value());
   EXPECT_EQ(*mid, u"running"_s);
-  // Before the first sample → no string.
   EXPECT_FALSE(catalog.stringValueAt(string_key, displayOf(500'000'000)).has_value());
 
-  // Numeric and string reads stay on their own seams.
   auto numeric_value = catalog.scalarValueAt(numeric_key, displayOf(2'500'000'000));
   ASSERT_TRUE(numeric_value.has_value());
   EXPECT_DOUBLE_EQ(*numeric_value, 10.0);
@@ -1370,6 +1596,7 @@ TEST(CatalogModelTest, WholeNumberFloatIsDiscreteUntilAFractionalValue) {
   EXPECT_TRUE(catalog.curveDescriptor(key_by_field[u"mode"_s], PJ::SeriesCapability::kDiscrete).has_value());
   EXPECT_TRUE(catalog.curveDescriptor(key_by_field[u"mode"_s], PJ::SeriesCapability::kPlottable).has_value());
   EXPECT_FALSE(catalog.curveDescriptor(key_by_field[u"speed"_s], PJ::SeriesCapability::kDiscrete).has_value());
+  EXPECT_TRUE(catalog.curveDescriptor(key_by_field[u"speed"_s], PJ::SeriesCapability::kAny).has_value());
 
   QSignalSpy capability_changed(&catalog, &PJ::CatalogModel::itemsChanged);
   commit_rows({{2.5, 2.0}}, 2'000'000'000);
@@ -1420,10 +1647,9 @@ TEST(CatalogModelTest, AdvertisedTopicsAppearAsDataLessPlaceholders) {
 }
 
 TEST(CatalogModelTest, ScalarShapedPlaceholderIsScalarKeyButImageShapedIsNot) {
-  // M3-UI: the curve-list Value column reads isScalarKey to choose "-" (scalar,
-  // no sample yet) vs blank (non-scalar row) — a kNone-classified advertised
-  // placeholder must count as scalar so it shows "-" like a real empty scalar
-  // field, but an object-shaped placeholder (e.g. kImage) must not.
+  // The curve-list Value column reads isScalarKey to choose "-" (scalar, no sample yet) vs blank (non-scalar row): a
+  // kNone-classified advertised placeholder must count as scalar, but an object-shaped placeholder (e.g. kImage) must
+  // not.
   PJ::SessionManager session;
   PJ::CatalogModel catalog(&session);
   auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "live"});
@@ -1445,7 +1671,6 @@ TEST(CatalogModelTest, ScalarShapedPlaceholderIsScalarKeyButImageShapedIsNot) {
 
   EXPECT_TRUE(catalog.isScalarKey(scalar_key));
   EXPECT_FALSE(catalog.isScalarKey(image_key));
-  // No sample exists yet — scalarValueAt stays nullopt (the caller renders "-").
   EXPECT_FALSE(catalog.scalarValueAt(scalar_key, 0.0).has_value());
 }
 

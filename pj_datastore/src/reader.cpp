@@ -161,17 +161,13 @@ std::optional<TopicMetadata> DataReader::getMetadata(TopicId topic_id) const {
 }
 
 Expected<RangeCursor> DataReader::rangeQuery(const QueryRange& range) const {
-  // Take the read-lock BEFORE the lookup (a concurrent createTopic rehash could
-  // otherwise move storages mid-lookup) and MOVE it into the cursor, which holds
-  // it for its lazy-iteration lifetime.
+  // The cursor keeps the engine lock for its whole lazy iteration.
   auto lock = engine_.lockEngine();
   const TopicStorage* storage = engine_.getTopicStorage(range.topic_id);
   if (storage == nullptr) {
     return PJ::unexpected(fmt::format("Topic {} not found", range.topic_id));
   }
-  // Raise the lower bound to the topic's retention floor so a straddling chunk's
-  // logically-evicted rows are never returned (RangeCursor skips rows < t_min,
-  // and yields nothing when t_min > t_max — i.e. a window entirely below floor).
+  // Rows of a straddling chunk under the retention floor are evicted; t_min > t_max yields nothing.
   const Timestamp t_min = std::max(range.t_min, storage->retentionFloor());
   return RangeCursor(storage->sealedChunks(), t_min, range.t_max, std::move(lock));
 }
@@ -186,36 +182,13 @@ PJ::Expected<std::optional<MaterializedSample>> DataReader::latestAt(const Query
   if (!row.has_value()) {
     return std::optional<MaterializedSample>{};
   }
-  // Read the row's column values WHILE the lock is held so the raw TopicChunk*
-  // never escapes. QueryPoint carries no column index; we materialize every
-  // column of the row (column N -> values[N]; a scalar topic uses values[0]).
+  // Read under the lock so no TopicChunk* escapes.
   std::vector<double> values;
   values.reserve(row->chunk->columns.size());
   for (std::size_t col = 0; col < row->chunk->columns.size(); ++col) {
     values.push_back(row->chunk->readNumericAsDouble(col, row->row_index));
   }
   return std::optional<MaterializedSample>{MaterializedSample{row->timestamp, std::move(values)}};
-}
-
-PJ::Expected<std::optional<double>> DataReader::latestNumericAt(
-    const QueryPoint& point, std::size_t column_index) const {
-  auto lock = engine_.lockEngine();
-  const TopicStorage* storage = engine_.getTopicStorage(point.topic_id);
-  if (storage == nullptr) {
-    return PJ::unexpected(fmt::format("Topic {} not found", point.topic_id));
-  }
-  const std::optional<SampleRow> row = PJ::latestAt(storage->sealedChunks(), point.t, storage->retentionFloor());
-  if (!row.has_value()) {
-    return std::optional<double>{};
-  }
-  // Guard the column index (a chunk committed before a mid-stream column add has
-  // fewer columns) and null cells — readNumericAsDouble reads a null as 0.0, so
-  // an explicit isNull check is what lets the Value column show "-" rather than a
-  // fabricated "0.000" for a sparsely-populated field.
-  if (column_index >= row->chunk->columns.size() || row->chunk->isNull(column_index, row->row_index)) {
-    return std::optional<double>{};
-  }
-  return std::optional<double>{row->chunk->readNumericAsDouble(column_index, row->row_index)};
 }
 
 PJ::Expected<std::optional<StringSample>> DataReader::latestStringAt(
@@ -229,11 +202,8 @@ PJ::Expected<std::optional<StringSample>> DataReader::latestStringAt(
   if (!row.has_value()) {
     return std::optional<StringSample>{};
   }
-  // Guard the column index (chunks before a mid-stream column add have fewer
-  // columns) and the string-ness of the column (readString is UB on a numeric
-  // column); a null cell is a sample with no value. Copy the value out WHILE the
-  // lock is held, since readString views chunk-internal dictionary memory that
-  // must not escape.
+  // Chunks from before a mid-stream column add have fewer columns, and readString() on a numeric column is UB. The
+  // value is copied under the lock: readString() views chunk memory.
   if (column_index >= row->chunk->columns.size()) {
     return std::optional<StringSample>{};
   }

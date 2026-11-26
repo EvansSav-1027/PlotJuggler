@@ -24,7 +24,7 @@ import {
   gzip,
 } from 'node:zlib';
 
-import { CACHE_CONTROL, ISOLATION_HEADERS } from './wasm_http_contract.mjs';
+import { CACHE_CONTROL, ISOLATION_HEADERS, JSON_CONTENT_TYPE } from './wasm_http_contract.mjs';
 import { readVersion, representation, sha256 } from './wasm_manifest.mjs';
 
 const brotliCompressAsync = promisify(brotliCompress);
@@ -37,6 +37,9 @@ const REQUIRED_ARTIFACTS = [
   'plotjuggler4.wasm',
   'qtloader.js',
 ];
+// Packaged in the bundle when the build has it: the Python stdlib, fetched by the first Python use, not at startup
+// (pj_scripting/src/python_sandbox.cpp), so scripts/wasm_size_budget.mjs leaves it out.
+export const PYTHON_STDLIB = 'python_stdlib.zip';
 // The page icon of the entry page (Qt's template qtlogo.svg is not packaged).
 const LOGO = 'plotjuggler.svg';
 // Every build writes it (cmake/PjWasmNotices.cmake). Packaged beside the module, and again at the deployment root,
@@ -47,7 +50,7 @@ const NOTICES = 'THIRD_PARTY_NOTICES.txt';
 export const CONTENT_TYPES = new Map([
   ['.html', 'text/html; charset=utf-8'],
   ['.js', 'text/javascript; charset=utf-8'],
-  ['.json', 'application/json; charset=utf-8'],
+  ['.json', JSON_CONTENT_TYPE],
   ['.svg', 'image/svg+xml'],
   ['.txt', 'text/plain; charset=utf-8'],
   ['.wasm', 'application/wasm'],
@@ -64,6 +67,7 @@ export const CONTENT_TYPES = new Map([
   ['.png', 'image/png'],
   ['.stl', 'model/stl'],
   ['.xml', 'application/xml'],
+  ['.zip', 'application/zip'],
 ]);
 // Each preset path segment: portable on every static host and filesystem, and
 // never a dotfile (.git, .DS_Store, editor state) or a URL-significant name.
@@ -73,6 +77,8 @@ const PRESET_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 // The empty extension is the extensionless license/notice text of a preset package.
 export const COMPRESSIBLE_TYPES = new Set([
   '', '.csv', '.dae', '.gltf', '.html', '.js', '.json', '.md', '.obj', '.stl', '.svg', '.txt', '.wasm', '.xml',
+  // The Python stdlib zip stores its members uncompressed (cmake/wasm_python/stdlib_zip.py).
+  '.zip',
 ]);
 const MINIMUM_COMPRESSED_SIZE = 1024;
 const BROTLI_QUALITY = 9;
@@ -232,9 +238,7 @@ async function presetFiles(presetsRoot, prefix = '') {
 }
 
 // Refuses a preset tree whose index.json the browser could not use: absent,
-// malformed, without a presets array, with an entry the browser's catalog parser
-// refuses (which drops every entry), or naming a relative layout or thumbnail
-// the tree does not deploy. Absolute http(s) references live elsewhere and pass.
+// malformed, or failing validatePresetCatalog against the tree's `files`.
 async function validatePresetIndex(presetsRoot, files) {
   let index;
   try {
@@ -242,6 +246,16 @@ async function validatePresetIndex(presetsRoot, files) {
   } catch (error) {
     throw new Error(`The preset tree needs a readable JSON index.json: ${error.message}`, { cause: error });
   }
+  validatePresetCatalog(index, files);
+}
+
+// Refuses a parsed preset index the browser could not use: without a presets
+// array, with an entry the browser's catalog parser refuses (which drops every
+// entry), or naming a relative layout or thumbnail that is not one of `files`
+// (the paths deployed beside it, under presets/). Absolute http(s) references
+// live elsewhere and pass, and so does an empty thumbnail, which means none.
+// packaging/web/upload_preset_index.mjs applies it with no files beside it.
+export function validatePresetCatalog(index, files) {
   if (!Array.isArray(index?.presets)) {
     throw new Error('The preset index.json has no presets array');
   }
@@ -255,6 +269,9 @@ async function validatePresetIndex(presetsRoot, files) {
     const fields = ['id', 'title', 'description', 'layout', 'thumbnail'];
     if (fields.some(field => entry[field] !== undefined && entry[field] !== null && typeof entry[field] !== 'string')) {
       throw new Error(`${label} has a field that is not a string`);
+    }
+    if (entry.listed !== undefined && entry.listed !== null && typeof entry.listed !== 'boolean') {
+      throw new Error(`${label} has a listed that is not true or false`);
     }
     if (!entry.id) {
       throw new Error(`${label} has no id`);
@@ -270,7 +287,7 @@ async function validatePresetIndex(presetsRoot, files) {
   const deployed = new Set(files);
   const base = new URL('https://presets.invalid/presets/index.json');
   for (const entry of index.presets) {
-    for (const reference of [entry?.layout, entry?.thumbnail].filter(value => value != null)) {
+    for (const reference of [entry?.layout, entry?.thumbnail].filter(value => value != null && value !== '')) {
       const target = typeof reference === 'string' && URL.canParse(reference, base)
         ? new URL(reference, base) : undefined;
       if (target && target.origin !== base.origin && ['http:', 'https:'].includes(target.protocol)) {
@@ -279,7 +296,8 @@ async function validatePresetIndex(presetsRoot, files) {
       const relative = target?.origin === base.origin && target.pathname.startsWith('/presets/')
         ? decodeURIComponent(target.pathname.slice('/presets/'.length)) : undefined;
       if (!deployed.has(relative)) {
-        throw new Error(`The preset index.json names a file the tree does not deploy: ${JSON.stringify(reference)}`);
+        throw new Error(
+          `The preset index.json names a file that is not deployed beside it: ${JSON.stringify(reference)}`);
       }
     }
   }
@@ -330,6 +348,17 @@ async function validateSource(sourceRoot) {
   if (wasm.length < 8 || !wasm.subarray(0, 4).equals(Buffer.from([0x00, 0x61, 0x73, 0x6d]))) {
     throw new Error('plotjuggler4.wasm does not have a WebAssembly magic header');
   }
+  // The stdlib ships exactly with a module that downloads it: a missing one fails the first Python use, a stray one
+  // (left by an earlier build with Python) would ship unused.
+  const downloadsStdlib = javascript.includes(PYTHON_STDLIB);
+  const hasStdlib = await access(path.join(sourceRoot, PYTHON_STDLIB)).then(() => true, () => false);
+  if (downloadsStdlib && !hasStdlib) {
+    throw new Error(`plotjuggler4.js downloads ${PYTHON_STDLIB}, which the build does not have`);
+  }
+  if (hasStdlib && !downloadsStdlib) {
+    throw new Error(`${PYTHON_STDLIB} is left over from another build: plotjuggler4.js does not download it`);
+  }
+  return hasStdlib;
 }
 
 async function validateReplaceableOutput(outputRoot) {
@@ -378,7 +407,7 @@ export async function packageWasm(options) {
     throw new Error('The source, presets and output directories must be distinct, non-nested paths');
   }
   await validateReplaceableOutput(outputRoot);
-  await validateSource(sourceRoot);
+  const hasPythonStdlib = await validateSource(sourceRoot);
   if (presetsRoot && !(await stat(presetsRoot)).isDirectory()) {
     throw new Error(`The preset tree is not a directory: ${presetsRoot}`);
   }
@@ -388,7 +417,7 @@ export async function packageWasm(options) {
   }
 
   const sourceAssets = await Promise.all([
-    ...[...REQUIRED_ARTIFACTS, NOTICES].map(async fileName => ({
+    ...[...REQUIRED_ARTIFACTS, NOTICES, ...(hasPythonStdlib ? [PYTHON_STDLIB] : [])].map(async fileName => ({
       fileName,
       contents: await readFile(path.join(sourceRoot, fileName)),
     })),

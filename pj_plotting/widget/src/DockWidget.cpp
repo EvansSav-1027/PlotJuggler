@@ -38,6 +38,7 @@
 #include "pj_runtime/CatalogModel.h"
 #include "pj_widgets/CurveTreeView.h"
 #include "pj_widgets/FrameworkTokens.h"
+#include "pj_widgets/OwnedMenu.h"
 #include "pj_widgets/SvgUtil.h"
 #include "pj_widgets/VisualizationPlaceholderWidget.h"
 using namespace Qt::StringLiterals;
@@ -74,11 +75,15 @@ bool objectElementSeedsWidget(const QDomElement& element) {
   return !element.firstChildElement(u"layer"_s).isNull() || !element.firstChildElement(u"config_topic"_s).isNull();
 }
 
-bool isPanelOnlyItem(const CatalogItem& item) {
-  const auto* object = asObjectTopic(item);
-  const auto* advertised = asAdvertisedTopic(item);
-  return (object != nullptr && isPanelOnlyObjectType(object->object_type)) ||
-         (advertised != nullptr && isPanelOnlyObjectType(advertised->classification));
+/// The object type of a stored or advertised object topic, kNone for anything else.
+sdk::BuiltinObjectType objectTypeOfItem(const CatalogItem& item) {
+  if (const auto* object = asObjectTopic(item)) {
+    return object->object_type;
+  }
+  if (const auto* advertised = asAdvertisedTopic(item)) {
+    return advertised->classification;
+  }
+  return sdk::BuiltinObjectType::kNone;
 }
 
 }  // namespace
@@ -102,6 +107,7 @@ DockWidget::DockWidget(
   toolbar_->label()->setText("...");
   qobject_cast<QBoxLayout*>(layout())->insertWidget(0, toolbar_);
 
+  connect(toolbar_, &DockToolbar::titleChanged, this, &DockWidget::undoableChange);
   connect(toolbar_->buttonSplitHorizontal(), &QPushButton::clicked, this, [this]() { splitHorizontal(); });
   connect(toolbar_->buttonSplitVertical(), &QPushButton::clicked, this, [this]() { splitVertical(); });
 
@@ -111,7 +117,6 @@ DockWidget::DockWidget(
       return;
     }
     parent_docker->toggleFullscreen(this);
-    toolbar_->setFullscreen(parent_docker->fullscreenDock() == this);
   };
   connect(toolbar_->buttonFullscreen(), &QPushButton::clicked, this, fullscreen_action);
 
@@ -131,7 +136,10 @@ DockWidget::DockWidget(
   }
 }
 
-DockWidget::~DockWidget() = default;
+DockWidget::~DockWidget() {
+  // A widget or a whole tab going away is layout activity for the idle easter egg.
+  noteLayoutActivity();
+}
 
 void DockWidget::setDataServices(SessionManager* session, CatalogModel* catalog) {
   session_ = session;
@@ -195,8 +203,8 @@ void DockWidget::setObjectWidget(IDataWidget* widget) {
     return;
   }
   installObjectContextMenuFilter(content_widget_);
-  // ForceNoScrollArea: object widgets manage their own viewport — wrapping
-  // them in ADS' QScrollArea adds a visible frame. Mirrors the drop path.
+  // ForceNoScrollArea: object widgets manage their own viewport, and ADS' QScrollArea would add a visible frame (as the
+  // drop path).
   setWidget(content_widget_, ads::CDockWidget::ForceNoScrollArea);
 }
 
@@ -242,6 +250,14 @@ void DockWidget::setPlaceholderWidget() {
       placeholder_widget_, &VisualizationPlaceholderWidget::contextMenuAboutToShow, this,
       &DockWidget::updatePlaceholderPasteAction);
   updatePlaceholderPasteAction();
+  placeholder_widget_->setCustomWidgetsAvailable(custom_widget_support_.available);
+}
+
+void DockWidget::setCustomWidgetSupport(CustomWidgetSupport support) {
+  custom_widget_support_ = std::move(support);
+  if (placeholder_widget_ != nullptr) {
+    placeholder_widget_->setCustomWidgetsAvailable(custom_widget_support_.available);
+  }
 }
 
 void DockWidget::onVisualizationRequested(VisualizationKind kind) {
@@ -252,20 +268,20 @@ void DockWidget::onVisualizationRequested(VisualizationKind kind) {
     focusSelf();
     return;
   }
-  // Scene families: the shell owns the family→kind mapping and dock construction.
-  // It builds the empty widget and hands it back via adoptObjectWidget().
+  // Scene families: the shell owns the family -> kind mapping and dock construction; it builds the empty widget and
+  // hands it back through adoptObjectWidget().
   emit objectFamilyRequested(this, kind);
 }
 
 void DockWidget::adoptObjectWidget(IDataWidget* widget) {
   if (widget == nullptr) {
-    // Build failed (unknown kind / factory refusal): keep a usable placeholder.
+    // Build failed (unknown kind, factory refusal): keep a usable placeholder.
     setPlaceholderWidget();
     return;
   }
   setObjectWidget(widget);
-  // setObjectWidget cleared the gate via clearCurrentContent; arm it now so the
-  // first topic dropped into this empty widget seeds streaming playback.
+  // setObjectWidget cleared the gate through clearCurrentContent: arm it so the first topic dropped into this empty
+  // widget seeds streaming playback.
   object_widget_awaiting_first_topic_ = true;
   setName(u"..."_s);
   emit undoableChange();
@@ -321,10 +337,9 @@ bool DockWidget::eventFilter(QObject* watched, QEvent* event) {
           break;  // pass-through: the re-sent event must reach the widget's own handler
         }
         auto* context_event = static_cast<QContextMenuEvent*>(event);
-        // First shot goes to the content widget's own contextMenuEvent (e.g.
-        // the 3D view's frame-gizmo menu). Only an IGNORED event falls back to
-        // the dock's standard menu — same fall-through contract as plain Qt
-        // parent-chain propagation, which this filter would otherwise defeat.
+        // The first shot goes to the content widget's own contextMenuEvent (the 3D view's frame-gizmo menu); only an
+        // ignored event falls back to the dock's standard menu, the fall-through contract of plain Qt parent-chain
+        // propagation, which this filter would otherwise defeat.
         {
           QScopedValueRollback<bool> guard(forwarding_context_menu_, true);
           QContextMenuEvent forwarded(
@@ -340,11 +355,9 @@ bool DockWidget::eventFilter(QObject* watched, QEvent* event) {
         event->accept();
         return true;
       }
-      // Catalog drops on the *live* content widget — once the placeholder
-      // is gone, this filter is the only thing that hears the drop. Used by
-      // multi-topic widgets (Scene3D) to absorb additional topics; a topic the
-      // committed widget can't host is rejected by onCatalogItemsDropped (no
-      // family-switching replacement — that only happens from the placeholder).
+      // Catalog drops on the live content widget: once the placeholder is gone this filter is the only thing that hears
+      // the drop. Multi-topic widgets (Scene3D) use it to absorb more topics; a topic the committed widget cannot host
+      // is rejected by onCatalogItemsDropped (no family-switching replacement: that happens only from the placeholder).
       case QEvent::DragEnter:
       case QEvent::DragMove: {
         auto* drag = static_cast<QDropEvent*>(event);
@@ -413,9 +426,13 @@ DockWidget* DockWidget::splitInto(ads::DockWidgetArea dock_area, PlotWidget* plo
   if (!parent_docker) {
     return nullptr;
   }
+  // The context-menu splits stay reachable on the maximized dock (the toolbar's are hidden); inserting into the folded
+  // tree would defeat the fullscreen snapshot, so leave fullscreen first.
+  parent_docker->exitFullscreen();
   auto* new_widget = new DockWidget(plot, session_, catalog_, parent_docker, nullptr, false);
   new_widget->setObjectWidgetFactory(object_widget_factory_);
   new_widget->setConfigurationPanelVisibilityQuery(configuration_panel_visible_);
+  new_widget->setCustomWidgetSupport(custom_widget_support_);
   auto* area = parent_docker->addDockWidget(dock_area, new_widget, dockAreaWidget());
   area->setAllowedAreas(ads::OuterDockAreas);
 
@@ -451,12 +468,18 @@ void DockWidget::onCatalogItemsDropped(const QStringList& dropped_keys) {
   }
 
   // Before anything else: the first key picks the branch below, and an object row sorts ahead of scalars.
+  // A Custom-Widget-only type is kept only for a mounted widget, which may be a Custom Widget that reads it.
+  const auto& shows_only = custom_widget_support_.shows_only;
   QStringList keys;
   QStringList left_out;
+  QStringList custom_only;
   for (const QString& key : dropped_keys) {
     const auto item = catalog_->itemDescriptor(key);
-    if (item.has_value() && isPanelOnlyItem(*item)) {
+    const sdk::BuiltinObjectType type = item.has_value() ? objectTypeOfItem(*item) : sdk::BuiltinObjectType::kNone;
+    if (isPanelOnlyObjectType(type)) {
       left_out.append(item->topic_name);
+    } else if (object_widget_ == nullptr && shows_only && shows_only(type)) {
+      custom_only.append(item->topic_name);
     } else {
       keys.append(key);
     }
@@ -468,6 +491,12 @@ void DockWidget::onCatalogItemsDropped(const QStringList& dropped_keys) {
     emit topicRefused(
         tr("%1 topics cannot be displayed on their own, but a plugin panel can read them.").arg(left_out.size()));
   }
+  if (custom_only.size() == 1) {
+    emit topicRefused(tr("This topic is shown by a Custom Widget. Create one in this panel first."));
+  } else if (!custom_only.isEmpty()) {
+    emit topicRefused(
+        tr("%1 topics are shown by a Custom Widget. Create one in this panel first.").arg(custom_only.size()));
+  }
   if (keys.empty()) {
     return;
   }
@@ -478,10 +507,9 @@ void DockWidget::onCatalogItemsDropped(const QStringList& dropped_keys) {
   }
 
   if (const auto* advertised = asAdvertisedTopic(*first_item); advertised != nullptr) {
-    // Multi-select drop: the FIRST placeholder decides the branch (scalar vs
-    // object); every other advertised key of the same shape rides along, so a
-    // two-cloud drop pends both. Keys of the other shape are dropped silently
-    // (exactly like non-plottables in a mixed real-topic drop).
+    // Multi-select drop: the first placeholder decides the branch (scalar or object); every other advertised key of the
+    // same shape rides along, so a two-cloud drop pends both. Keys of the other shape are dropped silently, as
+    // non-plottables in a mixed real-topic drop.
     const auto for_each_advertised = [&](sdk::BuiltinObjectType wanted, auto&& emit_drop) {
       for (const QString& key : keys) {
         const auto item = catalog_->itemDescriptor(key);
@@ -500,9 +528,8 @@ void DockWidget::onCatalogItemsDropped(const QStringList& dropped_keys) {
     };
 
     if (advertised->classification == sdk::BuiltinObjectType::kNone) {
-      // Scalar-shaped placeholder: materialize the plot lazily (mirrors the real
-      // scalar branch below) so the pending bind has somewhere to land, but let
-      // the shell register demand instead of fabricating a curve.
+      // Scalar-shaped placeholder: materialize the plot lazily (as the real scalar branch below) so the pending bind
+      // has somewhere to land, but let the shell register demand instead of fabricating a curve.
       if (object_widget_ != nullptr) {
         return;  // an object dock hosts no scalar curves
       }
@@ -516,28 +543,27 @@ void DockWidget::onCatalogItemsDropped(const QStringList& dropped_keys) {
       focusSelf();
       return;
     }
-    // Object-shaped placeholder: a committed plot dock hosts no object topics —
-    // reject rather than replacing the plot (and its curves) with an object view.
+    // Object-shaped placeholder: a committed plot dock hosts no object topics; reject rather than replace the plot
+    // (and its curves) with an object view.
     if (plot_widget_ != nullptr) {
       return;
     }
     if (object_widget_ == nullptr) {
-      // Empty tile: materialize a dock of the family the shell resolves from the
-      // classification. The seed carries a null storage id — the topic has no
-      // data (and thus no ObjectTopicId) until the demand registered by the drop
-      // below starts the subscription; the pending drop then completes against
-      // the real id (TopicDemandController::handleSceneDockPlaceholderDrop).
+      // Empty tile: materialize a dock of the family the shell resolves from the classification. The seed carries a
+      // null storage id (the topic has no data, so no ObjectTopicId, until the demand registered below starts the
+      // subscription); the pending drop then completes against the real id
+      // (TopicDemandController::handleSceneDockPlaceholderDrop).
       if (!object_widget_factory_) {
         return;
       }
       const ObjectDropSeed seed{ObjectTopicId{}, advertised->classification, first_item->topic_name};
       IDataWidget* widget = object_widget_factory_(QString(), &seed, this);
       if (widget == nullptr) {
-        return;  // family not hostable — keep the placeholder affordance
+        return;  // no dock family hosts this classification: keep the placeholder
       }
       setObjectWidget(widget);
-      // Arm the gate so the first real topic (a later drop into this widget)
-      // seeds streaming playback, mirroring the click-create path.
+      // Arm the gate so the first real topic (a later drop into this widget) seeds streaming playback, as the
+      // click-create path.
       object_widget_awaiting_first_topic_ = true;
       setName(u"..."_s);
       emit undoableChange();
@@ -550,9 +576,8 @@ void DockWidget::onCatalogItemsDropped(const QStringList& dropped_keys) {
   }
 
   if (isScalarField(*first_item)) {
-    // A committed object dock hosts no plot curves — but a widget that consumes
-    // scalar series itself (the state-transitions strip) may absorb the keys in
-    // place. Refused ⇒ reject the drop rather than replacing the object view.
+    // A committed object dock hosts no plot curves, but a widget that consumes scalar series itself (the
+    // state-transitions strip) may absorb the keys in place; if refused, reject the drop rather than replace the view.
     if (object_widget_ != nullptr) {
       if (object_widget_->tryAcceptSeriesKeys(keys)) {
         emit undoableChange();
@@ -560,10 +585,9 @@ void DockWidget::onCatalogItemsDropped(const QStringList& dropped_keys) {
       }
       return;
     }
-    // Materialize the plot lazily — only once a dropped key is actually a
-    // plottable curve. String fields are catalog scalars (isScalarField) but have
-    // no curveDescriptor, so a drop of only string fields must NOT convert a
-    // placeholder into a blank, curveless plot.
+    // Materialize the plot lazily, only once a dropped key is a plottable curve. String fields are catalog scalars
+    // (isScalarField) with no curveDescriptor, so a drop of only string fields must not turn a placeholder into a
+    // blank, curveless plot.
     PlotWidget* plot = nullptr;
     const bool was_empty = plotWidget() == nullptr || plotWidget()->isEmpty();
     bool changed = false;
@@ -577,10 +601,9 @@ void DockWidget::onCatalogItemsDropped(const QStringList& dropped_keys) {
       changed = plot->addCurve(key) != nullptr || changed;
     }
     if (plot == nullptr) {
-      // Nothing plottable — but a discrete-only drop on an empty tile
-      // materializes the state-transitions strip instead of dying. (Plottable
-      // wins the tie: an integer/bool key creates a plot above and never
-      // reaches here; only strings are discrete-and-not-plottable today.)
+      // Nothing plottable, but a discrete-only drop on an empty tile materializes the state-transitions strip.
+      // (Plottable wins the tie: an integer or bool key creates a plot above; only strings are discrete and not
+      // plottable.)
       maybeCreateStateTransitionsFromDrop(keys);
       return;
     }
@@ -598,18 +621,15 @@ void DockWidget::onCatalogItemsDropped(const QStringList& dropped_keys) {
     return;
   }
 
-  // Helper: build the title string the factory expects from a catalog item.
-  // With a single dataset loaded the dataset name is redundant noise in the
-  // object lists, so show just the topic; with multiple datasets keep the
-  // "dataset/topic" qualifier to disambiguate.
+  // The title string the factory expects for a catalog item: just the topic with a single dataset loaded (the dataset
+  // name is noise), "dataset/topic" with several.
   const bool single_dataset = (catalog_ != nullptr) && catalog_->datasets().size() <= 1;
   const auto title_for = [single_dataset](const auto& descriptor) {
     return (single_dataset || descriptor.dataset_name.isEmpty())
                ? descriptor.topic_name
                : u"%1/%2"_s.arg(descriptor.dataset_name, descriptor.topic_name);
   };
-  // Helper: walk all keys and offer each one to the given widget via
-  // IDataWidget::tryAcceptObjectTopic. Returns the count accepted.
+  // Offers each key to the widget through IDataWidget::tryAcceptObjectTopic; returns the count accepted.
   const auto offer_keys_to = [&](IDataWidget* target, int start_index) {
     int accepted = 0;
     for (int i = start_index; i < keys.size(); ++i) {
@@ -628,16 +648,24 @@ void DockWidget::onCatalogItemsDropped(const QStringList& dropped_keys) {
     return accepted;
   };
 
-  // First: if a widget is already mounted, try to add the dropped topics
-  // *into* it (Scene3DDockWidget consumes pointcloud / TF this way). On
-  // success we don't replace the widget — only the topic list grows.
+  // If a widget is already mounted, try to add the dropped topics into it (Scene3DDockWidget consumes pointcloud and
+  // TF this way); on success the widget is kept and only its topic list grows.
   if (object_widget_ != nullptr) {
-    if (offer_keys_to(object_widget_, /*start_index=*/0) > 0) {
-      if (object_widget_awaiting_first_topic_) {
-        // First topic into an empty click-created dock: seed streaming playback,
-        // which the placeholder→drop path otherwise does at creation. Fires once
-        // per dock. The dock keeps its "..." name — dragging a topic does NOT
-        // rename the dock (the user renames it explicitly via the title if wanted).
+    const bool objects_taken = offer_keys_to(object_widget_, /*start_index=*/0) > 0;
+    // The scalar fields of the same drop go to the widget too (a Custom Widget with number inputs takes them), as a
+    // drop led by a scalar offers them all.
+    QStringList scalar_keys;
+    for (const QString& key : keys) {
+      if (const auto item = catalog_->itemDescriptor(key); item.has_value() && isScalarField(*item)) {
+        scalar_keys.append(key);
+      }
+    }
+    const bool scalars_taken = !scalar_keys.empty() && object_widget_->tryAcceptSeriesKeys(scalar_keys);
+    if (objects_taken || scalars_taken) {
+      if (objects_taken && object_widget_awaiting_first_topic_) {
+        // First topic into an empty click-created dock: seed streaming playback (the placeholder-to-drop path does it
+        // at creation); fires once per dock. The dock keeps its "..." name: a drop does not rename it, the user does
+        // through the title.
         object_widget_awaiting_first_topic_ = false;
         emit firstObjectTopicAdded();
       }
@@ -645,44 +673,44 @@ void DockWidget::onCatalogItemsDropped(const QStringList& dropped_keys) {
       focusSelf();
       return;
     }
-    // A committed object dock refused the dropped topic(s) — a different family
-    // (e.g. an image dropped on a 3D view, or a pointcloud on a 2D view). Reject
-    // the drop rather than silently replacing the dock with another family; the
-    // user switches families via Clear or the placeholder icons, not by drop.
+    // A committed object dock refused the dropped topic(s), a different family (an image on a 3D view, a pointcloud on
+    // a 2D view): reject rather than silently replace the dock; the user switches families through Clear or the
+    // placeholder icons, not by drop.
     return;
   }
 
-  // A committed plot dock hosts no object topics — reject rather than replacing
-  // the plot (and its curves) with an object view.
+  // A committed plot dock hosts no object topics: reject rather than replace the plot (and its curves) with an object
+  // view.
   if (plot_widget_ != nullptr) {
     return;
   }
 
-  // Placeholder state only: the factory classifies the object type and builds the
-  // matching dock. A null return ("I can't render this") reverts to the
-  // placeholder so the user sees an explicit "not supported" affordance.
+  // Placeholder state only: the factory classifies the object type and builds the matching dock; a null return ("can't
+  // render this") reverts to the placeholder, an explicit "not supported" affordance.
   const QString title = title_for(*first_item);
   clearCurrentContent(true);
-  // Drop path: empty kind + a seed for the first topic. The factory classifies
-  // the object type, constructs the matching dock, and populates the seed.
+  // Drop path: empty kind and a seed for the first topic; the factory classifies the type, constructs the dock and
+  // populates the seed.
   const ObjectDropSeed seed{object_payload->object_topic_id, object_payload->object_type, title};
   object_widget_ = object_widget_factory_(QString(), &seed, this);
   content_widget_ = object_widget_ != nullptr ? object_widget_->widget() : nullptr;
   if (content_widget_ == nullptr) {
     setPlaceholderWidget();
+    // The first topic got no view (the factory said why: no dock family shows its type, or this topic cannot be
+    // shown). The rest of the drop still lands: a log row selected with scalar fields must not lose them. Only that
+    // topic is left out, since another topic of its type may well be shown.
+    if (keys.size() > 1) {
+      onCatalogItemsDropped(keys.mid(1));
+    }
     return;
   }
   installObjectContextMenuFilter(content_widget_);
-  // ForceNoScrollArea: object widgets (Scene3DDockWidget, Scene2DDockWidget,
-  // …) manage their own viewport — wrapping them in ADS' QScrollArea adds a
-  // visible frame around the content. The object widget is responsible for
-  // its own sizing/scrolling if any is needed.
+  // ForceNoScrollArea: object widgets (Scene3DDockWidget, Scene2DDockWidget, ...) manage their own viewport, and ADS'
+  // QScrollArea would add a visible frame; the widget handles its own sizing and scrolling.
   setWidget(content_widget_, ads::CDockWidget::ForceNoScrollArea);
-  // The dock keeps its default "..." name — dragging a topic does NOT rename it.
-  // Multi-select drop: hand the remaining keys to the new widget so it
-  // can absorb the rest of the selection (Scene3D / future multi-topic
-  // viewers benefit; single-topic widgets refuse and we drop them
-  // silently — the user still got their first topic shown).
+  // The dock keeps its default "..." name: a drop does not rename it. Multi-select drop: hand the remaining keys to the
+  // new widget so it can absorb the rest (Scene3D and other multi-topic viewers do; single-topic widgets refuse and the
+  // keys are dropped silently, the first topic being shown).
   if (object_widget_ != nullptr && keys.size() > 1) {
     offer_keys_to(object_widget_, /*start_index=*/1);
   }
@@ -691,9 +719,8 @@ void DockWidget::onCatalogItemsDropped(const QStringList& dropped_keys) {
 }
 
 void DockWidget::maybeCreateStateTransitionsFromDrop(const QStringList& keys) {
-  // Only from an empty tile, and only when the drop actually carries a discrete
-  // series; the factory owns construction + wiring (the shell's one construct
-  // site), seeded through the same tryAcceptSeriesKeys hook a mounted strip uses.
+  // Only from an empty tile, and only when the drop carries a discrete series; the factory owns construction and wiring
+  // (the shell's one construct site), seeded through the tryAcceptSeriesKeys hook a mounted strip uses.
   if (plot_widget_ != nullptr || object_widget_ != nullptr || !object_widget_factory_ || catalog_ == nullptr) {
     return;
   }
@@ -714,9 +741,8 @@ void DockWidget::maybeCreateStateTransitionsFromDrop(const QStringList& keys) {
 }
 
 void DockWidget::onCatalogItemsXyRequested(const QStringList& keys) {
-  // A right-drag of two curves onto an empty placeholder: build a plot and create
-  // an XY (scatter) curve from the pair — the same gesture the live plot canvas
-  // handles, here routed through the placeholder.
+  // A right-drag of two curves onto an empty placeholder: build a plot and an XY (scatter) curve from the pair, the
+  // gesture the live plot canvas handles, routed through the placeholder.
   if (catalog_ == nullptr || keys.size() != 2 || object_widget_ != nullptr) {
     return;
   }
@@ -745,8 +771,8 @@ void DockWidget::onCatalogItemsXyRequested(const QStringList& keys) {
           guard->focusSelf();
           return;
         }
-        // Do not schedule the just-cancelled plot for deletion while its dialog's
-        // finished handler is still on that plot's stack.
+        // Do not schedule the just-cancelled plot for deletion while its dialog's finished handler is still on that
+        // plot's stack.
         QTimer::singleShot(0, guard, [guard, pending_plot, created_plot]() {
           if (created_plot && !guard.isNull() && !pending_plot.isNull() && guard->plot_widget_ == pending_plot.data() &&
               pending_plot->curveList().empty()) {
@@ -807,19 +833,59 @@ void DockWidget::pasteObjectWidgetFromClipboard() {
   if (!widget_clipboard::parse(doc, objectWidgetClipboardTag())) {
     return;
   }
-  const QDomElement element = doc.documentElement();
-  const bool seeds_empty_click_created_widget =
-      object_widget_awaiting_first_topic_ &&
-      (!element.firstChildElement(u"layer"_s).isNull() || !element.firstChildElement(u"config_topic"_s).isNull());
-  if (object_widget_->xmlLoadState(element)) {
-    object_widget_->finishRestore();
-    if (seeds_empty_click_created_widget) {
-      object_widget_awaiting_first_topic_ = false;
-      emit firstObjectTopicAdded();
-    }
+  if (applyState(doc.documentElement())) {
     emit undoableChange();
     focusSelf();
   }
+}
+
+bool DockWidget::applyState(const QDomElement& element) {
+  const bool seeds_empty_click_created_widget =
+      object_widget_ != nullptr && object_widget_awaiting_first_topic_ && objectElementSeedsWidget(element);
+  if (!xmlLoadState(element)) {
+    return false;
+  }
+  finishRestore();
+  if (seeds_empty_click_created_widget) {
+    object_widget_awaiting_first_topic_ = false;
+    emit firstObjectTopicAdded();
+  }
+  return true;
+}
+
+QDomElement DockWidget::xmlSaveState(QDomDocument& doc) const {
+  if (plot_widget_ != nullptr) {
+    return plot_widget_->xmlSaveState(doc);
+  }
+  return object_widget_ != nullptr ? object_widget_->xmlSaveState(doc) : QDomElement();
+}
+
+bool DockWidget::xmlValidateState(const QDomElement& element) const {
+  if (plot_widget_ != nullptr) {
+    return plot_widget_->xmlValidateState(element);
+  }
+  return object_widget_ != nullptr && object_widget_->xmlValidateState(element);
+}
+
+bool DockWidget::xmlLoadState(const QDomElement& element) {
+  if (plot_widget_ != nullptr) {
+    return plot_widget_->xmlLoadState(element);
+  }
+  return object_widget_ != nullptr && object_widget_->xmlLoadState(element);
+}
+
+void DockWidget::finishRestore() {
+  if (object_widget_ != nullptr) {
+    object_widget_->finishRestore();
+  }
+}
+
+QStringList DockWidget::unresolvedRestores() const {
+  return object_widget_ != nullptr ? object_widget_->unresolvedRestores() : QStringList();
+}
+
+QString DockWidget::takeRefusalReason() {
+  return object_widget_ != nullptr ? object_widget_->takeRefusalReason() : QString();
 }
 
 bool DockWidget::canPasteObjectWidgetFromClipboard() const {
@@ -917,11 +983,9 @@ void DockWidget::installObjectContextMenuFilter(QWidget* root) {
     return;
   }
   root->installEventFilter(this);
-  // Enable drop-target status on the root content widget so subsequent
-  // catalog drags surface DragEnter/Drop events here (eventFilter then
-  // routes them to onCatalogItemsDropped). Children typically refuse drops
-  // and Qt walks up the parent chain to find this accepting root, so we
-  // don't need to flip every descendant — only the root.
+  // Enable drop-target status on the root content widget so later catalog drags surface DragEnter and Drop here
+  // (eventFilter routes them to onCatalogItemsDropped). Children typically refuse drops and Qt walks up the parent
+  // chain to this accepting root, so only the root needs it.
   root->setAcceptDrops(true);
   const auto children = root->findChildren<QWidget*>();
   for (auto* child : children) {
@@ -946,47 +1010,34 @@ void DockWidget::setConfigurationPanelVisibilityQuery(std::function<bool()> quer
 
 void DockWidget::showObjectContextMenu(const QPoint& global_pos) {
   const QString theme = currentTheme();
-#ifdef PJ_TARGET_WASM
-  // QMenu::exec() needs a nested event loop, which the Asyncify-free browser
-  // build cannot enter. Retain the popup until it closes; action wiring stays
-  // identical to the desktop menu below.
-  auto* wasm_menu = new QMenu(this);
-  wasm_menu->setAttribute(Qt::WA_DeleteOnClose);
-  QMenu& menu = *wasm_menu;
-#else
-  QMenu menu(this);
-#endif
-  menu.setObjectName(u"PJMenu"_s);
-  menu.setProperty("categorySeparators", true);
+  auto* menu = new QMenu(this);
+  menu->setObjectName(u"PJMenu"_s);
+  menu->setProperty("categorySeparators", true);
   const bool settings_open = configuration_panel_visible_ && configuration_panel_visible_();
-  menu.addAction(settings_open ? tr("Close Settings") : tr("Open Settings"), this, [this]() {
+  menu->addAction(settings_open ? tr("Close Settings") : tr("Open Settings"), this, [this]() {
     focusSelf();
     emit settingsPanelToggleRequested(this);
   });
-  addActionCategorySeparator(menu);
-  QAction* copy_action = menu.addAction(
+  addActionCategorySeparator(*menu);
+  QAction* copy_action = menu->addAction(
       QIcon(loadSvg(":/resources/svg/copy.svg", theme)), tr("Copy"), this, [this]() { copyObjectWidgetToClipboard(); });
   copy_action->setEnabled(!objectWidgetClipboardTag().isEmpty());
-  QAction* paste_action = menu.addAction(
+  QAction* paste_action = menu->addAction(
       QIcon(loadSvg(":/resources/svg/paste.svg", theme)), tr("Paste"), this,
       [this]() { pasteObjectWidgetFromClipboard(); });
   paste_action->setEnabled(canPasteObjectWidgetFromClipboard());
-  addActionCategorySeparator(menu);
+  addActionCategorySeparator(*menu);
 
-  menu.addAction(QIcon(loadSvg(":/resources/svg/add_column.svg", theme)), tr("Split Horizontally"), this, [this]() {
+  menu->addAction(QIcon(loadSvg(":/resources/svg/add_column.svg", theme)), tr("Split Horizontally"), this, [this]() {
     splitHorizontal();
   });
-  menu.addAction(QIcon(loadSvg(":/resources/svg/add_row.svg", theme)), tr("Split Vertically"), this, [this]() {
+  menu->addAction(QIcon(loadSvg(":/resources/svg/add_row.svg", theme)), tr("Split Vertically"), this, [this]() {
     splitVertical();
   });
-  addActionCategorySeparator(menu);
-  menu.addAction(
+  addActionCategorySeparator(*menu);
+  menu->addAction(
       QIcon(loadSvg(":/resources/svg/clear.svg", theme)), tr("Clear"), this, [this]() { clearToPlaceholder(); });
-#ifdef PJ_TARGET_WASM
-  menu.popup(global_pos);
-#else
-  menu.exec(global_pos);
-#endif
+  showOwnedMenu(menu, global_pos);
 }
 
 }  // namespace PJ

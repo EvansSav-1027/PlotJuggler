@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "pj_base/types.hpp"
@@ -16,7 +17,6 @@
 namespace PJ {
 namespace {
 
-// Helper: build a test chunk with sequential timestamps.
 TopicChunk makeTestChunk(Timestamp t_start, uint32_t num_rows, Timestamp step) {
   std::vector<ColumnDescriptor> cols = {{0, PrimitiveType::kFloat32, "value"}};
   TopicChunkBuilder builder(1, 1, cols, num_rows);
@@ -29,7 +29,7 @@ TopicChunk makeTestChunk(Timestamp t_start, uint32_t num_rows, Timestamp step) {
   return builder.seal();
 }
 
-// Helper: build a chunk from an explicit (possibly non-uniform / duplicated)
+// Builds a chunk from an explicit (possibly non-uniform / duplicated)
 // timestamp list. The column value equals the row index, so a returned
 // row_index can be cross-checked against value.
 TopicChunk makeChunkFromTimestamps(const std::vector<Timestamp>& ts) {
@@ -56,10 +56,6 @@ std::deque<TopicChunk> makeStandardChunks() {
   }
   return chunks;
 }
-
-// =========================================================================
-// Range query tests
-// =========================================================================
 
 TEST(QueryTest, RangeQuerySpanningTwoChunks) {
   auto chunks = makeStandardChunks();
@@ -121,7 +117,6 @@ TEST(QueryTest, RangeQueryExactChunkBoundary) {
     cursor.advance();
   }
 
-  // Chunk 1 has t = 100, 110, ..., 190. All 10 are in [100, 199].
   ASSERT_EQ(timestamps.size(), 10u);
   EXPECT_EQ(timestamps.front(), 100);
   EXPECT_EQ(timestamps.back(), 190);
@@ -135,10 +130,6 @@ TEST(QueryTest, ForEachCallback) {
   cursor.forEach([&count](const SampleRow& /*row*/) { ++count; });
   EXPECT_EQ(count, 20u);  // chunks 2 and 3, 10 rows each
 }
-
-// =========================================================================
-// latest_at tests
-// =========================================================================
 
 TEST(QueryTest, LatestAtInMiddleOfChunk) {
   auto chunks = makeStandardChunks();
@@ -174,10 +165,6 @@ TEST(QueryTest, LatestAtBetweenChunks) {
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->timestamp, 90);
 }
-
-// =========================================================================
-// Binary-search edge cases (duplicate timestamps, shared chunk boundaries)
-// =========================================================================
 
 TEST(QueryTest, LatestAtWithDuplicateTimestampsReturnsLastDuplicate) {
   std::deque<TopicChunk> chunks;
@@ -230,10 +217,6 @@ TEST(QueryTest, RangeQuerySingleTimestampPoint) {
   EXPECT_EQ(timestamps.front(), 200);
 }
 
-// =========================================================================
-// Empty deque tests
-// =========================================================================
-
 TEST(QueryTest, EmptyDequeRangeQuery) {
   std::deque<TopicChunk> empty;
   auto cursor = rangeQuery(empty, 0, 100);
@@ -246,19 +229,13 @@ TEST(QueryTest, EmptyDequeLatestAt) {
   EXPECT_FALSE(result.has_value());
 }
 
-// =========================================================================
-// for_each_chunk tests
-// =========================================================================
-
 TEST(QueryTest, ForEachChunkMatchesForEach) {
   auto chunks = makeStandardChunks();
 
-  // Collect per-row results via for_each
   auto cursor1 = rangeQuery(chunks, 150, 350);
   std::vector<Timestamp> per_row_ts;
   cursor1.forEach([&](const SampleRow& row) { per_row_ts.push_back(row.timestamp); });
 
-  // Collect per-chunk results via for_each_chunk
   auto cursor2 = rangeQuery(chunks, 150, 350);
   std::vector<Timestamp> chunk_ts;
   cursor2.forEachChunk([&](const ChunkRowRange& range) {
@@ -297,15 +274,9 @@ TEST(QueryTest, ForEachChunkNoResults) {
   EXPECT_EQ(count, 0u);
 }
 
-// =========================================================================
-// SeriesReader retention-floor tests
-//
-// A SeriesReader constructed with floor F must behave as if rows with
-// timestamp < F do not exist — through EVERY method (the retention-window
-// contract). The straddling chunk still physically holds those rows.
-// All cases share one chunk t=[0,490] step 10 (value == row index) that
-// straddles a floor of 200.
-// =========================================================================
+// SeriesReader retention floor: a SeriesReader constructed with floor F behaves as if rows with timestamp < F
+// do not exist, through every method. The straddling chunk still physically holds those rows. All cases share
+// one chunk t=[0,490] step 10 (value == row index) that straddles a floor of 200.
 
 class SeriesReaderFloorTest : public ::testing::Test {
  protected:
@@ -397,6 +368,35 @@ TEST_F(SeriesReaderFloorTest, DefaultIsNoFloor) {
   const auto bounds = series.bounds();
   ASSERT_TRUE(bounds.has_value());
   EXPECT_EQ(bounds->time.min, 0);
+}
+
+// forEachOrderedRun's runs concatenate to forEach's rows, ties included, and only an overlap splits a chunk.
+TEST(QueryTest, OrderedRunsConcatenateToTheMergedRows) {
+  std::deque<TopicChunk> chunks;
+  chunks.push_back(makeChunkFromTimestamps({0, 2, 4, 6}));
+  chunks.push_back(makeChunkFromTimestamps({1, 2, 3, 8}));
+  chunks.push_back(makeChunkFromTimestamps({10, 11, 12}));
+  using Row = std::pair<const TopicChunk*, std::size_t>;
+  const std::vector<std::pair<Timestamp, Timestamp>> windows = {
+      {std::numeric_limits<Timestamp>::min(), std::numeric_limits<Timestamp>::max()}, {2, 6}, {3, 3}, {7, 9}, {10, 12}};
+  for (const auto& [t_min, t_max] : windows) {
+    std::vector<Row> merged;
+    RangeCursor(chunks, t_min, t_max).forEach([&](const SampleRow& row) {
+      merged.emplace_back(row.chunk, row.row_index);
+    });
+    std::vector<Row> runs;
+    std::size_t run_count = 0;
+    RangeCursor(chunks, t_min, t_max).forEachOrderedRun([&](const ChunkRowRange& run) {
+      ++run_count;
+      for (std::size_t row = run.row_start; row < run.row_end; ++row) {
+        runs.emplace_back(run.chunk, row);
+      }
+    });
+    EXPECT_EQ(runs, merged) << "window [" << t_min << ", " << t_max << "]";
+    if (t_min == 10) {
+      EXPECT_EQ(run_count, 1u);
+    }
+  }
 }
 
 }  // namespace

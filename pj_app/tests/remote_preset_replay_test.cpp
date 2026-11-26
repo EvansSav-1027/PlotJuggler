@@ -14,6 +14,8 @@
 #include <QCryptographicHash>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QList>
 #include <QString>
@@ -24,6 +26,7 @@
 #include <QWidget>
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <utility>
 
 #include "FileLoader.h"
@@ -32,6 +35,7 @@
 #include "pj_plotting/PlotWidget.h"
 #include "pj_runtime/AppSession.h"
 #include "pj_runtime/CatalogModel.h"
+#include "pj_runtime/PlaybackEngine.h"
 #include "pj_runtime/PresetCatalog.h"
 #include "support/loader_test_support.h"
 #include "support/preset_test_support.h"
@@ -61,6 +65,8 @@ struct Source {
   QString filename;
   QString content_sha256;
   QString config = u"{}"_s;
+  // Raw <sideFile> elements, written inside the <fileInfo>.
+  QString side_files = {};
 };
 
 // A source-bound layout: one plot with a curve per source (bound by its logical
@@ -74,10 +80,10 @@ QByteArray presetLayout(
     curves += uR"(<curve topic="mock/file_data" field="value" dataset_path="%1"/>)"_s.arg(source.filename);
     files +=
         uR"(<fileInfo filename="%1" prefix=""%2><plugin ID="Mock File Source" manifest_id="mock-file-source">)"
-        uR"(<![CDATA[%3]]></plugin></fileInfo>)"_s.arg(
+        uR"(<![CDATA[%3]]></plugin>%4</fileInfo>)"_s.arg(
             source.filename,
             source.content_sha256.isEmpty() ? QString() : u" content_sha256=\"%1\""_s.arg(source.content_sha256),
-            source.config);
+            source.config, source.side_files);
   }
   return uR"(<root pj4_version="4" binding="source"><tabbed_widget parent="main_window"><Tab id="t1" containers="1">)"
          uR"(<Container><DockArea id="a1" name="View"><plot id="plot1" mode="TimeSeries">%1</plot></DockArea>)"
@@ -272,6 +278,48 @@ TEST_F(RemotePresetReplayTest, NextPresetReplacesThePreviousPresetsData) {
   EXPECT_EQ(PresetTestPeer::curveCount(*window_), 2);
 }
 
+// The next preset's layout restores with the playhead at the start of the data, not where the previous preset left
+// it: a scene view driven to a late time folds every marker message up to it. A preset that fails gives the playhead
+// back.
+TEST_F(RemotePresetReplayTest, NextPresetRestoresAtTheStartOfTheData) {
+  server_.route(u"/first/layout.pj4.xml"_s, presetLayout({{u"first.mock"_s, {}}}));
+  server_.route(u"/first/first.mock"_s, "first bytes");
+  server_.route(u"/second/layout.pj4.xml"_s, presetLayout({{u"second.mock"_s, {}}}));
+  server_.route(u"/second/second.mock"_s, "second bytes");
+  server_.route(
+      u"/broken/layout.pj4.xml"_s,
+      presetLayout({{u"broken.mock"_s, {}}}, uR"(<curve topic="mock/file_data" field="absent"/>)"_s));
+  server_.route(u"/broken/broken.mock"_s, "broken bytes");
+  ASSERT_EQ(loadPreset(u"/first/layout.pj4.xml"_s), u"ok"_s);
+  PJ::PlaybackEngine& engine = PresetTestPeer::session(*window_).playbackEngine();
+  ASSERT_LT(engine.rangeMin(), engine.rangeMax());
+  engine.setCurrentTime(engine.rangeMax());
+
+  // The restore logs its duration right after the workspace applies, before the previous preset's data goes.
+  static std::optional<PJ::DisplaySeconds> time_at_restore;
+  static PJ::PlaybackEngine* restore_engine = nullptr;
+  time_at_restore.reset();
+  restore_engine = &engine;
+  const QtMessageHandler previous_handler =
+      qInstallMessageHandler([](QtMsgType, const QMessageLogContext&, const QString& message) {
+        if (message.startsWith(u"PJ_WASM_LAYOUT_RESTORE_MS"_s)) {
+          time_at_restore = restore_engine->currentTime();
+        }
+      });
+  const QString outcome = loadPreset(u"/second/layout.pj4.xml"_s);
+  const PJ::DisplaySeconds range_min_at_end = engine.rangeMin();
+  qInstallMessageHandler(previous_handler);
+  ASSERT_EQ(outcome, u"ok"_s);
+  ASSERT_TRUE(time_at_restore.has_value());
+  EXPECT_EQ(time_at_restore->value, range_min_at_end.value);
+
+  const PJ::DisplaySeconds before_broken = engine.rangeMax();
+  engine.setCurrentTime(before_broken);
+  EXPECT_EQ(loadPreset(u"/broken/layout.pj4.xml"_s), u"apply-after-source-load"_s);
+  closeDialogs();
+  EXPECT_EQ(engine.currentTime().value, before_broken.value);
+}
+
 // A preset dataset that a merge folded the user's data into holds the user's data too, even
 // when it is the merge's anchor and keeps the preset's source identity: the next preset leaves it.
 TEST_F(RemotePresetReplayTest, NextPresetKeepsAMergedPresetDataset) {
@@ -331,6 +379,54 @@ TEST_F(RemotePresetReplayTest, FingerprintMismatchFails) {
   expectUnchanged(before, sources_before);
   EXPECT_FALSE(server_.requests.contains(u"/malformed/left.mock"_s)) << "a malformed record is refused up front";
   EXPECT_EQ(loads, 0);
+}
+
+// A side file downloads from beside its data file, is checked against its
+// fingerprint, and the plugin config names the staged copy.
+TEST_F(RemotePresetReplayTest, SideFileDownloadsBesideItsDataFile) {
+  const QByteArray dbc = "dbc bytes";
+  const auto side = [](const QByteArray& bytes) {
+    return uR"(<sideFile filename="engine.dbc" content_sha256="%1"/>)"_s.arg(sha256(bytes));
+  };
+  // The staged copy lives while its data file's import holds it, so it is read when the load reports.
+  QString config;
+  QByteArray staged_bytes;
+  QObject::connect(
+      &PresetTestPeer::fileLoader(*window_), &PJ::FileLoader::fileLoaded,
+      [&config, &staged_bytes](const QString&, const QString&, const QString&, const QString& plugin_config) {
+        config = plugin_config;
+        QFile staged(QJsonDocument::fromJson(plugin_config.toUtf8()).object().value(u"dbc"_s).toString());
+        staged_bytes = staged.open(QIODevice::ReadOnly) ? staged.readAll() : QByteArray("<unreadable>");
+      });
+  server_.route(
+      u"/side/layout.pj4.xml"_s,
+      presetLayout({{u"data/run.mock"_s, {}, uR"({"dbc":"engine.dbc","label":"engine.dbc.bak"})"_s, side(dbc)}}));
+  server_.route(u"/side/data/run.mock"_s, "run bytes");
+  server_.route(u"/side/data/engine.dbc"_s, dbc);
+  ASSERT_EQ(loadPreset(u"/side/layout.pj4.xml"_s), u"ok"_s);
+  EXPECT_EQ(
+      server_.requests, (QStringList{u"/side/layout.pj4.xml"_s, u"/side/data/run.mock"_s, u"/side/data/engine.dbc"_s}));
+  const QJsonObject loaded = QJsonDocument::fromJson(config.toUtf8()).object();
+  const QString staged = loaded.value(u"dbc"_s).toString();
+  EXPECT_NE(staged, u"engine.dbc"_s);
+  EXPECT_EQ(QFileInfo(staged).fileName(), u"engine.dbc"_s);
+  EXPECT_EQ(staged_bytes, dbc) << staged.toStdString();
+  EXPECT_EQ(loaded.value(u"label"_s).toString(), u"engine.dbc.bak"_s) << "only an exact match is rewritten";
+
+  // Other bytes than the recorded ones fail the preset like a data file's.
+  server_.route(
+      u"/side_mismatch/layout.pj4.xml"_s, presetLayout({{u"run.mock"_s, {}, uR"({"dbc":"engine.dbc"})"_s, side(dbc)}}));
+  server_.route(u"/side_mismatch/run.mock"_s, "run bytes");
+  server_.route(u"/side_mismatch/engine.dbc"_s, "other bytes");
+  EXPECT_EQ(loadPreset(u"/side_mismatch/layout.pj4.xml"_s), u"fingerprint"_s);
+}
+
+// The side-file prompt substitutes its arguments once: a '%' in a path stays literal.
+TEST(BrowserReplaySideFilePrompt, PathPercentSignsStayLiteral) {
+  const QString text = PresetTestPeer::sideFilePrompt(u"a%2.dbc"_s, u"logs/%1%3.log"_s, 2, 3);
+  EXPECT_TRUE(text.contains(u"'a%2.dbc'"_s)) << text.toStdString();
+  EXPECT_TRUE(text.contains(u"'logs/%1%3.log'"_s)) << text.toStdString();
+  EXPECT_TRUE(text.contains(u"file 2 of 3"_s)) << text.toStdString();
 }
 
 // Every way a preset can fail after it started — a missing file, an import

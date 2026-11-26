@@ -4,15 +4,15 @@
     {
       "id": "open_data_file",
       "name": "Open data files",
-      "summary": "Load recorded data from a file. The formats that open depend on the data loader extensions installed (for example CSV, MCAP, ULog or Parquet). Each loaded file becomes its own dataset, and several can be loaded side by side.",
-      "entry_point": "File → Open Data File..., or Sources panel → File → Load a data file",
-      "evidence": "pj_app/src/MainWindow.cpp#tr(\"Open Data File...\"); pj_app/src/ui/LeftPanel.ui#Load a data file",
+      "summary": "Load recorded data from a file. The formats that open depend on the data loader extensions installed (for example CSV, MCAP, ULog or Parquet). Each loaded file becomes its own dataset, and several can be loaded side by side. Files dragged onto the window from a file manager load the same way. Several files picked or dropped together ask once, before loading, whether each shows its loader's configuration dialog, only the first of each format does (the others reuse its settings), or none does (the last-used settings).",
+      "entry_point": "File → Open Data File..., or Sources panel → File → Load a data file, or drag files onto the window",
+      "evidence": "pj_app/src/MainWindow.cpp#tr(\"Open Data File...\"); pj_app/src/ui/LeftPanel.ui#Load a data file; pj_app/src/MainWindow.cpp#setAcceptDrops(true); pj_app/src/ui/BatchLoadDialog.ui#Configuration dialogs:",
       "verified": "2026-10-21 in-app on release-4.1 e275111c: File → Open Data File... and the Sources panel File page with its load button"
     },
     {
       "id": "command_line_data",
       "name": "Command-line data loading",
-      "summary": "Open data with repeatable -d / --datafile options or positional file paths. Files finish loading before an optional layout; explicit files replace the sources saved in that layout.",
+      "summary": "Open data with repeatable -d / --datafile options or positional file paths. Files finish loading before an optional layout; explicit files replace the sources saved in that layout, and each dataset the layout names maps to one of them (the same file, then the same file name, then by position within each file format when the counts match), so its plots and derived series stay bound.",
       "entry_point": "Desktop command line: plotjuggler4 -d first.csv -d second.csv -l shared.pj4.xml; plotjuggler4 recording.csv",
       "evidence": "pj_app/src/main.cpp#datafile_option; pj_app/src/MainWindow.cpp#void MainWindow::loadAtStartup",
       "verified": "MainWindowStartupTest: multi-file ordering, source replacement, failure settlement and data-only startup"
@@ -44,10 +44,10 @@
     {
       "id": "layouts",
       "name": "Layouts",
-      "summary": "Save and reload the whole workspace: tabs, plots, custom topics and markers. When saving, the layout can be bound to the loaded data so that loading it opens the same files again.",
+      "summary": "Save and reload the whole workspace: tabs, plots, custom topics and markers. When saving, the layout can be bound to the loaded data so that loading it opens the same files again and restarts the same streaming sources, without their connection dialog. A layout made for one dataset, loaded while several loaded datasets fit it, asks which ones to show; choosing several duplicates its tabs, one copy per dataset named after it, each curve in the same colour in every copy, the runs aligned to start together.",
       "entry_point": "File → Save Layout... / Load Layout...; recent layouts: Sources panel → Recent layouts & files",
-      "evidence": "pj_app/src/MainWindow.cpp#tr(\"Load Layout...\"); pj_app/src/MainWindow.cpp#tr(\"Save Layout with Sources...\"); pj_app/src/ui/LeftPanel.ui#buttonRecentFiles",
-      "verified": "2026-10-21 in-app on release-4.1 e275111c: File → Save Layout... / Load Layout... and Recent layouts & files"
+      "evidence": "pj_app/src/MainWindow.cpp#tr(\"Load Layout...\"); pj_app/src/MainWindow.cpp#tr(\"Save Layout with Sources...\"); pj_app/src/ui/LeftPanel.ui#buttonRecentFiles; pj_app/src/MainWindow.cpp#void MainWindow::chooseLayoutDatasets; pj_app/src/ui/LayoutDatasetDialog.ui#listDatasets",
+      "verified": "2026-10-21 in-app on release-4.1 e275111c: File → Save Layout... / Load Layout... and Recent layouts & files; 2026-11-19 the dataset question and duplicated tabs: LayoutDatasetChoiceTest and the layout_dataset_choice QA regression"
     },
     {
       "id": "extensions",
@@ -60,7 +60,7 @@
     {
       "id": "datasets_tree",
       "name": "Datasets panel",
-      "summary": "Every loaded file or stream is a dataset, listed with its topics and fields as a tree. The filter box searches by name, three buttons show or hide plot series, 2D image topics and 3D scene topics, and right-clicking a dataset offers Info, Merge, Reload, Replace and Remove.",
+      "summary": "Every loaded file or stream is a dataset, listed with its topics and fields as a tree. The filter box searches by name, three buttons show or hide plot series, 2D image topics and 3D scene topics, and right-clicking a dataset offers Info, Merge, Reload, Replace and Remove. The series and topics the selected plot or view shows are written in semi-bold italic, together with the groups that contain them.",
       "entry_point": "Datasets panel → Filter... box; right-click a dataset for its options",
       "evidence": "pj_app/src/ui/CurveListPanel.ui#labelTimeseries; pj_widgets/src/Search.cpp#tr(\"Filter...\"); pj_app/src/ui/CurveListPanel.cpp#tr(\"Info\")",
       "verified": "2026-10-21 in-app on release-4.1 e275111c: the Filter... box, the three show/hide buttons and the dataset right-click menu"
@@ -68,10 +68,10 @@
     {
       "id": "custom_series",
       "name": "Custom Topics",
-      "summary": "Create new series and 2D/3D objects computed from existing series and object topics, with a Luau or Python function, in the Transform Editor. Custom topics are listed in their own panel and can be edited or deleted there. Built-in filters can also be applied to the curves of a plot from that plot's right-click menu (Apply Filter...).",
+      "summary": "Create new series and 2D/3D objects computed from existing series and object topics, with a Luau or Python function, in the Transform Editor. Custom topics are listed in their own panel and can be edited or deleted there; a formula made by an AI agent or another plugin can be opened read-only from the pencil (View the formula) when the Transform Editor supports it. Built-in filters can also be applied to the curves of a plot from that plot's right-click menu (Apply Filter...).",
       "entry_point": "Custom Topics panel → + (Add custom topic)",
-      "evidence": "pj_app/src/ui/CurveListPanel.ui#Add custom topic; pj_app/src/MainWindow.cpp#editCustomTopicRequested; pj_plotting/widget/src/PlotWidget.cpp#tr(\"Apply Filter...\")",
-      "verified": "2026-10-26 against main's CurveListPanel.ui (the panel and its + were renamed from Custom Series); not re-checked in-app"
+      "evidence": "pj_app/src/ui/CurveListPanel.ui#Add custom topic; pj_app/src/MainWindow.cpp#editCustomTopicRequested; pj_app/src/ui/CurveListPanel.cpp#View the formula (read-only); pj_plotting/widget/src/PlotWidget.cpp#tr(\"Apply Filter...\")",
+      "verified": "2026-10-26 against main's CurveListPanel.ui (the panel and its + were renamed from Custom Series); not re-checked in-app; the read-only view of another owner's formula 2026-11-23 against CurveListPanel.cpp and the editor integration test, not checked in-app"
     },
     {
       "id": "viewer_2d",
@@ -84,10 +84,18 @@
     {
       "id": "scene_3d",
       "name": "3D scene",
-      "summary": "Show 3D data in step with the time cursor: coordinate frames (TF), point clouds, occupancy grids, robot models (URDF and meshes) and markers.",
+      "summary": "Show 3D data in step with the time cursor: coordinate frames (TF), point clouds, occupancy grids, robot models (URDF and meshes) and markers. Frames move smoothly between two transform samples; Preferences → Scene 3D → Interpolate transforms between samples turns that off.",
       "entry_point": "Empty plot area: click the 3D button (cube icon), then drag 3D topics from the Datasets panel onto it; right-click the scene and choose Open Settings for its settings",
-      "evidence": "pj_widgets/src/VisualizationPlaceholderWidget.cpp#buttonVizScene3D; pj_scene3D/CLAUDE.md#occupancy grids; pj_plotting/widget/src/DockWidget.cpp#Open Settings",
-      "verified": "2026-10-21 in-app on release-4.1 e275111c: the button and its tooltip; the drag onto it not automated"
+      "evidence": "pj_widgets/src/VisualizationPlaceholderWidget.cpp#buttonVizScene3D; pj_scene3D/CLAUDE.md#occupancy grids; pj_plotting/widget/src/DockWidget.cpp#Open Settings; pj_app/src/PreferencesDialog.ui#Interpolate transforms between samples:",
+      "verified": "2026-10-21 in-app on release-4.1 e275111c: the button and its tooltip; the drag onto it not automated; the interpolation toggle 2026-11-22 against PreferencesDialog.ui, not checked in-app"
+    },
+    {
+      "id": "robot_packages",
+      "name": "Robot models and their meshes",
+      "summary": "Show a robot from a URDF file, a robot_description topic or a URL, posed by its TF frames. A dataset with one robot_description topic adds it in one click, and a .urdf file dragged onto a 3D view adds it there. package:// meshes are found in the folders listed in Preferences (a ROS workspace works: packages are found in its subfolders), in $ROS_PACKAGE_PATH and $AMENT_PREFIX_PATH, in /opt/ros/<distro>/share, and next to the URDF; a robot with missing meshes offers Locate... to pick the folder, which is then added to that list.",
+      "entry_point": "Empty plot area: click the 3D button (cube icon), then in its settings the Model/URDF row (File, Topic or URL), or drag a .urdf file onto the 3D view; File → Preferences... → Scene 3D → Folders searched for robot packages (package://):",
+      "evidence": "pj_app/src/MainWindow.cpp#addDroppedRobotModels; pj_app/src/PreferencesDialog.ui#Folders searched for robot packages (package://):; pj_scene3D/widgets/src/layers/robot_model_layer.cpp#Locate...; pj_app/src/ui/Scene3DConfigPanel.cpp#topics.size() == 1",
+      "verified": "not checked by hand in the app; UrdfResolver and Scene3DDockPackageFolders tests cover the folder search and the Preferences reload"
     },
     {
       "id": "playback",
@@ -96,6 +104,14 @@
       "entry_point": "Bottom bar: Start/Stop player (Space), click or drag the time slider to seek, Loop, Rate (speed multiplier), Step size",
       "evidence": "pj_app/src/ui/TimelineWidget.ui#Start/Stop player (Space)",
       "verified": "2026-10-21 in-app on release-4.1 e275111c: Start/Stop player, Loop, Rate and Step size in the bottom bar"
+    },
+    {
+      "id": "clock_time",
+      "name": "Clock time display",
+      "summary": "Show times as a clock instead of seconds. Plot time axes show the time of day (HH:mm:ss, no date) with ticks on whole seconds, minutes or hours; the playback readout adds the date; the source timeline labels follow. Times relative to a start (the time-offset button beside it, or datasets aligned to 0) read as elapsed time from 0:00:00, without the date. Clock times use the local time zone, or UTC when chosen in Preferences.",
+      "entry_point": "Bottom bar: the clock button left of the time readout (Show time as clock time (HH:mm:ss) instead of seconds); File → Preferences... → Plotting → Clock time zone:",
+      "evidence": "pj_app/src/ui/TimelineWidget.ui#buttonUseDateTime; pj_app/src/PreferencesDialog.ui#Clock time zone:; pj_plotting/widget/src/PlotScaleDraw.cpp#PlotTimeScaleEngine::divideScale",
+      "verified": "PlotScaleDrawTest (clock-aligned ticks, axis swap, XY fallback) and TimeFormat tests"
     },
     {
       "id": "source_timeline",
@@ -118,16 +134,24 @@
       "name": "Custom Widget panels",
       "summary": "Show values in a panel provided by a widget extension, for example a gauge, a numeric indicator or a value table. Each widget declares the series it takes and its settings, which appear in the side panel. Widget extensions are installed from the Marketplace.",
       "entry_point": "Empty plot area: click the Custom Widget button and pick a widget, then drag the series from the Datasets panel onto it",
-      "evidence": "pj_widgets/src/VisualizationPlaceholderWidget.cpp#buttonVizCustomWidget; pj_app/src/ui/CustomWidgetPickerPanel.ui#CustomWidgetPickerPanel; pj_custom_widgets/CLAUDE.md#CustomWidgetDockWidget",
+      "evidence": "pj_widgets/src/VisualizationPlaceholderWidget.cpp#buttonVizCustomWidget; pj_app/src/ui/CustomWidgetPickerMenu.cpp#CustomWidgetPickerMenu; pj_custom_widgets/CLAUDE.md#CustomWidgetDockWidget",
       "verified": "not checked by hand in the app; pj_app GUI tests and the headless CustomWidgetE2E runs cover the button, the picker and the restored widget"
+    },
+    {
+      "id": "log_panel",
+      "name": "Log panel",
+      "summary": "Show log messages (for example ROS /rosout) as a list in time order, several topics merged. Filter by level, source, category and text; the message at the playback time is highlighted, later ones are greyed or hidden, and a double click jumps the playback to a message.",
+      "entry_point": "Empty plot area: click the Log button, then drag a log topic from the Datasets panel onto it; or drop a log topic straight onto an empty plot area",
+      "evidence": "pj_widgets/src/VisualizationPlaceholderWidget.cpp#buttonVizLog; pj_log/widget/src/LogView.ui#Filter messages...; pj_log/CLAUDE.md#LogDockWidget",
+      "verified": "not checked by hand in the app; pj_app GUI tests cover the button and the drop onto an empty plot area"
     },
     {
       "id": "plot_tabs",
       "name": "Plot tabs, splits and XY plots",
-      "summary": "Organise plots in tabs and split a plot area into several. Drag series from the Datasets panel onto a plot to show them. An XY plot draws one series against another.",
-      "entry_point": "+ on the tab bar adds a tab; plot area toolbar (shown when you hover the top edge of a plot): Split horizontally / Split vertically / Fullscreen; XY plot: drag two series from the Datasets panel with the right mouse button onto an empty plot",
-      "evidence": "pj_plotting/widget/src/TabbedPlotWidget.cpp#onAddTabButtonPressed; pj_plotting/widget/src/DockToolbar.ui#Split horizontally; pj_plotting/widget/src/DockWidget.cpp#onCatalogItemsXyRequested",
-      "verified": "2026-10-21 in-app on release-4.1 e275111c: the + tab button and the hover toolbar; the XY right-drag not automated"
+      "summary": "Organise plots in tabs and split a plot area into several. Drag series from the Datasets panel onto a plot to show them. An XY plot draws one series against another. Drag a tab along the tab bar to reorder the tabs; the order is saved with the layout. Right-click a tab to duplicate it, with its layout, curves and styles; duplicating a tab an AI agent or extension drew makes a copy that is yours, which the agent can no longer change.",
+      "entry_point": "+ on the tab bar adds a tab; drag a tab left or right to move it; right-click a tab: Duplicate tab; plot area toolbar (shown when you hover the top edge of a plot): Split horizontally / Split vertically / Fullscreen; XY plot: drag two series from the Datasets panel with the right mouse button onto an empty plot",
+      "evidence": "pj_plotting/widget/src/TabbedPlotWidget.cpp#onAddTabButtonPressed; pj_plotting/widget/src/TabbedPlotWidget.cpp#Duplicate tab; pj_plotting/widget/src/TabbedPlotWidget.cpp#onTabDragFinished; pj_plotting/widget/src/DockToolbar.ui#Split horizontally; pj_plotting/widget/src/DockWidget.cpp#onCatalogItemsXyRequested",
+      "verified": "2026-10-21 in-app on release-4.1 e275111c: the + tab button and the hover toolbar; the XY right-drag not automated. 2026-11-09 in-app (Xvfb) on feat/duplicate-tab: Duplicate tab, its undo and redo"
     },
     {
       "id": "preferences",
@@ -154,6 +178,14 @@
       "verified": "2026-10-21 in-app on release-4.1 e275111c: Help → Check for Updates... and the startup check on the Appearance page"
     },
     {
+      "id": "mcp_server",
+      "name": "AI agent control (MCP server)",
+      "summary": "Let AI agents such as Claude Code or Codex control PlotJuggler over the Model Context Protocol: open files, read and export series, create derived series and markers, draw in their own tabs, and save or load layouts (a load asks before replacing the user's work). On by default and can be turned off in Preferences; it serves this computer only, behind a secret token. Agents connect through plotjuggler4 --mcp-bridge (stdio). Long requests (imports, streams, exports) run in the background. The status bar names the active agent and counts running jobs; click it to list them and stop any.",
+      "entry_point": "File → Preferences... → Appearance → Let AI agents control PlotJuggler (MCP server):; for one run: plotjuggler4 --mcp",
+      "evidence": "pj_app/src/PreferencesDialog.ui#Let AI agents control PlotJuggler (MCP server):; pj_app/src/main.cpp#mcp_option; pj_app/src/mcp/McpBridge.cpp#int runBridge; pj_app/src/ui/McpJobsDialog.cpp#AI agent activity",
+      "verified": "McpBridgeTest (stdio bridge against an offscreen instance) and McpServerTest; in-app check pending"
+    },
+    {
       "id": "axis_wheel_zoom",
       "name": "Axis wheel zoom",
       "summary": "Hold X or Y while scrolling over a plot to zoom only that axis, even when keyboard focus is in another widget. Release the key to restore ordinary wheel zoom.",
@@ -166,7 +198,7 @@
     {
       "id": "publish_to_robot",
       "summary": "PlotJuggler 4 only receives and displays data; it cannot publish messages or send commands back to a robot or device.",
-      "evidence": "CLAUDE.md#`StatePublisher` parity; pj_runtime/include/pj_runtime/PluginRuntimeCatalog.h#Toolbox and Widget families"
+      "evidence": "pj_runtime/include/pj_runtime/PluginRuntimeCatalog.h#Toolbox and Widget families"
     },
     {
       "id": "edit_loaded_data",

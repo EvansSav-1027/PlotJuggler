@@ -7,6 +7,7 @@
 #include <QTimer>
 #include <memory>
 
+#include "pj_runtime/PlaybackRate.h"
 #include "pj_runtime/Time.h"
 
 namespace PJ {
@@ -36,6 +37,8 @@ class PlaybackEngine : public QObject {
   [[nodiscard]] DisplaySeconds rangeMax() const {
     return DisplaySeconds{range_max_};
   }
+  /// The applied rate: `setPlaybackRate` snaps what it is given to what the speed scrubber can show
+  /// (`snapPlaybackRate`).
   double playbackRate() const {
     return rate_;
   }
@@ -63,9 +66,12 @@ class PlaybackEngine : public QObject {
       double next, double range_min, double range_max, bool hold_at_max, bool looping, bool* reached_end);
 
  public slots:
+  /// `setRange`, `setRangeAndCurrentTime` and `setCurrentTime` ignore a non-finite range or time: NaN survives every
+  /// clamp, so the cursor would stay NaN.
   void setRange(DisplayRange range);
   void setRangeAndCurrentTime(DisplayRange range, DisplaySeconds t);
   void setCurrentTime(DisplaySeconds t);
+  /// Non-finite rates are ignored.
   void setPlaybackRate(double rate);
   void setStep(double step);
   void setLooping(bool looping);
@@ -76,7 +82,14 @@ class PlaybackEngine : public QObject {
 
  signals:
   void currentTimeChanged(double t);
+  /// The cursor for controls that only show where playback is (a slider handle, a time readout, a needle): every
+  /// second playback tick, every other change of the cursor as it happens, and the final time when playback pauses.
+  /// Such a control repainting on every tick makes Qt repaint the window's backing store under every GPU view updated
+  /// in the same frame (pj_app/docs/TECHNICAL_NOTES.md, "Raster repaints during playback").
+  void coarseTimeChanged(double t);
   void rangeChanged(double min, double max);
+  /// Emitted for every request that differs from the current rate, even when it snaps to the same rate, so a control
+  /// still holding the raw request (the speed scrubber after a typed 0.25) shows the applied one.
   void playbackRateChanged(double rate);
   void playingChanged(bool playing);
   void loopingChanged(bool looping);
@@ -86,6 +99,8 @@ class PlaybackEngine : public QObject {
 
  private:
   double clampedTime(double t) const;
+  /// Emits currentTimeChanged, and coarseTimeChanged unless this is a playback tick between two coarse ones.
+  void notifyTimeChanged(bool playback_tick);
   void applyRange(DisplayRange range);
 
   double current_time_ = 0.0;
@@ -94,6 +109,7 @@ class PlaybackEngine : public QObject {
   double rate_ = 1.0;
   double step_ = 0.0;
   bool playing_ = false;
+  int ticks_since_coarse_ = 0;  // playback ticks sent as currentTimeChanged only since the last coarseTimeChanged
   bool looping_ = false;
   bool hold_at_range_max_ = false;
 
